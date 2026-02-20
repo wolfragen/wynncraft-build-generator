@@ -5,8 +5,7 @@ def compute_score(state, query):
     # ---- Stat contribution ----
     for i in query.relevant_stat_indices:
         if query.weights[i] != 0:
-            val = state.compute_effective_stat(i)
-            score += val * query.weights[i]
+            score += state.effective_stat_max[i] * query.weights[i]
 
     # ---- Durability contribution ----
     if query.durability_weight != 0:
