@@ -5,15 +5,14 @@ from core.grid import LEFT, RIGHT, ABOVE, UNDER, TOUCHING, NOT_TOUCHING
 class CraftState:
 
     __slots__ = (
-        "slot_raw_min",
-        "slot_raw_max",
-        "durability",
         "depth",
         "max_depth",
-
-        "slots",
+        "durability",
+        "slot_raw",
         "slot_effectiveness",
-
+        "slot_contrib",
+        "slot_stat_ids",
+        "effective_stat_max",
         "ingredients",
         "n_stats",
     )
@@ -21,19 +20,17 @@ class CraftState:
     def __init__(self, query, recipe, max_depth=6):
 
         self.n_stats = query.n_stats
-    
-        self.slot_raw_min = np.zeros((6, self.n_stats), dtype=np.int32)
-        self.slot_raw_max = np.zeros((6, self.n_stats), dtype=np.int32)
-    
-        # Start from scaled base durability
+
+        self.slot_raw = np.zeros((6, self.n_stats), dtype=np.int32)
+        self.slot_contrib = np.zeros((6, self.n_stats), dtype=np.int32)
+        self.slot_stat_ids = [[] for _ in range(6)]
+
+        self.slot_effectiveness = np.zeros(6, dtype=np.int16)
+        self.effective_stat_max = np.zeros(self.n_stats, dtype=np.int32)
+
         self.durability = recipe.scaled_dura_max
-    
         self.depth = 0
         self.max_depth = max_depth
-    
-        self.slots = np.full(6, -1, dtype=np.int32)
-        self.slot_effectiveness = np.zeros(6, dtype=np.int32)
-    
         self.ingredients = np.zeros(max_depth, dtype=np.int32)
 
     # -------------------------------------------------
@@ -41,45 +38,104 @@ class CraftState:
     def apply(self, db, ing_idx):
 
         slot = self.depth
+        self.ingredients[slot] = ing_idx
 
-        self.slots[slot] = ing_idx
-        self.ingredients[self.depth] = ing_idx
-        self.depth += 1
+        raw_row = self.slot_raw[slot]
+        contrib_row = self.slot_contrib[slot]
+        eff_stats = self.effective_stat_max
+        eff_array = self.slot_effectiveness
 
-        # ---- Store raw stats in slot ----
+        # ---- Add raw ----
         start = db.stat_ptr[ing_idx]
         end   = db.stat_ptr[ing_idx + 1]
 
+        mult = 100 + eff_array[slot]
+
         for k in range(start, end):
             stat_id = db.stat_ids[k]
-            self.slot_raw_min[slot, stat_id] += db.stat_min[k]
-            self.slot_raw_max[slot, stat_id] += db.stat_max[k]
 
-        # ---- Durability ----
+            if raw_row[stat_id] == 0:
+                self.slot_stat_ids[slot].append(stat_id)
+
+            raw_row[stat_id] += db.stat_max[k]
+
+            old = contrib_row[stat_id]
+            new = (raw_row[stat_id] * mult) // 100
+
+            eff_stats[stat_id] += (new - old)
+            contrib_row[stat_id] = new
+
         self.durability += db.durability[ing_idx]
 
-        # ---- Effectiveness propagation ----
-        eff = db.effectiveness[ing_idx]
+        # ---- Propagation inline ----
+        eff_row = db.effectiveness[ing_idx]
+        current_depth = self.depth
 
-        if eff[0] != 0 and LEFT[slot] is not None:
-            self.slot_effectiveness[LEFT[slot]] += eff[0]
+        # directional
+        for idx, delta in (
+            (LEFT[slot],  eff_row[0]),
+            (RIGHT[slot], eff_row[1]),
+            (ABOVE[slot], eff_row[2]),
+            (UNDER[slot], eff_row[3]),
+        ):
+            if idx is not None and idx < current_depth and delta != 0:
 
-        if eff[1] != 0 and RIGHT[slot] is not None:
-            self.slot_effectiveness[RIGHT[slot]] += eff[1]
+                old_mult = 100 + eff_array[idx]
+                new_mult = old_mult + delta
+                eff_array[idx] += delta
 
-        if eff[2] != 0 and ABOVE[slot] is not None:
-            self.slot_effectiveness[ABOVE[slot]] += eff[2]
+                raw_r = self.slot_raw[idx]
+                contrib_r = self.slot_contrib[idx]
+                stat_ids = self.slot_stat_ids[idx]
 
-        if eff[3] != 0 and UNDER[slot] is not None:
-            self.slot_effectiveness[UNDER[slot]] += eff[3]
+                for stat_id in stat_ids:
+                    raw = raw_r[stat_id]
+                    old = contrib_r[stat_id]
+                    new = (raw * new_mult) // 100
+                    eff_stats[stat_id] += (new - old)
+                    contrib_r[stat_id] = new
 
-        if eff[4] != 0:
-            for s in TOUCHING[slot]:
-                self.slot_effectiveness[s] += eff[4]
+        # touching
+        delta = eff_row[4]
+        if delta != 0:
+            for idx in TOUCHING[slot]:
+                if idx < current_depth:
+                    old_mult = 100 + eff_array[idx]
+                    new_mult = old_mult + delta
+                    eff_array[idx] += delta
 
-        if eff[5] != 0:
-            for s in NOT_TOUCHING[slot]:
-                self.slot_effectiveness[s] += eff[5]
+                    raw_r = self.slot_raw[idx]
+                    contrib_r = self.slot_contrib[idx]
+                    stat_ids = self.slot_stat_ids[idx]
+
+                    for stat_id in stat_ids:
+                        raw = raw_r[stat_id]
+                        old = contrib_r[stat_id]
+                        new = (raw * new_mult) // 100
+                        eff_stats[stat_id] += (new - old)
+                        contrib_r[stat_id] = new
+
+        # not touching
+        delta = eff_row[5]
+        if delta != 0:
+            for idx in NOT_TOUCHING[slot]:
+                if idx < current_depth:
+                    old_mult = 100 + eff_array[idx]
+                    new_mult = old_mult + delta
+                    eff_array[idx] += delta
+
+                    raw_r = self.slot_raw[idx]
+                    contrib_r = self.slot_contrib[idx]
+                    stat_ids = self.slot_stat_ids[idx]
+
+                    for stat_id in stat_ids:
+                        raw = raw_r[stat_id]
+                        old = contrib_r[stat_id]
+                        new = (raw * new_mult) // 100
+                        eff_stats[stat_id] += (new - old)
+                        contrib_r[stat_id] = new
+
+        self.depth += 1
 
     # -------------------------------------------------
 
@@ -87,57 +143,100 @@ class CraftState:
 
         self.depth -= 1
         slot = self.depth
-        ing_idx = self.slots[slot]
+        ing_idx = self.ingredients[slot]
 
-        # ---- Remove raw stats ----
+        raw_row = self.slot_raw[slot]
+        contrib_row = self.slot_contrib[slot]
+        eff_stats = self.effective_stat_max
+        eff_array = self.slot_effectiveness
+
+        # ---- Remove propagation inline ----
+        eff_row = db.effectiveness[ing_idx]
+        current_depth = self.depth
+
+        for idx, delta in (
+            (LEFT[slot],  eff_row[0]),
+            (RIGHT[slot], eff_row[1]),
+            (ABOVE[slot], eff_row[2]),
+            (UNDER[slot], eff_row[3]),
+        ):
+            if idx is not None and idx < current_depth and delta != 0:
+
+                old_mult = 100 + eff_array[idx]
+                new_mult = old_mult - delta
+                eff_array[idx] -= delta
+
+                raw_r = self.slot_raw[idx]
+                contrib_r = self.slot_contrib[idx]
+                stat_ids = self.slot_stat_ids[idx]
+
+                for stat_id in stat_ids:
+                    raw = raw_r[stat_id]
+                    old = contrib_r[stat_id]
+                    new = (raw * new_mult) // 100
+                    eff_stats[stat_id] += (new - old)
+                    contrib_r[stat_id] = new
+
+        # touching
+        delta = eff_row[4]
+        if delta != 0:
+            for idx in TOUCHING[slot]:
+                if idx < current_depth:
+                    old_mult = 100 + eff_array[idx]
+                    new_mult = old_mult - delta
+                    eff_array[idx] -= delta
+
+                    raw_r = self.slot_raw[idx]
+                    contrib_r = self.slot_contrib[idx]
+                    stat_ids = self.slot_stat_ids[idx]
+
+                    for stat_id in stat_ids:
+                        raw = raw_r[stat_id]
+                        old = contrib_r[stat_id]
+                        new = (raw * new_mult) // 100
+                        eff_stats[stat_id] += (new - old)
+                        contrib_r[stat_id] = new
+
+        # not touching
+        delta = eff_row[5]
+        if delta != 0:
+            for idx in NOT_TOUCHING[slot]:
+                if idx < current_depth:
+                    old_mult = 100 + eff_array[idx]
+                    new_mult = old_mult - delta
+                    eff_array[idx] -= delta
+
+                    raw_r = self.slot_raw[idx]
+                    contrib_r = self.slot_contrib[idx]
+                    stat_ids = self.slot_stat_ids[idx]
+
+                    for stat_id in stat_ids:
+                        raw = raw_r[stat_id]
+                        old = contrib_r[stat_id]
+                        new = (raw * new_mult) // 100
+                        eff_stats[stat_id] += (new - old)
+                        contrib_r[stat_id] = new
+
+        # ---- Remove raw ----
         start = db.stat_ptr[ing_idx]
         end   = db.stat_ptr[ing_idx + 1]
 
+        mult = 100 + eff_array[slot]
+
         for k in range(start, end):
             stat_id = db.stat_ids[k]
-            self.slot_raw_min[slot, stat_id] -= db.stat_min[k]
-            self.slot_raw_max[slot, stat_id] -= db.stat_max[k]
 
-        # ---- Durability ----
+            old = contrib_row[stat_id]
+
+            raw_row[stat_id] -= db.stat_max[k]
+
+            new = (raw_row[stat_id] * mult) // 100 if raw_row[stat_id] != 0 else 0
+
+            eff_stats[stat_id] += (new - old)
+            contrib_row[stat_id] = new
+
         self.durability -= db.durability[ing_idx]
 
-        # ---- Remove effectiveness ----
-        eff = db.effectiveness[ing_idx]
-
-        if eff[0] != 0 and LEFT[slot] is not None:
-            self.slot_effectiveness[LEFT[slot]] -= eff[0]
-
-        if eff[1] != 0 and RIGHT[slot] is not None:
-            self.slot_effectiveness[RIGHT[slot]] -= eff[1]
-
-        if eff[2] != 0 and ABOVE[slot] is not None:
-            self.slot_effectiveness[ABOVE[slot]] -= eff[2]
-
-        if eff[3] != 0 and UNDER[slot] is not None:
-            self.slot_effectiveness[UNDER[slot]] -= eff[3]
-
-        if eff[4] != 0:
-            for s in TOUCHING[slot]:
-                self.slot_effectiveness[s] -= eff[4]
-
-        if eff[5] != 0:
-            for s in NOT_TOUCHING[slot]:
-                self.slot_effectiveness[s] -= eff[5]
-
-        self.slots[slot] = -1
-
-    # -------------------------------------------------
-
-    def compute_effective_stat(self, stat_id):
-        """
-        Exact effective stat computation.
-        """
-
-        total = 0.0
-
-        for s in range(self.depth):
-            raw = self.slot_raw_max[s, stat_id]
-            amp = 1.0 + self.slot_effectiveness[s] / 100.0
-            total += raw * amp
-
-        return total
+        raw_row.fill(0)
+        contrib_row.fill(0)
+        self.slot_stat_ids[slot].clear()

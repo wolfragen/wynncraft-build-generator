@@ -59,7 +59,7 @@ class SearchBase:
 
         for i in self.query.relevant_stat_indices:
     
-            effective = state.compute_effective_stat(i)
+            effective = state.effective_stat_max[i]
     
             if self.query.has_min_mask[i]:
                 if effective < self.query.min_vals[i]:
