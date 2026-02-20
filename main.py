@@ -11,6 +11,9 @@ from time import time
 import cProfile
 import pstats
 
+from line_profiler import LineProfiler
+from core.leaf_evaluator import evaluate_leaf
+
 
 def main():
 
@@ -95,15 +98,29 @@ def main():
         print("Ingredient JSON IDs:", real_json_ids)
 
 
+profile = False
+
 if __name__ == "__main__":
-    profiler = cProfile.Profile()
-    profiler.enable()
-
-    main()
-
-    profiler.disable()
-    stats = pstats.Stats(profiler)
-    stats.sort_stats("tottime").print_stats(30)
+    
+    if profile:
+        """
+        profiler = cProfile.Profile()
+        profiler.enable()
+    
+        main()
+    
+        profiler.disable()
+        stats = pstats.Stats(profiler)
+        stats.sort_stats("tottime").print_stats(30)"""
+        
+        lp = LineProfiler()
+        lp.add_function(evaluate_leaf)
+    
+        lp.runctx("main()", globals(), locals())
+        lp.print_stats()
+    
+    else:
+        main()
     
     
 """
@@ -116,26 +133,33 @@ if __name__ == "__main__":
 [831, 622, 593, 635, 831, 622] => 4% gather speed
 """
 
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
