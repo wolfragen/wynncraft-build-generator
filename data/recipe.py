@@ -4,6 +4,12 @@ TIER_MULT = [0.0, 1.0, 1.25, 1.4]
 
 
 class Recipe:
+    """
+    Class used to store all the base stats of a recipe.
+    Stores :
+        - durability range
+        - scaled durability ranged, using material tier multiplier
+    """
 
     __slots__ = (
         "base_dura_min",

@@ -17,26 +17,25 @@ from core.leaf_evaluator import evaluate_leaf
 
 def main():
 
-    # ---------- Load raw data ----------
+    # ---------- Load all ingredients ----------
     ingredients_raw = load_ingredients("data/ingreds_compress.json")
 
     # ---------- Build stat index ----------
     stat_index, num_stats = build_stat_index(ingredients_raw)
 
-    # ---------- Build Query ----------
+    # ---------- Build User Query ----------
     user_query = {
-        "gSpd": {"min": 1, "weight": 1.0},      # gathering speed %
-        #"gXp": {"weight": 0.35},    # gathering XP
-        "durability": {"min": 70, "weight": 0.0001},
+        "gSpd": {"min": 1, "weight": 10000},      # gathering speed %
+        "durability": {"min": 40, "weight": 1},
     }
 
     skill = "JEWELING"
     item = "RING"
 
-    # ---------- Load recipes ----------
+    # ---------- Load recipes (Materials => Stats) ----------
     recipes_data = load_recipes("data/recipes_compress.json")
 
-    recipe_raw = find_recipe(
+    recipe_raw = find_recipe( # gets recipe stats
         recipes_data,
         item_type=item,
         skill=skill,
@@ -44,13 +43,13 @@ def main():
         lvl_max=105,
     )
 
-    recipe = Recipe(recipe_raw, tier=3)
+    recipe = Recipe(recipe_raw, tier=3) # builds final recipe using material tier
 
     # ---------- Build Query Object ----------
     query = build_query(
         user_query=user_query,
         stat_index=stat_index,
-        search_for_inversion=True,
+        search_for_inversion=True, # negative effectiveness included
         algorithm="dfs",
         item_type=skill,
     )
@@ -103,7 +102,7 @@ profile = False
 if __name__ == "__main__":
     
     if profile:
-        """
+        
         profiler = cProfile.Profile()
         profiler.enable()
     
@@ -111,13 +110,14 @@ if __name__ == "__main__":
     
         profiler.disable()
         stats = pstats.Stats(profiler)
-        stats.sort_stats("tottime").print_stats(30)"""
+        stats.sort_stats("tottime").print_stats(30)
         
+        """
         lp = LineProfiler()
         lp.add_function(evaluate_leaf)
     
         lp.runctx("main()", globals(), locals())
-        lp.print_stats()
+        lp.print_stats()"""
     
     else:
         main()
@@ -129,8 +129,10 @@ if __name__ == "__main__":
 668 => Stolen Pearls
 593 => Eye of The Beast
 635 => Old Treasure\u058e
+318 => Serafite
 
 [831, 622, 593, 635, 831, 622] => 4% gather speed
+[831, 622, 593, 318, 831, 622] => 
 """
 
 

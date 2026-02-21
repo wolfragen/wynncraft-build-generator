@@ -3,7 +3,14 @@ import numpy as np
 
 class Query:
     """
-    Compact search-ready query representation.
+    Main search class, used everywhere else.
+    
+    Stores all useful information to be accessed easily afterward.
+    Contains : 
+        - min/max values
+        - weights
+        - relevant stat indices
+    along with other things.
     """
 
     __slots__ = (
@@ -52,6 +59,8 @@ class Query:
         self.min_durability = min_durability
         self.durability_weight = durability_weight
         
+        # First check to see if stat is relevant
+        # Used in loops instead of looping over all stats id, only loop over relevant stats
         self.relevant_stat_indices = np.where(self.has_min_mask | self.has_max_mask | (self.weights != 0))[0]
 
 
@@ -78,6 +87,8 @@ def build_query(
     min_vals = np.zeros(n_stats, dtype=np.int32)
     max_vals = np.zeros(n_stats, dtype=np.int32)
 
+    # Those two masks are here to filter ingredients. 
+    # For example, we will keep positive spell dmg if has_min_mask[spell_dmg_id] == True
     has_min_mask = np.zeros(n_stats, dtype=np.bool_)
     has_max_mask = np.zeros(n_stats, dtype=np.bool_)
 
@@ -86,9 +97,9 @@ def build_query(
     min_durability = None
     durability_weight = 0.0
 
-    for stat_name, cfg in user_query.items():
+    for stat_name, cfg in user_query.items(): # Checks which stats are of interest
 
-        # ---- Durability special case ----
+        # ---- Durability ----
         if stat_name == "durability":
 
             if "min" in cfg:
@@ -99,7 +110,7 @@ def build_query(
 
             continue
 
-        # ---- Normal stat ----
+        # ---- Normal stats ----
         if stat_name not in stat_index:
             raise ValueError(f"Unknown stat: {stat_name}")
 
@@ -107,14 +118,14 @@ def build_query(
 
         if "min" in cfg:
             min_vals[idx] = int(cfg["min"])
-            has_min_mask[idx] = True
+            has_min_mask[idx] = True # Used to filter ingredients
 
         if "max" in cfg:
             max_vals[idx] = int(cfg["max"])
-            has_max_mask[idx] = True
+            has_max_mask[idx] = True # Used to filter ingredients
 
         if "weight" in cfg:
-            weights[idx] = float(cfg["weight"])
+            weights[idx] = float(cfg["weight"]) # Score computation
 
     return Query(
         n_stats=n_stats,
@@ -129,3 +140,26 @@ def build_query(
         min_durability=min_durability,
         durability_weight=durability_weight,
     )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
