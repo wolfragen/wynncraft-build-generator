@@ -46,7 +46,7 @@ def get_filtered_ingredients(all_ingreds, profession, include_dura):
 
             # 3. Process Non-affected stats (Static)
             static_stats = {}
-            if dura != 0: static_stats["dura"] = {"min": dura, "max": dura}
+            if dura != 0: static_stats["durability"] = {"min": dura, "max": dura}
             
             for s in ["duration", "charges"]:
                 val = cons_ids.get(s, 0)
