@@ -114,15 +114,15 @@ def calculate_recipe_stats(grid):
             total_stats[name]["max"] += range_val["max"]
             
     return {
-        "ingredients": [ing["id"] if ing else -1 for ing in grid],
-        "effectiveness": [f"{e}%" for e in eff_values],
+        "ings": [ing["id"] if ing else -1 for ing in grid],
+        "eff": eff_values,
         "stats": total_stats
     }
 
 def run_precalculation(profession, include_dura_ingredients=True):
     print(f"--- PRECALCULATING: {profession} ---")
     data_dir = "data"
-    precalc_dir = os.path.join(data_dir, "precalc")
+    precalc_dir = os.path.join(data_dir, "precalc/full")
     ingred_path = os.path.join(data_dir, "ingreds_compress.json")
     os.makedirs(precalc_dir, exist_ok=True)
     
