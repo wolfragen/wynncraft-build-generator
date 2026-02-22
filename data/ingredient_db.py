@@ -28,14 +28,14 @@ class IngredientDB:
         self.n = len(ingredients_raw)
         self.ids = np.zeros(self.n, dtype=np.int32)
 
-        # ---------- Count total stat entries ----------
+        # ---------- Count total stat entries (for fun lol) ----------
         total_entries = 0
         for ing in ingredients_raw:
             ids = ing.get("ids")
             if ids:
                 total_entries += len(ids)
 
-        # ---------- Allocate CSR ----------
+        # ---------- Allocate CSR (Compressed Sparse Row) ----------
         self.stat_ptr = np.zeros(self.n + 1, dtype=np.int32)
         self.stat_ids = np.zeros(total_entries, dtype=np.uint16)
         self.stat_min = np.zeros(total_entries, dtype=np.int32)
@@ -52,7 +52,7 @@ class IngredientDB:
             self.stat_ptr[i] = cursor
             self.ids[i] = ing["id"]
 
-            ids = ing.get("ids")
+            ids = ing.get("ids") # normal stats
             if ids:
                 for stat_name, data in ids.items():
 
@@ -61,7 +61,7 @@ class IngredientDB:
 
                     gid = stat_index[stat_name]
 
-                    if isinstance(data, dict):
+                    if isinstance(data, dict): # item has max/min
                         min_val = data.get("minimum", data.get("min", 0))
                         max_val = data.get("maximum", data.get("max", 0))
                     else:
@@ -75,7 +75,7 @@ class IngredientDB:
                     cursor += 1
 
             # Durability (NOT affected by effectiveness)
-            self.durability[i] = ing.get("itemIDs", {}).get("dura", 0)
+            self.durability[i] = ing.get("itemIDs", {}).get("dura", 0) # durability
 
             # Effectiveness
             pos = ing.get("posMods", {})
@@ -86,4 +86,48 @@ class IngredientDB:
             self.effectiveness[i, 4] = pos.get("touching", 0)
             self.effectiveness[i, 5] = pos.get("notTouching", 0)
 
-        self.stat_ptr[self.n] = cursor
+        self.stat_ptr[self.n] = cursor # local ingredient id, inside the database
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
