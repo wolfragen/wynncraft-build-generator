@@ -6,7 +6,7 @@ class SearchBase:
     Simplified search engine.
 
     Leaf-only evaluation model:
-    - DFS only selects ingredients
+    - DFS only selects ingredients (TODO: Change when we pre-compute sets)
     - All craft computation happens at depth == max_depth
     """
 
@@ -24,11 +24,14 @@ class SearchBase:
 
     @staticmethod
     def execute(db, query, recipe, max_depth):
+        """
+        Launch core search
+        """
 
-        state = CraftState(max_depth=max_depth)
+        state = CraftState(max_depth=max_depth) # Final state of a crafted item
 
         from core.search_dfs import DFSSearch
-        search = DFSSearch(db, query, recipe)
+        search = DFSSearch(db, query, recipe) # DFS search class
 
         search.run(state)
 

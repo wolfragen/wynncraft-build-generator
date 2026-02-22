@@ -4,7 +4,7 @@ def filter_raw_ingredients(
     query,
 ):
     """
-    Exact rule-based filtering as specified.
+    Takes all ingredients from json and the user Query, then returns only useful ingredients.
     """
 
     filtered = []
@@ -16,7 +16,7 @@ def filter_raw_ingredients(
     min_dura = query.min_durability
     item_type = query.item_type
 
-    for ing in ingredients_raw:
+    for ing in ingredients_raw: # checks if each ingredient is useful
 
         # ---- Item type filter ----
         if item_type is not None:
@@ -26,14 +26,14 @@ def filter_raw_ingredients(
 
         keep = False
 
-        # ---- Durability rule (4) ----
+        # ---- Positive Durability filter ----
         if min_dura is not None:
             dura = ing.get("itemIDs", {}).get("dura", 0)
             if dura > 0:
                 filtered.append(ing)
                 continue
 
-        ids = ing.get("ids")
+        ids = ing.get("ids") # normal stats
         if ids:
 
             for stat_name, data in ids.items():
@@ -42,33 +42,34 @@ def filter_raw_ingredients(
                 if idx is None:
                     continue
 
-                if isinstance(data, dict):
-                    min_val = data.get("min", data.get("minimum", 0))
-                    max_val = data.get("max", data.get("maximum", 0))
-                else:
+                if isinstance(data, dict): # For the stats that have min/max (basically all of them)
+                    min_val = data.get("min", data.get("minimum", 0)) # get min
+                    max_val = data.get("max", data.get("maximum", 0)) # get max
+                else: # otherwise min/max are the same
                     min_val = data
                     max_val = data
 
-                # ---- Rule 1 ----
+                # ---- Minimum defined and stat can be positive ----
                 if has_min[idx] and max_val > 0:
                     keep = True
                     break
 
-                # ---- Rule 2 ----
+                # ---- Maximum defined and stat can be negative ----
                 if has_max[idx] and min_val < 0:
                     keep = True
                     break
 
-                # ---- Rule 5 (weight) ----
+                # ---- Positive weight defined and can be positive ----
                 if weights[idx] > 0 and max_val > 0:
                     keep = True
                     break
 
+                # ---- Negative weight defined and can be negative ----
                 if weights[idx] < 0 and min_val < 0:
                     keep = True
                     break
 
-                # ---- Rule 3 (inversion) ----
+                # ---- Inversion if enabled ----
                 if search_inv:
 
                     if has_min[idx] and min_val < 0:
@@ -87,26 +88,50 @@ def filter_raw_ingredients(
                         keep = True
                         break
 
-        # ---- Effectiveness rule (6, 7) ----
+        # ---- Effectiveness ----
         if not keep:
-            pos = ing.get("posMods", {})
+            pos = ing.get("posMods", {}) # gets effectiveness stats
 
             if pos:
                 has_pos_eff = False
                 has_neg_eff = False
 
-                for v in pos.values():
+                for v in pos.values(): # look for positive or negative
                     if v > 0:
                         has_pos_eff = True
                     elif v < 0:
                         has_neg_eff = True
 
-                if has_pos_eff:
+                if has_pos_eff: # always keep positive eff
                     keep = True
-                elif search_inv and has_neg_eff:
+                elif search_inv and has_neg_eff: # only keep negative eff if we look for inversion (TODO: True even with negative weight ?...)
                     keep = True
 
         if keep:
             filtered.append(ing)
 
     return filtered
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
