@@ -26,6 +26,11 @@ def evaluate_leaf(
     TOUCHING,
     NOT_TOUCHING,
 ):
+    """
+    Evaluate a 6-ingredient craft to compute all the stats, and return a score.
+    Returns -1 if it doesn't respect the criterias
+    TODO: -1 might be dangerous, switching to -inf would be fine ?
+    """
     # Allocate locally (Numba stack allocation, very cheap)
     slot_eff = np.zeros(6, dtype=np.int32)
     effective_stats = np.zeros(min_vals.shape[0], dtype=np.int32)

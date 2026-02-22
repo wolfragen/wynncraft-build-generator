@@ -1,165 +1,123 @@
+"""
+query.py
+
+Handles stat query parsing and projection.
+
+Design goals:
+- Support all stats defined in data.stats
+- Preserve existing mask semantics
+- Expose full stat space arrays for filtering
+- Provide projected stat space for search
+- No dict lookups in hot path
+"""
+
 import numpy as np
+
+from data.stats import STAT_INDEX, STAT_COUNT
 
 
 class Query:
     """
-    Main search class, used everywhere else.
-    
-    Stores all useful information to be accessed easily afterward.
-    Contains : 
-        - min/max values
-        - weights
-        - relevant stat indices
-    along with other things.
+    Represents a single stat query.
     """
-
-    __slots__ = (
-        "n_stats",
-        "min_vals",
-        "max_vals",
-        "has_min_mask",
-        "has_max_mask",
-        "weights",
-        "search_for_inversion",
-        "algorithm",
-        "item_type",
-        "min_durability",
-        "durability_weight",
-        "relevant_stat_indices"
-    )
 
     def __init__(
         self,
-        n_stats: int,
-        min_vals: np.ndarray,
-        max_vals: np.ndarray,
-        has_min_mask: np.ndarray,
-        has_max_mask: np.ndarray,
-        weights: np.ndarray,
+        user_json: dict,
         search_for_inversion: bool,
-        algorithm: str,
-        item_type: str | None,
-        min_durability: int | None,
-        durability_weight: float,
+        item_type=None,
+        skill=None,
     ):
-        self.n_stats = n_stats
+        """
+        Parse user query.
 
-        self.min_vals = min_vals
-        self.max_vals = max_vals
+        Args:
+            user_json: dict of stat constraints
+            search_for_inversion: bool
+            item_type: optional crafting profession filter
+            skill: optional skill filter (reserved for later use)
+        """
 
-        self.has_min_mask = has_min_mask
-        self.has_max_mask = has_max_mask
-
-        self.weights = weights
-
+        # ------------------------------------------------------------
+        # Store flags used by ingredient_filter
+        # ------------------------------------------------------------
         self.search_for_inversion = search_for_inversion
-        self.algorithm = algorithm
         self.item_type = item_type
+        self.skill = skill
 
-        self.min_durability = min_durability
-        self.durability_weight = durability_weight
-        
-        # First check to see if stat is relevant
-        # Used in loops instead of looping over all stats id, only loop over relevant stats
-        self.relevant_stat_indices = np.where(self.has_min_mask | self.has_max_mask | (self.weights != 0))[0]
+        self.min_durability = None
 
+        # ------------------------------------------------------------
+        # Full stat space storage (used by filter)
+        # ------------------------------------------------------------
+        self.min = np.zeros(STAT_COUNT, dtype=np.int32)
+        self.max = np.zeros(STAT_COUNT, dtype=np.int32)
+        self.weights = np.zeros(STAT_COUNT, dtype=np.float32)
 
-def build_query(
-    user_query: dict,
-    stat_index: dict,
-    search_for_inversion: bool,
-    algorithm: str,
-    item_type: str | None = None,
-) -> Query:
-    """
-    Build Query from user input.
+        self.has_min_mask = np.zeros(STAT_COUNT, dtype=np.bool_)
+        self.has_max_mask = np.zeros(STAT_COUNT, dtype=np.bool_)
 
-    user_query example:
-    {
-        "gSpd": {"min": 1, "weight": 1.0},
-        "gXp": {"min": -10, "weight": 0.35},
-        "durability": {"min": 70, "weight": 0.0001},
-    }
-    """
+        active_mask = np.zeros(STAT_COUNT, dtype=np.bool_)
 
-    n_stats = len(stat_index)
+        # ------------------------------------------------------------
+        # Parse user JSON
+        # ------------------------------------------------------------
+        for stat_name, config in user_json.items():
 
-    min_vals = np.zeros(n_stats, dtype=np.int32)
-    max_vals = np.zeros(n_stats, dtype=np.int32)
+            # Special durability handling
+            if stat_name == "durability":
+                self.min_durability = config.get("min")
+                continue
 
-    # Those two masks are here to filter ingredients. 
-    # For example, we will keep positive spell dmg if has_min_mask[spell_dmg_id] == True
-    has_min_mask = np.zeros(n_stats, dtype=np.bool_)
-    has_max_mask = np.zeros(n_stats, dtype=np.bool_)
+            idx = STAT_INDEX.get(stat_name)
+            if idx is None:
+                continue
 
-    weights = np.zeros(n_stats, dtype=np.float32)
+            stat_min = config.get("min")
+            stat_max = config.get("max")
+            stat_weight = config.get("weight")
 
-    min_durability = None
-    durability_weight = 0.0
+            if stat_min is not None:
+                self.min[idx] = stat_min
+                self.has_min_mask[idx] = True
+                active_mask[idx] = True
 
-    for stat_name, cfg in user_query.items(): # Checks which stats are of interest
+            if stat_max is not None:
+                self.max[idx] = stat_max
+                self.has_max_mask[idx] = True
+                active_mask[idx] = True
 
-        # ---- Durability ----
-        if stat_name == "durability":
+            if stat_weight is not None:
+                self.weights[idx] = stat_weight
+                active_mask[idx] = True
 
-            if "min" in cfg:
-                min_durability = int(cfg["min"])
+        # ------------------------------------------------------------
+        # Build projected stat space (for search phase)
+        # ------------------------------------------------------------
+        self.active_indices = np.nonzero(active_mask)[0].astype(np.int32)
+        self.stat_count = len(self.active_indices)
 
-            if "weight" in cfg:
-                durability_weight = float(cfg["weight"])
+        self.min_proj = self.min[self.active_indices]
+        self.max_proj = self.max[self.active_indices]
+        self.weights_proj = self.weights[self.active_indices]
 
-            continue
+        self.has_min_mask_proj = self.has_min_mask[self.active_indices]
+        self.has_max_mask_proj = self.has_max_mask[self.active_indices]
 
-        # ---- Normal stats ----
-        if stat_name not in stat_index:
-            raise ValueError(f"Unknown stat: {stat_name}")
+        self.weight_mask_proj = self.weights_proj != 0.0
 
-        idx = stat_index[stat_name]
+    # ------------------------------------------------------------
+    # Projection helper
+    # ------------------------------------------------------------
 
-        if "min" in cfg:
-            min_vals[idx] = int(cfg["min"])
-            has_min_mask[idx] = True # Used to filter ingredients
+    def project_stat_matrix(self, stat_matrix: np.ndarray) -> np.ndarray:
+        """
+        Project ingredient stat matrix into active stat space.
 
-        if "max" in cfg:
-            max_vals[idx] = int(cfg["max"])
-            has_max_mask[idx] = True # Used to filter ingredients
+        Input:
+            stat_matrix: [N, STAT_COUNT]
 
-        if "weight" in cfg:
-            weights[idx] = float(cfg["weight"]) # Score computation
-
-    return Query(
-        n_stats=n_stats,
-        min_vals=min_vals,
-        max_vals=max_vals,
-        has_min_mask=has_min_mask,
-        has_max_mask=has_max_mask,
-        weights=weights,
-        search_for_inversion=search_for_inversion,
-        algorithm=algorithm,
-        item_type=item_type,
-        min_durability=min_durability,
-        durability_weight=durability_weight,
-    )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        Output:
+            [N, active_stat_count]
+        """
+        return stat_matrix[:, self.active_indices]

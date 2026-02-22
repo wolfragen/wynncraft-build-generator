@@ -1,133 +1,100 @@
+"""
+ingredient_db.py
+
+Builds compact ingredient database after filtering.
+
+Design goals:
+- Only store active query stats
+- Store only JSON id (no raw dicts)
+- Compact contiguous memory layout
+- Precompute contributor structures for fast pruning
+"""
+
 import numpy as np
 
 
 class IngredientDB:
     """
-    Compact ingredient database aligned with global stat_index.
+    Compact ingredient database optimized for search.
 
-    Stores:
-    - ingredient JSON id
-    - CSR stat representation (global stat ids)
-    - durability (not affected by effectiveness)
-    - effectiveness modifiers (6 directions)
+    Stored data:
+    - stat_matrix        : int16 [N, K]
+    - json_ids           : int32 [N]
+    - contrib_mask       : bool  [N, K]
+    - stat_contributors  : list[np.ndarray[int32]]
+    - stat_bitmask       : uint64 [N]
     """
 
-    __slots__ = (
-        "n",
-        "ids",
-        "stat_ptr",
-        "stat_ids",
-        "stat_min",
-        "stat_max",
-        "durability",
-        "effectiveness",
-    )
+    def __init__(self, filtered_ingredients: list, query):
+        """
+        Build optimized database from filtered ingredients.
 
-    def __init__(self, ingredients_raw, stat_index):
+        Args:
+            filtered_ingredients: list of raw ingredient dicts
+            query: Query instance
+        """
 
-        self.n = len(ingredients_raw)
-        self.ids = np.zeros(self.n, dtype=np.int32)
+        self.count = len(filtered_ingredients)
+        self.stat_count = query.stat_count
+        active_indices = query.active_indices
+        search_inv = query.search_for_inversion
 
-        # ---------- Count total stat entries (for fun lol) ----------
-        total_entries = 0
-        for ing in ingredients_raw:
-            ids = ing.get("ids")
-            if ids:
-                total_entries += len(ids)
+        # ------------------------------------------------------------
+        # Projected stat matrix [N, K]
+        # ------------------------------------------------------------
+        self.stat_matrix = np.empty(
+            (self.count, self.stat_count),
+            dtype=np.int16
+        )
 
-        # ---------- Allocate CSR (Compressed Sparse Row) ----------
-        self.stat_ptr = np.zeros(self.n + 1, dtype=np.int32)
-        self.stat_ids = np.zeros(total_entries, dtype=np.uint16)
-        self.stat_min = np.zeros(total_entries, dtype=np.int32)
-        self.stat_max = np.zeros(total_entries, dtype=np.int32)
+        # ------------------------------------------------------------
+        # JSON id mapping [N]
+        # ------------------------------------------------------------
+        self.json_ids = np.empty(self.count, dtype=np.int32)
 
-        self.durability = np.zeros(self.n, dtype=np.int32)
-        self.effectiveness = np.zeros((self.n, 6), dtype=np.int16)
+        for new_idx, ing in enumerate(filtered_ingredients):
 
-        # ---------- Fill ----------
-        cursor = 0
+            self.stat_matrix[new_idx] = ing["stats"][active_indices]
+            self.json_ids[new_idx] = ing["id"]
 
-        for i, ing in enumerate(ingredients_raw):
+        # ------------------------------------------------------------
+        # Contribution mask [N, K]
+        # ------------------------------------------------------------
+        if not search_inv:
+            self.contrib_mask = self.stat_matrix > 0
+        else:
+            self.contrib_mask = self.stat_matrix < 0
 
-            self.stat_ptr[i] = cursor
-            self.ids[i] = ing["id"]
+        # ------------------------------------------------------------
+        # Contributors per stat
+        # ------------------------------------------------------------
+        self.stat_contributors = [
+            np.nonzero(self.contrib_mask[:, k])[0].astype(np.int32)
+            for k in range(self.stat_count)
+        ]
 
-            ids = ing.get("ids") # normal stats
-            if ids:
-                for stat_name, data in ids.items():
+        # ------------------------------------------------------------
+        # Bitmask per ingredient (fast coverage checks)
+        # ------------------------------------------------------------
+        # Supports up to 64 active stats (far above realistic usage)
+        self.stat_bitmask = np.zeros(self.count, dtype=np.uint64)
 
-                    if stat_name not in stat_index:
-                        continue
+        for k in range(self.stat_count):
+            bit = np.uint64(1) << np.uint64(k)
+            self.stat_bitmask[self.contrib_mask[:, k]] |= bit
 
-                    gid = stat_index[stat_name]
+    # ------------------------------------------------------------
+    # Access helpers
+    # ------------------------------------------------------------
 
-                    if isinstance(data, dict): # item has max/min
-                        min_val = data.get("minimum", data.get("min", 0))
-                        max_val = data.get("maximum", data.get("max", 0))
-                    else:
-                        min_val = data
-                        max_val = data
+    def get_stats(self, idx: int):
+        return self.stat_matrix[idx]
 
-                    self.stat_ids[cursor] = gid
-                    self.stat_min[cursor] = min_val
-                    self.stat_max[cursor] = max_val
+    def get_json_id(self, idx: int):
+        return self.json_ids[idx]
 
-                    cursor += 1
+    def get_bitmask(self, idx: int):
+        return self.stat_bitmask[idx]
 
-            # Durability (NOT affected by effectiveness)
-            self.durability[i] = ing.get("itemIDs", {}).get("dura", 0) # durability
-
-            # Effectiveness
-            pos = ing.get("posMods", {})
-            self.effectiveness[i, 0] = pos.get("left", 0)
-            self.effectiveness[i, 1] = pos.get("right", 0)
-            self.effectiveness[i, 2] = pos.get("above", 0)
-            self.effectiveness[i, 3] = pos.get("under", 0)
-            self.effectiveness[i, 4] = pos.get("touching", 0)
-            self.effectiveness[i, 5] = pos.get("notTouching", 0)
-
-        self.stat_ptr[self.n] = cursor # local ingredient id, inside the database
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
+    def __len__(self):
+        return self.count

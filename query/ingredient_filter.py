@@ -1,10 +1,22 @@
+"""
+ingredient_filter.py
+
+Filters raw ingredients according to Query rules.
+
+Exact same logic as original implementation,
+adapted to dense stat vectors.
+
+Effectiveness filtering removed.
+"""
+
+
 def filter_raw_ingredients(
     ingredients_raw,
     stat_index,
     query,
 ):
     """
-    Takes all ingredients from json and the user Query, then returns only useful ingredients.
+    Takes all ingredients and the user Query, then returns only useful ingredients.
     """
 
     filtered = []
@@ -16,7 +28,7 @@ def filter_raw_ingredients(
     min_dura = query.min_durability
     item_type = query.item_type
 
-    for ing in ingredients_raw: # checks if each ingredient is useful
+    for ing in ingredients_raw:
 
         # ---- Item type filter ----
         if item_type is not None:
@@ -26,112 +38,69 @@ def filter_raw_ingredients(
 
         keep = False
 
+        stats = ing["stats"]
+
         # ---- Positive Durability filter ----
         if min_dura is not None:
-            dura = ing.get("itemIDs", {}).get("dura", 0)
-            if dura > 0:
-                filtered.append(ing)
-                continue
-
-        ids = ing.get("ids") # normal stats
-        if ids:
-
-            for stat_name, data in ids.items():
-
-                idx = stat_index.get(stat_name)
-                if idx is None:
+            dura_idx = stat_index.get("durability")
+            if dura_idx is not None:
+                if stats[dura_idx] > 0:
+                    filtered.append(ing)
                     continue
 
-                if isinstance(data, dict): # For the stats that have min/max (basically all of them)
-                    min_val = data.get("min", data.get("minimum", 0)) # get min
-                    max_val = data.get("max", data.get("maximum", 0)) # get max
-                else: # otherwise min/max are the same
-                    min_val = data
-                    max_val = data
+        # ---- Normal stats ----
+        for stat_name, idx in stat_index.items():
 
-                # ---- Minimum defined and stat can be positive ----
-                if has_min[idx] and max_val > 0:
+            # Skip stats not used in query
+            if not (has_min[idx] or has_max[idx] or weights[idx] != 0):
+                continue
+
+            value = stats[idx]
+
+            # Since rolls are removed:
+            min_val = value
+            max_val = value
+
+            # ---- Minimum defined and stat can be positive ----
+            if has_min[idx] and max_val > 0:
+                keep = True
+                break
+
+            # ---- Maximum defined and stat can be negative ----
+            if has_max[idx] and min_val < 0:
+                keep = True
+                break
+
+            # ---- Positive weight defined and can be positive ----
+            if weights[idx] > 0 and max_val > 0:
+                keep = True
+                break
+
+            # ---- Negative weight defined and can be negative ----
+            if weights[idx] < 0 and min_val < 0:
+                keep = True
+                break
+
+            # ---- Inversion if enabled ----
+            if search_inv:
+
+                if has_min[idx] and min_val < 0:
                     keep = True
                     break
 
-                # ---- Maximum defined and stat can be negative ----
-                if has_max[idx] and min_val < 0:
+                if has_max[idx] and max_val > 0:
                     keep = True
                     break
 
-                # ---- Positive weight defined and can be positive ----
-                if weights[idx] > 0 and max_val > 0:
+                if weights[idx] > 0 and min_val < 0:
                     keep = True
                     break
 
-                # ---- Negative weight defined and can be negative ----
-                if weights[idx] < 0 and min_val < 0:
+                if weights[idx] < 0 and max_val > 0:
                     keep = True
                     break
-
-                # ---- Inversion if enabled ----
-                if search_inv:
-
-                    if has_min[idx] and min_val < 0:
-                        keep = True
-                        break
-
-                    if has_max[idx] and max_val > 0:
-                        keep = True
-                        break
-
-                    if weights[idx] > 0 and min_val < 0:
-                        keep = True
-                        break
-
-                    if weights[idx] < 0 and max_val > 0:
-                        keep = True
-                        break
-
-        # ---- Effectiveness ----
-        if not keep:
-            pos = ing.get("posMods", {}) # gets effectiveness stats
-
-            if pos:
-                has_pos_eff = False
-                has_neg_eff = False
-
-                for v in pos.values(): # look for positive or negative
-                    if v > 0:
-                        has_pos_eff = True
-                    elif v < 0:
-                        has_neg_eff = True
-
-                if has_pos_eff: # always keep positive eff
-                    keep = True
-                elif search_inv and has_neg_eff: # only keep negative eff if we look for inversion (TODO: True even with negative weight ?...)
-                    keep = True
 
         if keep:
             filtered.append(ing)
 
     return filtered
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
