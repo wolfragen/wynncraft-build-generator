@@ -20,9 +20,7 @@ def get_filtered_ingredients(all_ingreds, profession, include_dura):
         has_ingred_eff = "ingredEff" in ing.get("ids", {})
         is_meta = has_pos_mods or has_ingred_eff
         
-        # Collect Item IDs (Requirements and Durability)
         item_ids = ing.get("itemIDs", {})
-        # Collect Consumable IDs (Duration, Charges, etc)
         cons_ids = ing.get("consumableIDs", {})
         
         dura = item_ids.get("dura", 0)
@@ -30,21 +28,18 @@ def get_filtered_ingredients(all_ingreds, profession, include_dura):
         
         if is_meta or (include_dura and is_dura):
             stats = {}
-            # 1. Process regular IDs (affected by effectiveness)
             for name, val in ing.get("ids", {}).items():
                 if isinstance(val, dict):
                     stats[name] = {"min": val.get("minimum", 0), "max": val.get("maximum", 0)}
                 else:
                     stats[name] = {"min": val, "max": val}
             
-            # 2. Process Requirements (affected by effectiveness)
             reqs = ["strReq", "dexReq", "intReq", "defReq", "agiReq"]
             for r in reqs:
                 val = item_ids.get(r, 0)
                 if val != 0:
                     stats[r] = {"min": val, "max": val}
 
-            # 3. Process Non-affected stats (Static)
             static_stats = {}
             if dura != 0: static_stats["durability"] = {"min": dura, "max": dura}
             
@@ -70,7 +65,6 @@ def calculate_recipe_stats(grid):
     for i, ing in enumerate(grid):
         if ing is None: continue
         pm = ing["posMods"]
-        # ingredEff is stored in 'stats' as min/max (usually identical)
         effs[i] += ing["stats"].get("ingredEff", {"min": 0})["min"]
         
         if i % 2 == 0: effs[i + 1] += pm.get('right', 0)
@@ -86,19 +80,15 @@ def calculate_recipe_stats(grid):
             if target != i and target not in adjacents[i]:
                 effs[target] += pm.get('notTouching', 0)
 
-    eff_values = [max(0, e) for e in effs]
-    
+    # Effectiveness is NO LONGER clamped to 0 so negative effs evaluate properly.
     total_stats = {}
     
     for s, ing in enumerate(grid):
         if ing is None: continue
-        multiplier = eff_values[s]
+        multiplier = effs[s]
         
-        # A. Process Affected Stats
         for name, range_val in ing["stats"].items():
             if name == "ingredEff": continue
-            
-            # (raw * effectiveness) // 100
             b_min = (range_val["min"] * multiplier) // 100
             b_max = (range_val["max"] * multiplier) // 100
             
@@ -107,7 +97,6 @@ def calculate_recipe_stats(grid):
                 total_stats[name]["min"] += b_min
                 total_stats[name]["max"] += b_max
         
-        # B. Process Static Stats (Durability, etc)
         for name, range_val in ing["static_stats"].items():
             if name not in total_stats: total_stats[name] = {"min": 0, "max": 0}
             total_stats[name]["min"] += range_val["min"]
@@ -115,11 +104,111 @@ def calculate_recipe_stats(grid):
             
     return {
         "ings": [ing["id"] if ing else -1 for ing in grid],
-        "eff": eff_values,
+        "eff": effs,
         "stats": total_stats
     }
 
-def run_precalculation(profession, include_dura_ingredients=True):
+def compare_recipes(r_a, r_b):
+    """Returns 1 if a > b, -1 if b > a, 2 if a == b, 0 if incomparable"""
+    a_better = False
+    b_better = False
+    
+    # 1. Compare Effectiveness on Empty Slots (-1 ingredients)
+    empty_effs_a = [r_a['eff'][i] for i in range(6) if r_a['ings'][i] == -1]
+    empty_effs_b = [r_b['eff'][i] for i in range(6) if r_b['ings'][i] == -1]
+    
+    pos_a = sorted([e for e in empty_effs_a if e > 0], reverse=True)
+    pos_b = sorted([e for e in empty_effs_b if e > 0], reverse=True)
+    
+    neg_a = sorted([e for e in empty_effs_a if e < 0]) # Ascending: -50, -10
+    neg_b = sorted([e for e in empty_effs_b if e < 0])
+    
+    # If the counts of positive or negative effs differ, they are incomparable
+    if len(pos_a) != len(pos_b) or len(neg_a) != len(neg_b):
+        return 0
+        
+    for pa, pb in zip(pos_a, pos_b):
+        if pa > pb: a_better = True
+        elif pb > pa: b_better = True
+        
+    for na, nb in zip(neg_a, neg_b):
+        # Lower negative is better (-50 is better than -10)
+        if na < nb: a_better = True
+        elif nb < na: b_better = True
+
+    if a_better and b_better:
+        return 0
+
+    # 2. Compare Stats
+    stats_a = r_a['stats']
+    stats_b = r_b['stats']
+    req_stats = {"strReq", "dexReq", "intReq", "defReq", "agiReq"}
+    keys = set(stats_a.keys()).union(set(stats_b.keys()))
+    
+    for k in keys:
+        a_val = stats_a.get(k, {"min": 0, "max": 0})
+        b_val = stats_b.get(k, {"min": 0, "max": 0})
+        
+        a_min, a_max = a_val["min"], a_val["max"]
+        b_min, b_max = b_val["min"], b_val["max"]
+        
+        if k in req_stats:
+            # For requirements, lower is better
+            if a_min < b_min: a_better = True
+            elif b_min < a_min: b_better = True
+            
+            if a_max < b_max: a_better = True
+            elif b_max < a_max: b_better = True
+        else:
+            # For standard stats, higher is better
+            if a_min > b_min: a_better = True
+            elif b_min > a_min: b_better = True
+            
+            if a_max > b_max: a_better = True
+            elif b_max > a_max: b_better = True
+            
+        # Early exit if incomparable
+        if a_better and b_better:
+            return 0 
+            
+    if a_better: return 1
+    if b_better: return -1
+    return 2 # Identical
+
+def local_cull(recipes):
+    """Keeps only the Pareto frontier of recipes within a given localized batch."""
+    survivors = []
+    for r in recipes:
+        is_dominated = False
+        to_remove = []
+        for i, s in enumerate(survivors):
+            cmp = compare_recipes(r, s)
+            if cmp == -1 or cmp == 2:
+                # 's' strictly dominates 'r', or they are completely identical. 
+                is_dominated = True
+                break
+            elif cmp == 1:
+                # 'r' strictly dominates 's'
+                to_remove.append(i)
+        
+        if not is_dominated:
+            # Remove dominated survivors in reverse order to preserve indices
+            for i in reversed(to_remove):
+                survivors.pop(i)
+            survivors.append(r)
+            
+    return survivors
+
+def get_unique_permutations(ing_multiset):
+    """Yields only unique permutations of a multiset based on ingredient IDs."""
+    seen = set()
+    for perm in itertools.permutations(ing_multiset):
+        perm_ids = tuple(ing['id'] for ing in perm)
+        if perm_ids not in seen:
+            seen.add(perm_ids)
+            yield perm
+
+def run_precalculation(profession, include_dura_ingredients=True, pre_filled=5):
     print(f"--- PRECALCULATING: {profession} ---")
     data_dir = "data"
     precalc_dir = os.path.join(data_dir, "precalc/full")
@@ -130,39 +219,67 @@ def run_precalculation(profession, include_dura_ingredients=True):
     filtered = get_filtered_ingredients(all_data, profession, include_dura_ingredients)
     print(f"Relevant ingredients found: {len(filtered)}")
     
-    for i in range(1, 7):
+    for i in range(1, pre_filled+1):
         filename = os.path.join(precalc_dir, f"{profession}_META_{i}.json")
-        num_slot_combos = math.comb(6, i)
-        total_for_file = num_slot_combos * (len(filtered) ** i)
         
-        print(f"\nStarting {profession}_META_{i}.json (Total: {total_for_file:,} recipes)")
+        num_multisets = math.comb(len(filtered) + i - 1, i)
+        num_slot_combos = math.comb(6, i)
+        total_generated_expected = num_slot_combos * (len(filtered) ** i)
+        
+        print(f"\nStarting {profession}_META_{i}.json")
+        print(f"Expected generated combinations: {total_generated_expected:,}")
+        
         start_time = time.time()
-        processed = 0
-        checkpoint = max(1, total_for_file // 100)
+        total_generated = 0
+        total_saved = 0
+        total_culled = 0
+        
+        checkpoint = max(1, num_multisets // 100)
         
         with open(filename, "w", encoding="utf-8") as f:
             f.write("[\n")
             first_entry = True
-            for active_slot_indices in itertools.combinations(range(6), i):
-                for ing_combo in itertools.product(filtered, repeat=i):
-                    grid = [None] * 6
-                    for slot_local_idx, grid_idx in enumerate(active_slot_indices):
-                        grid[grid_idx] = ing_combo[slot_local_idx]
-                    
-                    recipe_data = calculate_recipe_stats(grid)
-                    
+            
+            for multiset_idx, ing_multiset in enumerate(itertools.combinations_with_replacement(filtered, i)):
+                local_recipes = []
+                
+                for ing_perm in get_unique_permutations(ing_multiset):
+                    for active_slot_indices in itertools.combinations(range(6), i):
+                        grid = [None] * 6
+                        for slot_local_idx, grid_idx in enumerate(active_slot_indices):
+                            grid[grid_idx] = ing_perm[slot_local_idx]
+                        
+                        recipe_data = calculate_recipe_stats(grid)
+                        local_recipes.append(recipe_data)
+                        total_generated += 1
+                
+                survivors = local_cull(local_recipes)
+                
+                total_culled += (len(local_recipes) - len(survivors))
+                total_saved += len(survivors)
+                
+                for recipe in survivors:
                     if not first_entry: f.write(",\n")
-                    f.write(json.dumps(recipe_data))
+                    f.write(json.dumps(recipe))
                     first_entry = False
-                    
-                    processed += 1
-                    if processed % checkpoint == 0:
-                        pct = (processed * 100) // total_for_file
-                        print(f"Progress: {pct}% | {processed}/{total_for_file} | {time.time()-start_time:.0f}s", end='\r')
+                
+                if (multiset_idx + 1) % checkpoint == 0 or (multiset_idx + 1) == num_multisets:
+                    pct = ((multiset_idx + 1) * 100) // num_multisets
+                    elapsed = time.time() - start_time
+                    print(f"Progress: {pct}% | "
+                          f"Gen: {total_generated:,} | Saved: {total_saved:,} | Culled: {total_culled:,} "
+                          f"| Time: {elapsed:.0f}s", end='\r')
+            
             f.write("\n]")
+            
         print(f"\nFinished {profession}_META_{i}.json in {time.time() - start_time:.2f}s")
+        print(f"Final Batch Stats - Saved: {total_saved:,} | Culled: {total_culled:,} ", end="")
+        if total_generated > 0:
+            print(f"({(total_culled / total_generated) * 100:.2f}% size reduction)")
 
 if __name__ == "__main__":
     TARGET_PROFESSION = "JEWELING" 
     if os.path.exists("data/ingreds_compress.json"):
-        run_precalculation(TARGET_PROFESSION, include_dura_ingredients=True)
+        run_precalculation(TARGET_PROFESSION, include_dura_ingredients=True, pre_filled=5)
+    else:
+        print("Data file not found. Ensure 'data/ingreds_compress.json' exists.")
