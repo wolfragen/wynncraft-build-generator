@@ -174,4 +174,4 @@ def cull_recipes(filename):
     print(f"Done! Saved to {out_path}")
 
 if __name__ == "__main__":
-    cull_recipes("JEWELING_META_1.json")
+    cull_recipes("JEWELING_1.json")
