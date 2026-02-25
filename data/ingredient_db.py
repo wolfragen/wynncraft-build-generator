@@ -4,10 +4,10 @@ ingredient_db.py
 Builds compact ingredient database after filtering.
 
 Design goals:
-- Only store active query stats
-- Store only JSON id (no raw dicts)
-- Compact contiguous memory layout
-- Precompute contributor structures for fast pruning
+- Store projected min/max stat matrices
+- Store only JSON id
+- Precompute contributor structures
+- Optimized for search phase
 """
 
 import numpy as np
@@ -16,13 +16,6 @@ import numpy as np
 class IngredientDB:
     """
     Compact ingredient database optimized for search.
-
-    Stored data:
-    - stat_matrix        : int16 [N, K]
-    - json_ids           : int32 [N]
-    - contrib_mask       : bool  [N, K]
-    - stat_contributors  : list[np.ndarray[int32]]
-    - stat_bitmask       : uint64 [N]
     """
 
     def __init__(self, filtered_ingredients: list, query):
@@ -40,30 +33,38 @@ class IngredientDB:
         search_inv = query.search_for_inversion
 
         # ------------------------------------------------------------
-        # Projected stat matrix [N, K]
+        # Projected stat matrices [N, K]
         # ------------------------------------------------------------
-        self.stat_matrix = np.empty(
+        self.stat_min_matrix = np.empty(
+            (self.count, self.stat_count),
+            dtype=np.int16
+        )
+
+        self.stat_max_matrix = np.empty(
             (self.count, self.stat_count),
             dtype=np.int16
         )
 
         # ------------------------------------------------------------
-        # JSON id mapping [N]
+        # JSON id mapping
         # ------------------------------------------------------------
         self.json_ids = np.empty(self.count, dtype=np.int32)
 
         for new_idx, ing in enumerate(filtered_ingredients):
 
-            self.stat_matrix[new_idx] = ing["stats"][active_indices]
+            self.stat_min_matrix[new_idx] = ing["stats_min"][active_indices]
+            self.stat_max_matrix[new_idx] = ing["stats_max"][active_indices]
             self.json_ids[new_idx] = ing["id"]
 
         # ------------------------------------------------------------
         # Contribution mask [N, K]
         # ------------------------------------------------------------
         if not search_inv:
-            self.contrib_mask = self.stat_matrix > 0
+            # Normal search: stat can be positive
+            self.contrib_mask = self.stat_max_matrix > 0
         else:
-            self.contrib_mask = self.stat_matrix < 0
+            # Inversion search: stat can be negative
+            self.contrib_mask = self.stat_min_matrix < 0
 
         # ------------------------------------------------------------
         # Contributors per stat
@@ -74,9 +75,8 @@ class IngredientDB:
         ]
 
         # ------------------------------------------------------------
-        # Bitmask per ingredient (fast coverage checks)
+        # Bitmask per ingredient
         # ------------------------------------------------------------
-        # Supports up to 64 active stats (far above realistic usage)
         self.stat_bitmask = np.zeros(self.count, dtype=np.uint64)
 
         for k in range(self.stat_count):
@@ -86,9 +86,6 @@ class IngredientDB:
     # ------------------------------------------------------------
     # Access helpers
     # ------------------------------------------------------------
-
-    def get_stats(self, idx: int):
-        return self.stat_matrix[idx]
 
     def get_json_id(self, idx: int):
         return self.json_ids[idx]

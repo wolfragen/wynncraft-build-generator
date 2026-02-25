@@ -45,8 +45,6 @@ class Query:
         self.item_type = item_type
         self.skill = skill
 
-        self.min_durability = None
-
         # ------------------------------------------------------------
         # Full stat space storage (used by filter)
         # ------------------------------------------------------------
@@ -63,11 +61,6 @@ class Query:
         # Parse user JSON
         # ------------------------------------------------------------
         for stat_name, config in user_json.items():
-
-            # Special durability handling
-            if stat_name == "durability":
-                self.min_durability = config.get("min")
-                continue
 
             idx = STAT_INDEX.get(stat_name)
             if idx is None:
@@ -105,6 +98,8 @@ class Query:
         self.has_max_mask_proj = self.has_max_mask[self.active_indices]
 
         self.weight_mask_proj = self.weights_proj != 0.0
+        
+        self.stat_index_keys_proj = [next(name for name, i in STAT_INDEX.items() if i == idx) for idx in self.active_indices]
 
     # ------------------------------------------------------------
     # Projection helper

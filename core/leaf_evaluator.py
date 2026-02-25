@@ -5,126 +5,64 @@ from numba import njit
 @njit(cache=True, fastmath=True)
 def evaluate_leaf(
     ingredients,
-    effectiveness,
-    stat_ptr,
-    stat_ids,
-    stat_max,
-    durability_arr,
-    scaled_dura_max,
-    relevant,
-    has_min,
-    has_max,
+    k,
+    stat_min_matrix,
+    stat_max_matrix,
+    base_min,
+    base_max,
+    void_effectiveness,
+    use_eff,
+    durability_idx,
+    has_min_mask,
+    has_max_mask,
     min_vals,
     max_vals,
     weights,
-    min_dura,
-    dura_weight,
-    LEFT,
-    RIGHT,
-    ABOVE,
-    UNDER,
-    TOUCHING,
-    NOT_TOUCHING,
 ):
-    """
-    Evaluate a 6-ingredient craft to compute all the stats, and return a score.
-    Returns -1 if it doesn't respect the criterias
-    TODO: -1 might be dangerous, switching to -inf would be fine ?
-    """
-    # Allocate locally (Numba stack allocation, very cheap)
-    slot_eff = np.zeros(6, dtype=np.int32)
-    effective_stats = np.zeros(min_vals.shape[0], dtype=np.int32)
 
-    # ---------------- EFFECTIVENESS ----------------
+    K = min_vals.shape[0]
 
-    for s in range(6):
-        ing = ingredients[s]
-        eff_row = effectiveness[ing]
+    acc_min = np.empty(K, dtype=np.int32)
+    acc_max = np.empty(K, dtype=np.int32)
 
-        # LEFT
-        t = LEFT[s]
-        if t != -1:
-            v = eff_row[0]
-            if v != 0:
-                slot_eff[t] += v
+    # ---------------- INIT ----------------
+    for s in range(K):
+        acc_min[s] = base_min[s]
+        acc_max[s] = base_max[s]
 
-        # RIGHT
-        t = RIGHT[s]
-        if t != -1:
-            v = eff_row[1]
-            if v != 0:
-                slot_eff[t] += v
+    # ---------------- ACCUMULATION ----------------
+    for i in range(k):
 
-        # ABOVE
-        t = ABOVE[s]
-        if t != -1:
-            v = eff_row[2]
-            if v != 0:
-                slot_eff[t] += v
+        ing = ingredients[i]
 
-        # UNDER
-        t = UNDER[s]
-        if t != -1:
-            v = eff_row[3]
-            if v != 0:
-                slot_eff[t] += v
+        mult = void_effectiveness[i] if use_eff else 100
 
-        # TOUCHING
-        v = eff_row[4]
-        if v != 0:
-            for j in range(TOUCHING.shape[1]):
-                t = TOUCHING[s, j]
-                if t != -1:
-                    slot_eff[t] += v
+        row_min = stat_min_matrix[ing]
+        row_max = stat_max_matrix[ing]
 
-        # NOT TOUCHING
-        v = eff_row[5]
-        if v != 0:
-            for j in range(NOT_TOUCHING.shape[1]):
-                t = NOT_TOUCHING[s, j]
-                if t != -1:
-                    slot_eff[t] += v
+        for s in range(K):
 
-    # ---------------- STAT ACCUMULATION ----------------
-
-    for s in range(6):
-        ing = ingredients[s]
-        mult = 100 + slot_eff[s]
-
-        start = stat_ptr[ing]
-        end = stat_ptr[ing + 1]
-
-        for k in range(start, end):
-            sid = stat_ids[k]
-            raw = stat_max[k]
-            effective_stats[sid] += (raw * mult) // 100
-
-    # ---------------- DURABILITY ----------------
-
-    durability = scaled_dura_max
-    for s in range(6):
-        durability += durability_arr[ingredients[s]]
+            if s == durability_idx:
+                acc_min[s] += row_min[s]
+                acc_max[s] += row_max[s]
+            else:
+                acc_min[s] += (row_min[s] * mult) // 100
+                acc_max[s] += (row_max[s] * mult) // 100
 
     # ---------------- CONSTRAINT + SCORE ----------------
-
     score = 0.0
 
-    for idx in relevant:
-        val = effective_stats[idx]
+    for s in range(K):
 
-        if has_min[idx] and val < min_vals[idx]:
-            return -1.0
+        min_v = acc_min[s]
+        max_v = acc_max[s]
 
-        if has_max[idx] and val > max_vals[idx]:
-            return -1.0
+        if has_min_mask[s] and max_v < min_vals[s]:
+            return -np.inf, acc_min, acc_max
 
-        score += val * weights[idx]
+        if has_max_mask[s] and min_v > max_vals[s]:
+            return -np.inf, acc_min, acc_max
 
-    if min_dura != -1:
-        if durability < min_dura:
-            return -1.0
+        score += max_v * weights[s]
 
-    if dura_weight != 0.0:
-        score += durability * dura_weight
-
-    return score
+    return score, acc_min, acc_max

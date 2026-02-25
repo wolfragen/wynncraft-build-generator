@@ -19,23 +19,37 @@ import numpy as np
 from data.stats import STAT_INDEX, STAT_COUNT
 
 
-def _build_stat_vector(data: dict) -> np.ndarray:
+def _build_stat_vectors(data: dict):
     """
-    Build dense stat vector for a single ingredient.
+    Build dense min/max stat vectors for a single ingredient.
 
-    All values are stored as int16.
-    Unknown stats are ignored.
+    Returns:
+        stats_min: int16 [STAT_COUNT]
+        stats_max: int16 [STAT_COUNT]
     """
-    stats = np.zeros(STAT_COUNT, dtype=np.int16)
+
+    stats_min = np.zeros(STAT_COUNT, dtype=np.int16)
+    stats_max = np.zeros(STAT_COUNT, dtype=np.int16)
 
     # ------------------------------------------------------------
     # ids
     # ------------------------------------------------------------
     ids = data.get("ids", {})
     for name, value in ids.items():
+
         idx = STAT_INDEX.get(name)
-        if idx is not None:
-            stats[idx] = value
+        if idx is None:
+            continue
+
+        if isinstance(value, dict):
+            min_val = value.get("min", value.get("minimum", 0))
+            max_val = value.get("max", value.get("maximum", 0))
+        else:
+            min_val = value
+            max_val = value
+
+        stats_min[idx] = min_val
+        stats_max[idx] = max_val
 
     # ------------------------------------------------------------
     # itemIDs
@@ -43,14 +57,23 @@ def _build_stat_vector(data: dict) -> np.ndarray:
     item_ids = data.get("itemIDs", {})
     for name, value in item_ids.items():
 
-        # durability remap
         if name == "dura":
-            idx = STAT_INDEX["durability"] # 2 "dura" in the json...
+            idx = STAT_INDEX["durability"]
         else:
             idx = STAT_INDEX.get(name)
 
-        if idx is not None:
-            stats[idx] = value
+        if idx is None:
+            continue
+
+        if isinstance(value, dict):
+            min_val = value.get("min", value.get("minimum", 0))
+            max_val = value.get("max", value.get("maximum", 0))
+        else:
+            min_val = value
+            max_val = value
+
+        stats_min[idx] = min_val
+        stats_max[idx] = max_val
 
     # ------------------------------------------------------------
     # consumableIDs
@@ -58,16 +81,25 @@ def _build_stat_vector(data: dict) -> np.ndarray:
     consumable_ids = data.get("consumableIDs", {})
     for name, value in consumable_ids.items():
 
-        # duration remap
         if name == "dura":
-            idx = STAT_INDEX["duration"] # 2 "dura" in the json...
+            idx = STAT_INDEX["duration"]
         else:
             idx = STAT_INDEX.get(name)
 
-        if idx is not None:
-            stats[idx] = value
+        if idx is None:
+            continue
 
-    return stats
+        if isinstance(value, dict):
+            min_val = value.get("min", value.get("minimum", 0))
+            max_val = value.get("max", value.get("maximum", 0))
+        else:
+            min_val = value
+            max_val = value
+
+        stats_min[idx] = min_val
+        stats_max[idx] = max_val
+
+    return stats_min, stats_max
 
 
 def load_ingredients(path: str):
@@ -92,11 +124,13 @@ def load_ingredients(path: str):
     ingredients = []
 
     for entry in raw:
+        stats_min, stats_max = _build_stat_vectors(entry)
 
         ingredient = {
             "id": entry["id"],
             "name": entry["name"],
-            "stats": _build_stat_vector(entry),
+            "stats_min": stats_min,
+            "stats_max": stats_max,
             "skills": entry.get("skills", {}),
             "posMods": entry.get("posMods", {}),
             "tier": entry.get("tier", 0),
@@ -107,3 +141,16 @@ def load_ingredients(path: str):
         ingredients.append(ingredient)
 
     return ingredients
+
+
+
+
+
+
+
+
+
+
+
+
+

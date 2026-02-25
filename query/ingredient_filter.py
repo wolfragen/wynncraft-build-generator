@@ -9,10 +9,11 @@ adapted to dense stat vectors.
 Effectiveness filtering removed.
 """
 
+from data.stats import STAT_INDEX
+
 
 def filter_raw_ingredients(
     ingredients_raw,
-    stat_index,
     query,
 ):
     """
@@ -25,41 +26,36 @@ def filter_raw_ingredients(
     has_max = query.has_max_mask
     weights = query.weights
     search_inv = query.search_for_inversion
-    min_dura = query.min_durability
-    item_type = query.item_type
+    #min_dura = query.min_durability
+    skill = query.skill
+    stat_index = STAT_INDEX
 
     for ing in ingredients_raw:
 
         # ---- Item type filter ----
-        if item_type is not None:
+        if skill is not None:
             skills = ing.get("skills")
-            if not skills or item_type not in skills:
+            if not skills or skill not in skills:
                 continue
 
         keep = False
 
-        stats = ing["stats"]
-
-        # ---- Positive Durability filter ----
-        if min_dura is not None:
-            dura_idx = stat_index.get("durability")
-            if dura_idx is not None:
-                if stats[dura_idx] > 0:
-                    filtered.append(ing)
-                    continue
+        min_stats = ing["stats_min"]
+        max_stats = ing["stats_max"]
 
         # ---- Normal stats ----
         for stat_name, idx in stat_index.items():
+            
+            if(stat_name == "durability"):
+                continue
 
             # Skip stats not used in query
             if not (has_min[idx] or has_max[idx] or weights[idx] != 0):
                 continue
 
-            value = stats[idx]
-
             # Since rolls are removed:
-            min_val = value
-            max_val = value
+            min_val = min_stats[idx]
+            max_val = max_stats[idx]
 
             # ---- Minimum defined and stat can be positive ----
             if has_min[idx] and max_val > 0:
