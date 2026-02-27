@@ -25,7 +25,7 @@ def main():
     # ---------- Build User Query ----------
     user_query = {
         "mr": {"min": 1, "weight": 10000},
-        "spd": {"weight": 5000},
+        "spd": {"weight": 10000},
         "durability": {"min": 40, "weight": 1},
     }
 

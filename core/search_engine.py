@@ -51,13 +51,14 @@ def dfs(
             if has_max_mask[s] and min_v > max_vals[s]:
                 return
 
-            score += weights[s] * max_v * 0.99
-            score += weights[s] * min_v * 0.01
+            score += weights[s] * max_v * 1.0
+            score += weights[s] * min_v * 0.0
 
         if score > best_score_ref[0]:
             best_score_ref[0] = score
             for i in range(k):
                 best_solution[i] = ingredients[i]
+
         return
 
     # Pruning hook (stat-based pruning to be improved later)
@@ -143,15 +144,16 @@ def search_meta_batch(
     best_meta_index = -1
 
     ingredients = np.zeros(k, dtype=np.int32)
-    best_solution = np.zeros(k, dtype=np.int32)
-    best_score_ref = np.zeros(1, dtype=np.float64)
 
-    for m in range(M):
+    best_solution_global = np.zeros(k, dtype=np.int32)
+
+    for m in range(M): # Pour chaque set
 
         current_min = base_min_matrix[m].copy()
         current_max = base_max_matrix[m].copy()
 
-        best_score_ref[0] = -1e18
+        best_score_ref = np.array([-1e18], dtype=np.float64)
+        best_solution_local = np.zeros(k, dtype=np.int32)
 
         dfs(
             0,
@@ -161,7 +163,7 @@ def search_meta_batch(
             current_min,
             current_max,
             best_score_ref,
-            best_solution,
+            best_solution_local,
             db_stat_min,
             db_stat_max,
             db_count,
@@ -177,8 +179,10 @@ def search_meta_batch(
         if best_score_ref[0] > best_score:
             best_score = best_score_ref[0]
             best_meta_index = m
+            for i in range(k):
+                best_solution_global[i] = best_solution_local[i]
 
-    return best_score, best_meta_index, best_solution
+    return best_score, best_meta_index, best_solution_global
 
 
 # ============================================================
