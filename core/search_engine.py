@@ -33,9 +33,11 @@ def dfs(
     min_vals,
     max_vals,
     weights,
+    total_searched,
 ):
     # Leaf
     if depth == k:
+        total_searched[0] += 1
 
         score = 0.0
 
@@ -51,8 +53,8 @@ def dfs(
             if has_max_mask[s] and min_v > max_vals[s]:
                 return
 
-            score += weights[s] * max_v * 1.0
-            score += weights[s] * min_v * 0.0
+            score += weights[s] * max_v * 0.99
+            score += weights[s] * min_v * 0.01
 
         if score > best_score_ref[0]:
             best_score_ref[0] = score
@@ -65,9 +67,7 @@ def dfs(
     if prune(depth, k, current_min, current_max):
         return
 
-    loop_start = start_index if k == 6 else 0
-
-    for i in range(loop_start, db_count):
+    for i in range(start_index, db_count):
 
         ingredients[depth] = i
 
@@ -82,8 +82,9 @@ def dfs(
                 current_min[s] += (db_stat_min[i, s] * eff) //100
                 current_max[s] += (db_stat_max[i, s] * eff) //100
 
-        next_start = i if k == 6 else 0 # Indice de départ, évite les permutations
-        # TODO : voir pour k = 5, k = 4 et peut-être même k = 3
+        next_start = 0 # Indice de départ, évite les permutations
+        if(k == 6 or eff == meta_void_eff[depth+1]):
+            next_start = i
 
         dfs(
             depth + 1,
@@ -104,6 +105,7 @@ def dfs(
             min_vals,
             max_vals,
             weights,
+            total_searched,
         )
 
         # Undo
@@ -136,6 +138,7 @@ def search_meta_batch(
     min_vals,
     max_vals,
     weights,
+    total_searched,
 ):
     M = ings_matrix.shape[0]
     k = void_count
@@ -174,6 +177,7 @@ def search_meta_batch(
             min_vals,
             max_vals,
             weights,
+            total_searched,
         )
 
         if best_score_ref[0] > best_score:
@@ -193,6 +197,8 @@ def search(all_meta_sets, db, query):
 
     best_score = -np.inf
     best_full_slots = None
+    total_searched = np.array([0], dtype=np.int64)
+    total_possibilities = 0
 
     durability_idx = -1
     for i, name in enumerate(query.stat_index_keys_proj):
@@ -222,6 +228,7 @@ def search(all_meta_sets, db, query):
             query.min_proj,
             query.max_proj,
             query.weights_proj,
+            total_searched,
         )
 
         if score > best_score and meta_index != -1:
@@ -231,16 +238,25 @@ def search(all_meta_sets, db, query):
             meta_ings = meta_batch.ings_matrix[meta_index]
             full_slots = meta_ings.copy()
 
-            idx = 0
-            for slot in range(6):
-                if full_slots[slot] == -1:
-                    db_idx = sol[idx]
-                    full_slots[slot] = db.json_ids[db_idx]
-                    idx += 1
+            void_perm = meta_batch.void_slots_matrix[meta_index]
+
+            for sorted_depth in range(meta_batch.void_count):
+            
+                real_slot = void_perm[sorted_depth]
+            
+                db_idx = sol[sorted_depth]
+            
+                full_slots[real_slot] = db.json_ids[db_idx]
 
             best_full_slots = full_slots
             
         print(f"meta batch {6-meta_batch.void_count}: {len(meta_batch.ings_matrix)}, time elapsed: {time()-start_time:.0f}s")
-        print(f"Best: score={score:.0f} ")
+        total_possibilities += len(meta_batch.ings_matrix) * db.count**meta_batch.void_count
 
+    print()
+    print("SEARCHED FINISHED")
+    print("Total combinations :", total_possibilities)
+    print("Total evaluated :", total_searched[0])
+    print(f"Pruning efficiency : {(1-total_searched[0]/total_possibilities)*100:.2f}% skipped")
+    print()
     return best_full_slots

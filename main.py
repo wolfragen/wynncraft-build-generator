@@ -67,6 +67,7 @@ def main():
     
     meta_sets = load_meta_sets(skill, query, recipe)
     print("Meta sets loaded")
+    print()
                 
     # ---------- Search ----------
     best_solution = search(meta_sets, db, query)
@@ -119,30 +120,6 @@ if __name__ == "__main__":
     
     print(f"Elapsed time: {time()-start_time:.0f}s")
     
-    
-"""
-831 => Je Ne Sais Quoi
-622 => Obelisk Core
-668 => Stolen Pearls
-593 => Eye of The Beast
-635 => Old Treasure\u058e
-318 => Serafite
-
-[831, 622, 593, 635, 831, 622] => 4% gather speed
-[831, 622, 593, 318, 831, 622] => 
-
-[569, 391, 756, 756, 756] => Borange fluff, Bob's tear, Amber, Amber , Amber, -1
-
-[756, 442, 756, 442, 273, 614] : 3230067.0
-[756, 442, 756, 442, 359, 614] : [756, -1, 756, -1, 359, 614] [-1, 756, -1, 359, 614, 756]
-
-visiblement c'est [756, 756, -1, -1, 614, 359] qui a été sauvegardé (identique)
-Vérification dans meta_set_loader : il a été cull
-
-cull par : [-1, 756, -1, 756, 614, 668] correct.
-
-[756, 442, 756, 442, 273, 614] was returned again; let's see how [442, 756, 442, 756, 614, 668] did
-"""
 
 
 
