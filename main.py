@@ -67,6 +67,7 @@ def main():
     
     meta_sets = load_meta_sets(skill, query, recipe)
     print("Meta sets loaded")
+    print()
                 
     # ---------- Search ----------
     best_solution = search(meta_sets, db, query)
