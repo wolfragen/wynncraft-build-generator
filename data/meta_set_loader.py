@@ -13,72 +13,58 @@ import numpy as np
 from numba import njit
 import json
 import os
+from typing import NamedTuple
 
 from data.stats import STAT_INDEX, STAT_COUNT, REQ_STATS
 
 
+class MetaBatch(NamedTuple):
+    ings_matrix: np.ndarray          # (M, 6)
+    void_count: int                  # number of void slots
+    void_eff_matrix: np.ndarray      # (M, void_count)
+    base_min_matrix: np.ndarray      # (M, K)
+    base_max_matrix: np.ndarray      # (M, K)
+
+
+# ------------------------------------------------------------
+# Main Loader
+# ------------------------------------------------------------
+
 def load_meta_sets(skill, query, recipe, culling=True, should_print=False, base_path="data/precalc/generic_cull"):
+
     full_meta_sets = []
-    
-    first_meta_set = refine_meta_sets([{
-        "ings":[-1,-1,-1,-1,-1,-1],
-        "eff":[100,100,100,100,100,100],
-        "stats": {}}], query, recipe)
-    full_meta_sets.append(first_meta_set)
-    
-    for n in range(1,6):
+
+    # META_0
+    first_raw = [{
+        "ings": [-1, -1, -1, -1, -1, -1],
+        "eff": [100, 100, 100, 100, 100, 100],
+        "stats": {}
+    }]
+
+    first_batch = refine_meta_sets(first_raw, query, recipe, culling=False)
+    full_meta_sets.append(first_batch)
+
+    # META_1..5
+    for n in range(1, 6):
+
         raw_meta_sets = load_raw_meta_sets(skill, n)
-        refined_meta_sets = refine_meta_sets(raw_meta_sets, query, recipe)
-        
-        if(culling):
-            meta_sets = cull_refined_meta_sets(refined_meta_sets, query)
-            if(should_print):
-                print(f"{skill}_META_{n}: {len(refined_meta_sets)} => {len(meta_sets)}, {len(meta_sets)/len(refined_meta_sets)*100:.1f}% restants")
-            full_meta_sets.append(meta_sets)
-            
-        else:
-            full_meta_sets.append(refined_meta_sets)
+
+        batch = refine_meta_sets(
+            raw_meta_sets,
+            query,
+            recipe,
+            culling=culling
+        )
+
+        if should_print:
+            print(f"{skill}_META_{n}: {len(raw_meta_sets)} => {batch.ings_matrix.shape[0]}")
+
+        full_meta_sets.append(batch)
+
     return full_meta_sets
-
-def print_meta_sets(meta_sets, query):
-
-    for i, meta in enumerate(meta_sets):
-
-        print(f"\n===== META SET {i} =====")
-
-        # -----------------------------
-        # Meta ingredient IDs
-        # -----------------------------
-        print("ings :", meta["ings"])
-
-        # -----------------------------
-        # Void info
-        # -----------------------------
-        print("void_effectiveness :", meta["void_effectiveness"])
-
-        # -----------------------------
-        # Stats
-        # -----------------------------
-        for idx, stat_name in enumerate(query.stat_index_keys_proj):
-
-            min_val = meta["base_min_proj"][idx]
-            max_val = meta["base_max_proj"][idx]
-
-            print(f"{stat_name} : {min_val}/{max_val}")
 
 
 def load_raw_meta_sets(skill: str, n: int, base_path="data/precalc/generic_cull"):
-    """
-    Load raw meta-sets JSON file.
-
-    Args:
-        skill: crafting profession (e.g. "ARMOURING")
-        n: number of meta-ingredients
-        base_path: folder containing META files
-
-    Returns:
-        list of raw meta-set dicts
-    """
 
     filename = f"{skill.upper()}_META_{n}.json"
     path = os.path.join(base_path, filename)
@@ -90,41 +76,61 @@ def load_raw_meta_sets(skill: str, n: int, base_path="data/precalc/generic_cull"
 
 
 # ------------------------------------------------------------
-# Refine all meta sets
+# Refine + Optional Cull
 # ------------------------------------------------------------
 
-def refine_meta_sets(raw_meta_sets: list, query, recipe):
-    """
-    Refine a list of raw meta-sets according to Query.
-
-    Args:
-        raw_meta_sets: list of dict (output of load_raw_meta_sets)
-        query: Query instance
-
-    Returns:
-        list of refined meta-sets
-    """
+def refine_meta_sets(raw_meta_sets: list, query, recipe, culling=True):
 
     if not isinstance(raw_meta_sets, list):
         raise TypeError("refine_meta_sets expects a list of meta-set dicts.")
 
+    num_sets = len(raw_meta_sets)
     active_indices = query.active_indices
+    num_stats = query.stat_count
 
-    refined_sets = []
+    # Determine void_count from first meta-set
+    if num_sets == 0:
+        return MetaBatch(
+            np.empty((0, 6), dtype=np.int32),
+            0,
+            np.empty((0, 6), dtype=np.int32),
+            np.empty((0, num_stats), dtype=np.int32),
+            np.empty((0, num_stats), dtype=np.int32),
+        )
 
-    for raw_meta_set in raw_meta_sets:
+    first_ings = raw_meta_sets[0]["ings"]
+    void_count = sum(1 for v in first_ings if v == -1)
 
-        # ------------------------------------------------------------
-        # Slots
-        # ------------------------------------------------------------
+    dur_idx_full = STAT_INDEX.get("durability")
+
+    # ------------------------------------------------------------
+    # Allocate flat matrices
+    # ------------------------------------------------------------
+
+    ings_matrix = np.zeros((num_sets, 6), dtype=np.int32)
+    void_eff_matrix = np.zeros((num_sets, void_count), dtype=np.int32)
+
+    base_min_matrix = np.zeros((num_sets, num_stats), dtype=np.int32)
+    base_max_matrix = np.zeros((num_sets, num_stats), dtype=np.int32)
+
+    # ------------------------------------------------------------
+    # Fill matrices
+    # ------------------------------------------------------------
+
+    for i, raw_meta_set in enumerate(raw_meta_sets):
+
         ings = raw_meta_set["ings"]
+        ings_matrix[i] = ings
 
-        void_positions = [i for i, v in enumerate(ings) if v == -1]
-        void_count = len(void_positions)
+        # Fill void efficiency
+        temp_count = 0
+        full_eff = raw_meta_set["eff"]
+        for slot in range(6):
+            if ings[slot] == -1:
+                void_eff_matrix[i, temp_count] = full_eff[slot]
+                temp_count += 1
 
-        # ------------------------------------------------------------
-        # Base stats (min/max full → projected)
-        # ------------------------------------------------------------
+        # Stats
         base_min_full = np.zeros(STAT_COUNT, dtype=np.int32)
         base_max_full = np.zeros(STAT_COUNT, dtype=np.int32)
 
@@ -136,55 +142,64 @@ def refine_meta_sets(raw_meta_sets: list, query, recipe):
             if idx is None:
                 continue
 
-            if isinstance(value, dict):
-                min_val = value.get("min", value.get("minimum", 0))
-                max_val = value.get("max", value.get("maximum", 0))
-            else:
-                min_val = value
-                max_val = value
+            min_val = value.get("min", value.get("minimum", 0))
+            max_val = value.get("max", value.get("maximum", 0))
 
             base_min_full[idx] = min_val
             base_max_full[idx] = max_val
 
         base_min_proj = base_min_full[active_indices]
         base_max_proj = base_max_full[active_indices]
-        
-        # ------------------------------------------------------------
-        # Inject recipe durability (if durability is active)
-        # ------------------------------------------------------------
-        dur_idx_full = STAT_INDEX.get("durability")
-        
+
+        # Inject durability
         if dur_idx_full is not None:
-        
-            # Check if durability is part of projected stats
-            for proj_idx, full_idx in enumerate(query.active_indices):
-        
+            for proj_idx, full_idx in enumerate(active_indices):
                 if full_idx == dur_idx_full:
-        
                     base_min_proj[proj_idx] += recipe.scaled_dura_min
                     base_max_proj[proj_idx] += recipe.scaled_dura_max
                     break
 
-        # ------------------------------------------------------------
-        # Effectiveness
-        # ------------------------------------------------------------
-        full_eff_percent = raw_meta_set["eff"]  # length 6
-        full_eff = np.array(full_eff_percent, dtype=np.int32)
+        base_min_matrix[i] = base_min_proj
+        base_max_matrix[i] = base_max_proj
 
-        void_effectiveness = full_eff[void_positions]
+    # ------------------------------------------------------------
+    # Culling
+    # ------------------------------------------------------------
 
-        refined_sets.append({
-            "ings": ings.copy(),
-            "void_positions": void_positions,
-            "void_count": void_count,
-            "void_effectiveness": void_effectiveness,
-            "base_min_proj": base_min_proj,
-            "base_max_proj": base_max_proj,
-        })
+    if culling and num_sets > 0:
 
-    return refined_sets
+        req_mask_full = np.zeros(STAT_COUNT, dtype=np.bool_)
+        for name in REQ_STATS:
+            req_mask_full[STAT_INDEX[name]] = True
+
+        req_mask_proj = req_mask_full[active_indices]
+
+        kept_indices = numba_cull(
+            base_min_matrix,
+            base_max_matrix,
+            void_eff_matrix,
+            ings_matrix,
+            void_count,
+            req_mask_proj
+        )
+
+        ings_matrix = ings_matrix[kept_indices]
+        void_eff_matrix = void_eff_matrix[kept_indices]
+        base_min_matrix = base_min_matrix[kept_indices]
+        base_max_matrix = base_max_matrix[kept_indices]
+
+    return MetaBatch(
+        ings_matrix=ings_matrix,
+        void_count=void_count,
+        void_eff_matrix=void_eff_matrix,
+        base_min_matrix=base_min_matrix,
+        base_max_matrix=base_max_matrix,
+    )
 
 
+# ------------------------------------------------------------
+# Pareto
+# ------------------------------------------------------------
 
 @njit(fastmath=True)
 def compare_vectors(a, b, num_effs):
@@ -264,62 +279,36 @@ def pareto_filter(matrix, num_effs):
     return is_kept
 
 
-def cull_refined_meta_sets(refined_meta_sets, query):
-    """
-    Apply same Pareto dominance logic as original precalc file,
-    but using projected meta-set stats.
-    """
+@njit
+def numba_cull(base_min_matrix,
+               base_max_matrix,
+               void_eff_matrix,
+               ings_matrix,
+               void_count,
+               req_mask_proj):
 
-    if not refined_meta_sets:
-        return refined_meta_sets
+    num_sets, num_stats = base_min_matrix.shape
+    matrix = np.zeros((num_sets, void_count + num_stats), dtype=np.int32)
 
-    num_sets = len(refined_meta_sets)
-    num_effs = max(meta["void_count"] for meta in refined_meta_sets)
-    num_stats = query.stat_count
+    for i in range(num_sets):
 
-    matrix = np.zeros((num_sets, num_effs + num_stats), dtype=np.float32)
+        # --------------------------
+        # Sort descending
+        # --------------------------
+        tmp_eff = void_eff_matrix[i].copy()
+        tmp_eff.sort()  # ascending
 
-    # Map projected stat index to stat name
-    stat_names = list(query.stat_index_keys_proj)
+        for j in range(void_count):
+            matrix[i, j] = tmp_eff[void_count - 1 - j]
 
-    for i, meta in enumerate(refined_meta_sets):
-
-        # -------------------------------
-        # Effectiveness
-        # -------------------------------
-        effs = list(meta["void_effectiveness"])
-        effs.sort(reverse=True)
-
-        for j, val in enumerate(effs):
-            matrix[i, j] = val
-
-        # -------------------------------
+        # --------------------------
         # Stats
-        # -------------------------------
-        for s_idx in range(num_stats):
-
-            stat_name = stat_names[s_idx]
-
-            if stat_name in REQ_STATS:
-                matrix[i, num_effs + s_idx] = -meta["base_min_proj"][s_idx]
+        # --------------------------
+        for s in range(num_stats):
+            if req_mask_proj[s]:
+                matrix[i, void_count + s] = -base_min_matrix[i, s]
             else:
-                matrix[i, num_effs + s_idx] = meta["base_max_proj"][s_idx]
+                matrix[i, void_count + s] = base_max_matrix[i, s]
 
-    # Sorting optimization (same as original)
-    eff_scores = np.sum(np.abs(matrix[:, :num_effs]), axis=1)
-    stat_scores = np.sum(matrix[:, num_effs:], axis=1)
-    sort_order = np.argsort(-(eff_scores + stat_scores))
-
-    matrix = matrix[sort_order]
-    refined_meta_sets = [refined_meta_sets[i] for i in sort_order]
-
-    is_kept = pareto_filter(matrix, num_effs)
-    kept_indices = np.where(is_kept)[0]
-
-    return [refined_meta_sets[i] for i in kept_indices]
-
-
-
-
-
-
+    is_kept = pareto_filter(matrix, void_count)
+    return np.where(is_kept)[0]

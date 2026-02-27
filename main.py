@@ -1,13 +1,12 @@
 from data.ingredient_loader import load_ingredients
 from data.ingredient_db import IngredientDB
 from data.recipe_loader import load_recipes, find_recipe
-from data.recipe import Recipe
-from query.query import Query
+from data.recipe import build_recipe
+from query.query import build_query
 from query.ingredient_filter import filter_raw_ingredients
 from utils.hash_generator import generate_crafter_url
 from data.stats import STAT_INDEX, STAT_COUNT
-from data.meta_set_loader import load_meta_sets, print_meta_sets
-from utils.utils import craft
+from data.meta_set_loader import load_meta_sets
 
 from core.search_engine import search
 
@@ -15,32 +14,7 @@ from time import time
 import cProfile
 import pstats
 
-from line_profiler import LineProfiler
-from core.leaf_evaluator import evaluate_leaf
 
-
-def compute_stats(ingredient_names):
-    
-    # ---------- Load all ingredients ----------
-    ingredients_raw = load_ingredients("data/ingreds_compress.json")
-
-    skill = "JEWELING"
-    item_type = "RING"
-
-    # ---------- Load recipes (Materials => Stats) ----------
-    recipes_data = load_recipes("data/recipes_compress.json")
-
-    recipe_raw = find_recipe( # gets recipe stats
-        recipes_data,
-        item_type=item_type,
-        skill=skill,
-        lvl_min=103,
-        lvl_max=105,
-    )
-
-    recipe = Recipe(recipe_raw, tier=3) # builds final recipe using material tier
-    
-    craft(ingredient_names, recipe, ingredients_raw)
 
 
 def main():
@@ -50,30 +24,29 @@ def main():
 
     # ---------- Build User Query ----------
     user_query = {
-        "gSpd": {"min": 1, "weight": 10000},      # gathering speed %
-        "gXp": {"weight": 1000},
-        "mr": {"min": 1, "weight": 1000},
+        "mr": {"min": 1, "weight": 10000},
+        "spd": {"weight": 5000},
         "durability": {"min": 40, "weight": 1},
     }
 
-    skill = "JEWELING"
-    item_type = "RING"
+    skill = "WEAPONSMITHING"
+    item_type = "SPEAR"
 
     # ---------- Load recipes (Materials => Stats) ----------
-    recipes_data = load_recipes("data/recipes_compress.json")
+    recipes = load_recipes("data/recipes_compress.json")
 
     recipe_raw = find_recipe( # gets recipe stats
-        recipes_data,
+        recipes = recipes,
         item_type=item_type,
         skill=skill,
         lvl_min=103,
         lvl_max=105,
     )
 
-    recipe = Recipe(recipe_raw, tier=3) # builds final recipe using material tier
+    recipe = build_recipe(recipe_raw, tier=3) # builds final recipe using material tier
 
     # ---------- Build Query Object ----------
-    query = Query(
+    query = build_query(
         user_json=user_query,
         search_for_inversion=True, # negative effectiveness included
         item_type=item_type,
@@ -93,6 +66,7 @@ def main():
     print("Filtered ingredients:", len(db))
     
     meta_sets = load_meta_sets(skill, query, recipe)
+    print("Meta sets loaded")
                 
     # ---------- Search ----------
     best_solution = search(meta_sets, db, query)
@@ -101,7 +75,7 @@ def main():
     
     if best_solution is not None:
         
-        id_to_name = {int(ing["id"]): ing["name"] for ing in ingredients_raw}
+        id_to_name = {int(ing.ing_id): ing.name for ing in ingredients_raw}
         names = [id_to_name[i] for i in best_solution]
         print(names)
 
@@ -142,8 +116,6 @@ if __name__ == "__main__":
     
     else:
         main()
-        
-        #compute_stats(ingredient_names=['Amber-Encased Fleris', 'Green Opal', 'Amber-Encased Fleris', 'Green Opal', 'Tough Bone', 'Lunar Charm'])
     
     print(f"Elapsed time: {time()-start_time:.0f}s")
     
@@ -171,10 +143,6 @@ cull par : [-1, 756, -1, 756, 614, 668] correct.
 
 [756, 442, 756, 442, 273, 614] was returned again; let's see how [442, 756, 442, 756, 614, 668] did
 """
-
-
-
-
 
 
 

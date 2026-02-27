@@ -1,160 +1,242 @@
 """
 search_engine.py
-
-Full craft search engine.
-
-Searches across all meta-set groups (n = 0..5),
-evaluates crafts directly, and returns the best solution.
-
-Returns:
-    dict with:
-        - meta
-        - full_slots (int32[6])
-    or None if no valid craft.
 """
 
 import numpy as np
-from core.craft_state import CraftState
-from core.leaf_evaluator import evaluate_leaf
-
+from numba import njit
 from time import time
 
+from core.pruning import prune
+
+
+# ============================================================
+# DFS (numba)
+# ============================================================
+
+@njit
+def dfs(
+    depth,
+    start_index,
+    k,
+    ingredients,
+    current_min,
+    current_max,
+    best_score_ref,
+    best_solution,
+    db_stat_min,
+    db_stat_max,
+    db_count,
+    meta_void_eff,
+    durability_idx,
+    has_min_mask,
+    has_max_mask,
+    min_vals,
+    max_vals,
+    weights,
+):
+    # Leaf
+    if depth == k:
+
+        score = 0.0
+
+        # Evaluate directly using current stats
+        for s in range(len(current_min)):
+
+            min_v = current_min[s]
+            max_v = current_max[s]
+
+            if has_min_mask[s] and max_v < min_vals[s]:
+                return
+
+            if has_max_mask[s] and min_v > max_vals[s]:
+                return
+
+            score += weights[s] * max_v * 0.99
+            score += weights[s] * min_v * 0.01
+
+        if score > best_score_ref[0]:
+            best_score_ref[0] = score
+            for i in range(k):
+                best_solution[i] = ingredients[i]
+        return
+
+    # Pruning hook (stat-based pruning to be improved later)
+    if prune(depth, k, current_min, current_max):
+        return
+
+    loop_start = start_index if k == 6 else 0
+
+    for i in range(loop_start, db_count):
+
+        ingredients[depth] = i
+
+        eff = meta_void_eff[depth]
+
+        # Apply ingredient contribution
+        for s in range(len(current_min)):
+            if(s == durability_idx):
+                current_min[s] += db_stat_min[i, s]
+                current_max[s] += db_stat_max[i, s]
+            else:
+                current_min[s] += (db_stat_min[i, s] * eff) //100
+                current_max[s] += (db_stat_max[i, s] * eff) //100
+
+        next_start = i if k == 6 else 0 # Indice de départ, évite les permutations
+        # TODO : voir pour k = 5, k = 4 et peut-être même k = 3
+
+        dfs(
+            depth + 1,
+            next_start,
+            k,
+            ingredients,
+            current_min,
+            current_max,
+            best_score_ref,
+            best_solution,
+            db_stat_min,
+            db_stat_max,
+            db_count,
+            meta_void_eff,
+            durability_idx,
+            has_min_mask,
+            has_max_mask,
+            min_vals,
+            max_vals,
+            weights,
+        )
+
+        # Undo
+        for s in range(len(current_min)):
+            if(s == durability_idx):
+                current_min[s] -= db_stat_min[i, s]
+                current_max[s] -= db_stat_max[i, s]
+            else:
+                current_min[s] -= (db_stat_min[i, s] * eff) //100
+                current_max[s] -= (db_stat_max[i, s] * eff) //100
+
+
+# ============================================================
+# Search One Meta Batch (numba)
+# ============================================================
+
+@njit
+def search_meta_batch(
+    ings_matrix,
+    void_count,
+    void_eff_matrix,
+    base_min_matrix,
+    base_max_matrix,
+    db_stat_min,
+    db_stat_max,
+    db_count,
+    durability_idx,
+    has_min_mask,
+    has_max_mask,
+    min_vals,
+    max_vals,
+    weights,
+):
+    M = ings_matrix.shape[0]
+    k = void_count
+
+    best_score = -1e18
+    best_meta_index = -1
+
+    ingredients = np.zeros(k, dtype=np.int32)
+    best_solution = np.zeros(k, dtype=np.int32)
+    best_score_ref = np.zeros(1, dtype=np.float64)
+
+    for m in range(M):
+
+        current_min = base_min_matrix[m].copy()
+        current_max = base_max_matrix[m].copy()
+
+        best_score_ref[0] = -1e18
+
+        dfs(
+            0,
+            0,
+            k,
+            ingredients,
+            current_min,
+            current_max,
+            best_score_ref,
+            best_solution,
+            db_stat_min,
+            db_stat_max,
+            db_count,
+            void_eff_matrix[m],
+            durability_idx,
+            has_min_mask,
+            has_max_mask,
+            min_vals,
+            max_vals,
+            weights,
+        )
+
+        if best_score_ref[0] > best_score:
+            best_score = best_score_ref[0]
+            best_meta_index = m
+
+    return best_score, best_meta_index, best_solution
+
+
+# ============================================================
+# Python Orchestration
+# ============================================================
 
 def search(all_meta_sets, db, query):
 
     best_score = -np.inf
-    best_meta = None
     best_full_slots = None
 
-    # ------------------------------------------------------------
-    # Required coverage mask
-    # Rule:
-    #   stat must appear if:
-    #       min > 0 OR max < 0
-    # ------------------------------------------------------------
-    required_mask = 0
-
-    for s in range(query.stat_count):
-        if query.min_proj[s] > 0 or query.max_proj[s] < 0:
-            required_mask |= (1 << s)
-            
-    durability_idx = None
-
+    durability_idx = -1
     for i, name in enumerate(query.stat_index_keys_proj):
         if name == "durability":
             durability_idx = i
             break
         
-    if(durability_idx is None):
-        print("minimum durability wasn't found in the query")
-        return
 
-    # ------------------------------------------------------------
-    # Iterate meta groups (n = 0..5)
-    # ------------------------------------------------------------
-    for n_meta, meta_group in enumerate(all_meta_sets):
+    for meta_batch in all_meta_sets:
         start_time = time()
-        k = 6-n_meta
 
-        if not meta_group:
+        if meta_batch.ings_matrix.shape[0] == 0:
             continue
 
-        avoid_permutations = (n_meta == 0)
-        
-        for meta in meta_group:
-    
-            state = CraftState(k)
-    
-            # -------------------------
-            # Compute initial coverage from meta
-            # -------------------------
-            meta_coverage_mask = 0
-    
-            for s in range(query.stat_count):
-                min_v = meta["base_min_proj"][s]
-                max_v = meta["base_max_proj"][s]
-    
-                if min_v != 0 or max_v != 0:
-                    meta_coverage_mask |= (1 << s)
-    
-            # -------------------------
-            # DFS
-            # -------------------------
-            def dfs(start_idx, coverage_mask):
-    
-                nonlocal best_score, best_meta, best_full_slots
-    
-                depth = state.depth
-    
-                if depth == k:
-    
-                    if (coverage_mask & required_mask) == required_mask:
-    
-                        score, min_vals, max_vals = evaluate_leaf(
-                            state.ingredients,
-                            k,
-                            db.stat_min_matrix,
-                            db.stat_max_matrix,
-                            meta["base_min_proj"],
-                            meta["base_max_proj"],
-                            meta["void_effectiveness"],
-                            use_eff=(n_meta != 0),
-                            durability_idx=durability_idx,
-                            has_min_mask=query.has_min_mask_proj,
-                            has_max_mask=query.has_max_mask_proj,
-                            min_vals=query.min_proj,
-                            max_vals=query.max_proj,
-                            weights=query.weights_proj,
-                        )
-    
-                        if score > best_score:
-                            best_score = score
-                            best_meta = meta
-    
-                            full_slots = meta["ings"].copy()
-                            for i, slot in enumerate(meta["void_positions"]):
-                                db_idx = state.ingredients[i]
-                                full_slots[slot] = int(db.json_ids[db_idx])
-    
-                            best_full_slots = full_slots.copy()
-    
-                    return
-    
-                remaining = k - depth
-                uncovered = required_mask & ~coverage_mask
-    
-                if uncovered.bit_count() > remaining:
-                    return
-    
-                loop_start = start_idx if avoid_permutations else 0
-    
-                for i in range(loop_start, db.count):
-    
-                    state.apply(i)
-    
-                    new_mask = coverage_mask | db.stat_bitmask[i]
-    
-                    if avoid_permutations:
-                        dfs(i, new_mask)
-                    else:
-                        dfs(0, new_mask)
-    
-                    state.undo()
-    
-            dfs(0, meta_coverage_mask)
-        print(f"Finished the {n_meta}-meta_sets in {time() - start_time:.0f}s")
+        score, meta_index, sol = search_meta_batch(
+            meta_batch.ings_matrix,
+            meta_batch.void_count,
+            meta_batch.void_eff_matrix,
+            meta_batch.base_min_matrix,
+            meta_batch.base_max_matrix,
+            db.stat_min_matrix,
+            db.stat_max_matrix,
+            db.count,
+            durability_idx,
+            query.has_min_mask_proj,
+            query.has_max_mask_proj,
+            query.min_proj,
+            query.max_proj,
+            query.weights_proj,
+        )
 
-    if best_meta is None:
-        return None
+        if score > best_score and meta_index != -1:
+
+            best_score = score
+
+            meta_ings = meta_batch.ings_matrix[meta_index]
+            full_slots = meta_ings.copy()
+
+            idx = 0
+            for slot in range(6):
+                if full_slots[slot] == -1:
+                    db_idx = sol[idx]
+                    full_slots[slot] = db.json_ids[db_idx]
+                    idx += 1
+
+            best_full_slots = full_slots
+            
+        print(f"meta batch {6-meta_batch.void_count}: {len(meta_batch.ings_matrix)}, time elapsed: {time()-start_time:.0f}s")
+        print(f"Best: score={score:.0f} ")
 
     return best_full_slots
-
-
-
-
-
-
-
-
-
-

@@ -23,14 +23,13 @@ class IngredientDB:
         Build optimized database from filtered ingredients.
 
         Args:
-            filtered_ingredients: list of raw ingredient dicts
+            filtered_ingredients: list of RawIngredient
             query: Query instance
         """
 
         self.count = len(filtered_ingredients)
         self.stat_count = query.stat_count
         active_indices = query.active_indices
-        search_inv = query.search_for_inversion
 
         # ------------------------------------------------------------
         # Projected stat matrices [N, K]
@@ -52,36 +51,19 @@ class IngredientDB:
 
         for new_idx, ing in enumerate(filtered_ingredients):
 
-            self.stat_min_matrix[new_idx] = ing["stats_min"][active_indices]
-            self.stat_max_matrix[new_idx] = ing["stats_max"][active_indices]
-            self.json_ids[new_idx] = ing["id"]
+            self.stat_min_matrix[new_idx] = ing.stats_min[active_indices]
+            self.stat_max_matrix[new_idx] = ing.stats_max[active_indices]
+            self.json_ids[new_idx] = ing.ing_id
 
         # ------------------------------------------------------------
-        # Contribution mask [N, K]
+        # Contribution masks [N, K]
         # ------------------------------------------------------------
-        if not search_inv:
-            # Normal search: stat can be positive
-            self.contrib_mask = self.stat_max_matrix > 0
-        else:
-            # Inversion search: stat can be negative
-            self.contrib_mask = self.stat_min_matrix < 0
 
-        # ------------------------------------------------------------
-        # Contributors per stat
-        # ------------------------------------------------------------
-        self.stat_contributors = [
-            np.nonzero(self.contrib_mask[:, k])[0].astype(np.int32)
-            for k in range(self.stat_count)
-        ]
+        # Positive contribution (normal search)
+        self.contrib_pos_mask = self.stat_max_matrix > 0
 
-        # ------------------------------------------------------------
-        # Bitmask per ingredient
-        # ------------------------------------------------------------
-        self.stat_bitmask = np.zeros(self.count, dtype=np.uint64)
-
-        for k in range(self.stat_count):
-            bit = np.uint64(1) << np.uint64(k)
-            self.stat_bitmask[self.contrib_mask[:, k]] |= bit
+        # Negative contribution (used for inversion search)
+        self.contrib_neg_mask = self.stat_min_matrix < 0
 
     # ------------------------------------------------------------
     # Access helpers
@@ -89,9 +71,6 @@ class IngredientDB:
 
     def get_json_id(self, idx: int):
         return self.json_ids[idx]
-
-    def get_bitmask(self, idx: int):
-        return self.stat_bitmask[idx]
 
     def __len__(self):
         return self.count

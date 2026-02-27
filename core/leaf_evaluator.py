@@ -63,6 +63,7 @@ def evaluate_leaf(
         if has_max_mask[s] and min_v > max_vals[s]:
             return -np.inf, acc_min, acc_max
 
-        score += max_v * weights[s]
+        score += max_v * weights[s] * 0.9
+        score += min_v * weights[s] * 0.1
 
     return score, acc_min, acc_max

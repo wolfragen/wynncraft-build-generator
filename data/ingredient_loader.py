@@ -5,18 +5,58 @@ Loads ingredient data from compressed JSON and converts it into
 a dense stat representation.
 
 All stats are mapped into a fixed-size flat vector defined in data.stats.
-
-Design goals:
-- No dict-based stat storage at runtime
-- Deterministic stat indexing
-- Compact int16 storage
-- Minimal allocations
 """
 
 import json
 import numpy as np
+from typing import NamedTuple
 
 from data.stats import STAT_INDEX, STAT_COUNT
+
+
+# ------------------------------------------------------------
+# Skill registry (deterministic order)
+# ------------------------------------------------------------
+
+SKILL_ORDER = (
+    "ARMOURING",
+    "TAILORING",
+    "WEAPONSMITHING",
+    "WOODWORKING",
+    "ALCHEMISM",
+    "SCRIBING",
+    "COOKING",
+)
+
+# Needed because skills can appear in any order when loading ingredients
+SKILL_INDEX = {name: i for i, name in enumerate(SKILL_ORDER)}
+SKILL_COUNT = len(SKILL_ORDER)
+
+
+# ------------------------------------------------------------
+# Position modifier registry (fixed order)
+# ------------------------------------------------------------
+
+POSMOD_ORDER = (
+    "left",
+    "right",
+    "above",
+    "under",
+    "touching",
+    "notTouching",
+)
+
+
+class RawIngredient(NamedTuple):
+    ing_id: int
+    name: str
+    stats_min: np.ndarray
+    stats_max: np.ndarray
+    skills: np.ndarray
+    pos_mods: np.ndarray
+    tier: int
+    lvl: int
+    ing_type: int
 
 
 def _build_stat_vectors(data: dict):
@@ -126,31 +166,35 @@ def load_ingredients(path: str):
     for entry in raw:
         stats_min, stats_max = _build_stat_vectors(entry)
 
-        ingredient = {
-            "id": entry["id"],
-            "name": entry["name"],
-            "stats_min": stats_min,
-            "stats_max": stats_max,
-            "skills": entry.get("skills", {}),
-            "posMods": entry.get("posMods", {}),
-            "tier": entry.get("tier", 0),
-            "lvl": entry.get("lvl", 0),
-            "type": entry.get("type", 0),
-        }
+        # ------------------------------------------------------------
+        # Skills
+        # ------------------------------------------------------------
+        skills_array = np.zeros(SKILL_COUNT, dtype=np.bool_)
+        for skill in entry.get("skills", []):
+            idx = SKILL_INDEX.get(skill)
+            if idx is not None:
+                skills_array[idx] = True
+
+        # ------------------------------------------------------------
+        # PosMods
+        # ------------------------------------------------------------
+        pos_mods = np.zeros(6, dtype=np.int16)
+        raw_pos = entry.get("posMods", {})
+        for i, key in enumerate(POSMOD_ORDER):
+            pos_mods[i] = raw_pos.get(key, 0)
+
+        ingredient = RawIngredient(
+            ing_id=entry["id"],
+            name=entry["name"],
+            stats_min=stats_min,
+            stats_max=stats_max,
+            skills=skills_array,
+            pos_mods=pos_mods,
+            tier=entry.get("tier", 0),
+            lvl=entry.get("lvl", 0),
+            ing_type=entry.get("type", 0),
+        )
 
         ingredients.append(ingredient)
 
     return ingredients
-
-
-
-
-
-
-
-
-
-
-
-
-
