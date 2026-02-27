@@ -238,12 +238,15 @@ def search(all_meta_sets, db, query):
             meta_ings = meta_batch.ings_matrix[meta_index]
             full_slots = meta_ings.copy()
 
-            idx = 0
-            for slot in range(6):
-                if full_slots[slot] == -1:
-                    db_idx = sol[idx]
-                    full_slots[slot] = db.json_ids[db_idx]
-                    idx += 1
+            void_perm = meta_batch.void_slots_matrix[meta_index]
+
+            for sorted_depth in range(meta_batch.void_count):
+            
+                real_slot = void_perm[sorted_depth]
+            
+                db_idx = sol[sorted_depth]
+            
+                full_slots[real_slot] = db.json_ids[db_idx]
 
             best_full_slots = full_slots
             

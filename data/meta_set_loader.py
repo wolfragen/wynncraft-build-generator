@@ -22,6 +22,7 @@ class MetaBatch(NamedTuple):
     ings_matrix: np.ndarray          # (M, 6)
     void_count: int                  # number of void slots
     void_eff_matrix: np.ndarray      # (M, void_count)
+    void_slots_matrix: np.ndarray    # (M, void_count)
     base_min_matrix: np.ndarray      # (M, K)
     base_max_matrix: np.ndarray      # (M, K)
 
@@ -88,11 +89,11 @@ def refine_meta_sets(raw_meta_sets: list, query, recipe, culling=True):
     active_indices = query.active_indices
     num_stats = query.stat_count
 
-    # Determine void_count from first meta-set
     if num_sets == 0:
         return MetaBatch(
             np.empty((0, 6), dtype=np.int32),
             0,
+            np.empty((0, 6), dtype=np.int32),
             np.empty((0, 6), dtype=np.int32),
             np.empty((0, num_stats), dtype=np.int32),
             np.empty((0, num_stats), dtype=np.int32),
@@ -103,34 +104,26 @@ def refine_meta_sets(raw_meta_sets: list, query, recipe, culling=True):
 
     dur_idx_full = STAT_INDEX.get("durability")
 
-    # ------------------------------------------------------------
-    # Allocate flat matrices
-    # ------------------------------------------------------------
-
     ings_matrix = np.zeros((num_sets, 6), dtype=np.int32)
     void_eff_matrix = np.zeros((num_sets, void_count), dtype=np.int32)
+    void_real_slot_matrix = np.zeros((num_sets, void_count), dtype=np.int32)
 
     base_min_matrix = np.zeros((num_sets, num_stats), dtype=np.int32)
     base_max_matrix = np.zeros((num_sets, num_stats), dtype=np.int32)
-
-    # ------------------------------------------------------------
-    # Fill matrices
-    # ------------------------------------------------------------
 
     for i, raw_meta_set in enumerate(raw_meta_sets):
 
         ings = raw_meta_set["ings"]
         ings_matrix[i] = ings
 
-        # Fill void efficiency
         temp_count = 0
         full_eff = raw_meta_set["eff"]
         for slot in range(6):
             if ings[slot] == -1:
                 void_eff_matrix[i, temp_count] = full_eff[slot]
+                void_real_slot_matrix[i, temp_count] = slot
                 temp_count += 1
 
-        # Stats
         base_min_full = np.zeros(STAT_COUNT, dtype=np.int32)
         base_max_full = np.zeros(STAT_COUNT, dtype=np.int32)
 
@@ -151,7 +144,6 @@ def refine_meta_sets(raw_meta_sets: list, query, recipe, culling=True):
         base_min_proj = base_min_full[active_indices]
         base_max_proj = base_max_full[active_indices]
 
-        # Inject durability
         if dur_idx_full is not None:
             for proj_idx, full_idx in enumerate(active_indices):
                 if full_idx == dur_idx_full:
@@ -161,10 +153,6 @@ def refine_meta_sets(raw_meta_sets: list, query, recipe, culling=True):
 
         base_min_matrix[i] = base_min_proj
         base_max_matrix[i] = base_max_proj
-
-    # ------------------------------------------------------------
-    # Culling
-    # ------------------------------------------------------------
 
     if culling and num_sets > 0:
 
@@ -185,13 +173,29 @@ def refine_meta_sets(raw_meta_sets: list, query, recipe, culling=True):
 
         ings_matrix = ings_matrix[kept_indices]
         void_eff_matrix = void_eff_matrix[kept_indices]
+        void_real_slot_matrix = void_real_slot_matrix[kept_indices]
         base_min_matrix = base_min_matrix[kept_indices]
         base_max_matrix = base_max_matrix[kept_indices]
+
+    M = void_eff_matrix.shape[0]
+
+    sorted_void_eff_matrix = np.zeros_like(void_eff_matrix)
+    void_slots_matrix = np.zeros_like(void_real_slot_matrix)
+
+    for m in range(M):
+
+        order = np.argsort(void_eff_matrix[m])
+
+        for j in range(void_count):
+            src = order[void_count - 1 - j]
+            sorted_void_eff_matrix[m, j] = void_eff_matrix[m, src]
+            void_slots_matrix[m, j] = void_real_slot_matrix[m, src]
 
     return MetaBatch(
         ings_matrix=ings_matrix,
         void_count=void_count,
-        void_eff_matrix=void_eff_matrix,
+        void_eff_matrix=sorted_void_eff_matrix,
+        void_slots_matrix=void_slots_matrix,
         base_min_matrix=base_min_matrix,
         base_max_matrix=base_max_matrix,
     )
