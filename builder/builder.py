@@ -61,7 +61,7 @@ def load_game_data(filepath):
 skill_point_types = ["str", "dex", "int", "def", "agi"]
 
 class BuildInfo:
-    def __init__(self, weapon_type, items=None, skill_points=None, available_skill_points = None, exclusive_flags=None):
+    def __init__(self, weapon_type, items=None, skill_points=None, available_skill_points = None, max_reqs=None, exclusive_flags=None):
         self.weapon_type = weapon_type
         # The 9 slots of a build
         self.items = items or {
@@ -75,7 +75,8 @@ class BuildInfo:
         self.available_skill_points = available_skill_points or 200
         self.skill_points = skill_points or {sk:{"attributed":0, "items_counting":0, "items_not_counting":0} 
                                              for sk in skill_point_types}
-        
+        self.max_reqs = max_reqs or {sk: 0 for sk in skill_point_types}
+
         # TODO Boolean flags for mutually exclusive items (Hive + Ornate Shadow)
         self.exclusive_flags = exclusive_flags or set()
 
@@ -99,6 +100,13 @@ class BuildInfo:
         # Create the new state
         new_build = BuildInfo(self.weapon_type, items=new_items, skill_points=new_sp, exclusive_flags=new_flags)
         
+        # Update max_reqs based on the newly added item
+        new_build.max_reqs = self.max_reqs.copy()
+        for sk in skill_point_types:
+            item_req = item.get(sk + "Req", 0)
+            if item_req > new_build.max_reqs[sk]:
+                new_build.max_reqs[sk] = item_req
+
         # We know skill points can be attributed at this point since can_equip was passed
         new_build.available_skill_points = new_available_skill_points
         for sk in new_attributions.keys():
@@ -167,7 +175,7 @@ def generate_builds(imposed_items=None, weapon_type="Bow"):
         if not slots_left:
             current_build.calculate_stats()
             current_score = score_build_spellDmg(current_build)
-            print(f"Completed a build with score {current_score}")
+            #print(f"Completed a build with score {current_score}")
             if current_score > best_score:
                 best_score = current_score
                 best_build = current_build
@@ -239,50 +247,45 @@ def penalize_skill_point_reqs(item : dict, score : float, penalty_strength : flo
     return 0
 
 
-def can_equip(item : dict, partial_build_info : BuildInfo):
+def can_equip(item: dict, partial_build_info: BuildInfo):
+    
+    # TODO: Mutually exclusive flags (Hive, Ornate Shadow)
 
-    # TODO: First do Mututally exclusive flags (Hive, Ornate Shadow)
-    # TODO make sure negative skill points are correctly handled
-
-    skill_points_available = partial_build_info.available_skill_points 
-    skill_points_counting = {sk:partial_build_info.skill_points[sk]["attributed"]+
-                             partial_build_info.skill_points[sk]["items_counting"] 
-                             for sk in skill_point_types} 
-    skill_points_needed = {sk : item[sk+"Req"] if sk+"Req" in item else 0 for sk in skill_point_types}
-
-    # increase needed from possible negative skill points on items
-    #print("Before: " + str(skill_points_needed))
+    newly_attributed = {}
+    
     for sk in skill_point_types:
-        #if sk in item: print(item[sk], end=" | ")
-        if sk in item and stat_to_max(item[sk]) < 0:
-            skill_points_needed[sk] += abs(stat_to_max(item[sk]))
-    #print("\nAfter: " + str(skill_points_needed))
+        current_attr = partial_build_info.skill_points[sk]["attributed"]
+        current_items = partial_build_info.skill_points[sk]["items_counting"]
+        item_req = item.get(sk + "Req", 0)
+        
+        # Weapons don't provide skill points to armor in Wynncraft
+        if item.get("category") == "weapon":
+            item_bonus = 0
+        else:
+            item_bonus = stat_to_max(item.get(sk, 0))
             
-
-    # check if equippable directly
-    if all(skill_points_needed[sk] <= skill_points_counting[sk] for sk in skill_point_types):
-        return True, {}, skill_points_available
-
-    # try to attribute manually
-    newly_attributed = {
-        sk: max(0, skill_points_needed[sk] - skill_points_counting[sk])
-        for sk in skill_point_types
-    }
-
-    # check 100 manuel attribution cap
-    if any(
-        partial_build_info.skill_points[sk]["attributed"] + newly_attributed[sk] > 100
-        for sk in skill_point_types
-    ):
+        # STEP 1: Do we have enough points just to hold the item?
+        needed_to_equip = max(0, item_req - (current_attr + current_items))
+        
+        # STEP 2: After putting it on, do we drop below the reqs of older items?
+        net_after_equip = current_attr + current_items + needed_to_equip + item_bonus
+        needed_to_sustain = max(0, partial_build_info.max_reqs[sk] - net_after_equip)
+        
+        # Total points we must spend this turn
+        newly_attributed[sk] = needed_to_equip + needed_to_sustain
+        
+        # Fail if this pushes us over the 100 manual point cap
+        if current_attr + newly_attributed[sk] > 100:
+            return False, {}, 0
+            
+    # Check if we have enough total available points left (from the 200 pool)
+    total_needed = sum(newly_attributed.values())
+    if partial_build_info.available_skill_points < total_needed:
         return False, {}, 0
+        
+    new_available = partial_build_info.available_skill_points - total_needed
+    return True, newly_attributed, new_available
 
-    skill_points_available -= sum(newly_attributed.values())
-
-    if skill_points_available < 0:
-        return False, {}, 0
-
-    # If we reach here, it IS equippable
-    return True, newly_attributed, skill_points_available
 
 def search_items(item_type : str, partial_build_info : BuildInfo, score_item_function, range_of_penalty : int = 0):
     # Search items that are equippable and maximize score
@@ -310,7 +313,7 @@ def search_items(item_type : str, partial_build_info : BuildInfo, score_item_fun
 items_database, sets_database = load_game_data('items.json')
 
 if __name__ == "__main__":
-    generate_builds()
+    generate_builds(imposed_items=None, weapon_type="Wand")
 
 
     
