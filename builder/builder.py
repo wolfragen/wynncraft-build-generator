@@ -75,7 +75,7 @@ class BuildInfo:
         self.available_skill_points = available_skill_points or 200
         self.skill_points = skill_points or {sk:{"attributed":0, "items_counting":0, "items_not_counting":0} 
                                              for sk in skill_point_types}
-        self.max_reqs = max_reqs or {sk: 0 for sk in skill_point_types}
+        self.max_reqs = max_reqs or {sk: -150 for sk in skill_point_types}
 
         # TODO Boolean flags for mutually exclusive items (Hive + Ornate Shadow)
         self.exclusive_flags = exclusive_flags or set()
@@ -103,9 +103,9 @@ class BuildInfo:
         # Update max_reqs based on the newly added item
         new_build.max_reqs = self.max_reqs.copy()
         for sk in skill_point_types:
-            item_req = item.get(sk + "Req", 0)
-            if item_req > new_build.max_reqs[sk]:
-                new_build.max_reqs[sk] = item_req
+            skReq = sk + "Req"
+            if skReq in item and item[skReq] > new_build.max_reqs[sk]:
+                new_build.max_reqs[sk] = item[skReq]
 
         # We know skill points can be attributed at this point since can_equip was passed
         new_build.available_skill_points = new_available_skill_points
@@ -230,7 +230,7 @@ def score_build_spellDmg(build_info : BuildInfo):
     spellPct = build_info.stats["sdPct"] if "sdPct" in build_info.stats else 0
     dps = build_info.stats["averageDps"] if "averageDps" in build_info.stats else 0
     skStr = build_info.skill_points["str"]["attributed"] + build_info.skill_points["str"]["items_counting"] + build_info.skill_points["str"]["items_not_counting"]
-    return max(0, dps+spellRaw)*(1+spellPct/100)*(1+skStr*(0.7/150)) # approx
+    return max(0, dps+spellRaw)*(1+spellPct/100)*(1+max(0,skStr)*(0.7/150)) # approx
 
 def score_item_spellDmg(item : dict, partial_build_info : BuildInfo):
     # TODO use proper formulas with elements, adjust fields names
@@ -239,7 +239,7 @@ def score_item_spellDmg(item : dict, partial_build_info : BuildInfo):
     spellRawItem = stat_to_max(item["sdRaw"]) if "sdRaw" in item else 0
     spellPctBuild = partial_build_info.stats["sdPct"] if "sdPct" in partial_build_info.stats else 0
     spellPctItem = stat_to_max(item["sdPct"]) if "sdPct" in item else 0
-    dps = partial_build_info.stats["averageDps"] if "averageDps" in partial_build_info.stats else 500 # 500 is not perfect but more representative of a weapon than 0
+    dps = partial_build_info.stats["averageDps"] if "averageDps" in partial_build_info.stats else 0 # 160 is not perfect but more representative of a weapon than 0
     return max(0, dps+spellRawBuild+spellRawItem)*(1+(spellPctBuild+spellPctItem)/100)
 
 def penalize_skill_point_reqs(item : dict, score : float, penalty_strength : float, partial_build_info : BuildInfo):
@@ -256,7 +256,7 @@ def can_equip(item: dict, partial_build_info: BuildInfo):
     for sk in skill_point_types:
         current_attr = partial_build_info.skill_points[sk]["attributed"]
         current_items = partial_build_info.skill_points[sk]["items_counting"]
-        item_req = item.get(sk + "Req", 0)
+        item_req = item.get(sk + "Req", -150)
         
         # Weapons don't provide skill points to armor in Wynncraft
         if item.get("category") == "weapon":
