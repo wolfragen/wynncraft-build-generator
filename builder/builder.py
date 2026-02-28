@@ -152,9 +152,6 @@ class BuildInfo:
 def generate_builds(imposed_items=None, weapon_type="Bow"):
     best_build = None
     best_score = -float('inf')
-
-    # TODO create out of query instead
-    score_item_function = score_item_spellDmg
     
     # 1. Setup Initial State
     initial_build = BuildInfo(weapon_type=weapon_type)
@@ -176,7 +173,7 @@ def generate_builds(imposed_items=None, weapon_type="Bow"):
         # Base Case: The build is complete
         if not slots_left:
             current_build.calculate_stats()
-            current_score = score_build_spellDmg(current_build)
+            current_score = score_build_function(current_build)
             #print(f"Completed a build with score {current_score}")
             if current_score > best_score:
                 best_score = current_score
@@ -216,8 +213,6 @@ def generate_builds(imposed_items=None, weapon_type="Bow"):
 
 
 
-
-
 def stat_to_max(stat):
     # Returns max stat from range. Ex: "0-18" -> 18
     if isinstance(stat, str) and '-' in stat:
@@ -225,23 +220,7 @@ def stat_to_max(stat):
     return stat
 
 
-def score_build_spellDmg(build_info : BuildInfo):
-    # TODO use proper formulas with elements and skill points, adjust fields names
-    spellRaw = build_info.stats["sdRaw"] if "sdRaw" in build_info.stats else 0
-    spellPct = build_info.stats["sdPct"] if "sdPct" in build_info.stats else 0
-    dps = build_info.stats["averageDps"] if "averageDps" in build_info.stats else 0
-    skStr = build_info.skill_points["str"]["attributed"] + build_info.skill_points["str"]["items_counting"] + build_info.skill_points["str"]["items_not_counting"]
-    return max(0, dps+spellRaw)*(1+spellPct/100)*(1+max(0,skStr)*(0.7/150)) # approx
 
-def score_item_spellDmg(item : dict, partial_build_info : BuildInfo):
-    # TODO use proper formulas with elements, adjust fields names
-    # Use both items stats and partial build to evaluate actual impact
-    spellRawBuild = partial_build_info.stats["sdRaw"] if "sdRaw" in partial_build_info.stats else 0
-    spellRawItem = stat_to_max(item["sdRaw"]) if "sdRaw" in item else 0
-    spellPctBuild = partial_build_info.stats["sdPct"] if "sdPct" in partial_build_info.stats else 0
-    spellPctItem = stat_to_max(item["sdPct"]) if "sdPct" in item else 0
-    dps = partial_build_info.stats["averageDps"] if "averageDps" in partial_build_info.stats else 0 # 160 is not perfect but more representative of a weapon than 0
-    return max(0, dps+spellRawBuild+spellRawItem)*(1+(spellPctBuild+spellPctItem)/100)
 
 def penalize_skill_point_reqs(item : dict, score : float, penalty_strength : float, partial_build_info : BuildInfo):
     # TODO apply a % penalty from skill points beyond current attribution 
@@ -311,10 +290,42 @@ def search_items(item_type : str, partial_build_info : BuildInfo, score_item_fun
     return [item_info for item_info, _ in max_scores]
 
 
+def score_build_spellDmg(build_info : BuildInfo):
+    # TODO use proper formulas with elements and skill points, adjust fields names
+    spellRaw = build_info.stats["sdRaw"] if "sdRaw" in build_info.stats else 0
+    spellPct = build_info.stats["sdPct"] if "sdPct" in build_info.stats else 0
+    dps = build_info.stats["averageDps"] if "averageDps" in build_info.stats else 0
+    skStr = build_info.skill_points["str"]["attributed"] + build_info.skill_points["str"]["items_counting"] + build_info.skill_points["str"]["items_not_counting"]
+    return max(0, dps+spellRaw)*(1+spellPct/100)*(1+max(0,skStr)*(0.7/150)) # approx
+
+def score_item_spellDmg(item : dict, partial_build_info : BuildInfo):
+    # TODO use proper formulas with elements, adjust fields names
+    # Use both items stats and partial build to evaluate actual impact
+    spellRawBuild = partial_build_info.stats["sdRaw"] if "sdRaw" in partial_build_info.stats else 0
+    spellRawItem = stat_to_max(item["sdRaw"]) if "sdRaw" in item else 0
+    spellPctBuild = partial_build_info.stats["sdPct"] if "sdPct" in partial_build_info.stats else 0
+    spellPctItem = stat_to_max(item["sdPct"]) if "sdPct" in item else 0
+    dps = partial_build_info.stats["averageDps"] if "averageDps" in partial_build_info.stats else 0 # 160 is not perfect but more representative of a weapon than 0
+    return max(0, dps+spellRawBuild+spellRawItem)*(1+(spellPctBuild+spellPctItem)/100)
+
+def score_item_custom(item : dict, partial_build_info : BuildInfo):
+    return 0 # replace with your objective
+
+def score_build_custom(build_info : BuildInfo):
+    return 0 # replace with your objective
+
+score_build_function  = score_build_spellDmg
+score_item_function = score_item_spellDmg
+
 items_database, sets_database = load_game_data('items.json')
 
 if __name__ == "__main__":
     generate_builds(imposed_items=None, weapon_type="Wand")
 
 
-    
+'''
+TODO do skill req pernalty to branch into more possibilities
+TODO make incremental improvements
+TODO make progress indicators
+TODO add crafted
+'''
