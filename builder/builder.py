@@ -5,10 +5,13 @@ import json
 
 import json
 
+skill_point_types = ["str", "dex", "int", "def", "agi"]
 not_import_stats = ["icon", "name", "drop", "classReq", "lore", "tier", "dropInfo", "quest", "armourMaterial"]
 maximized_stats = ["lvl", "strReq", "dexReq", "intReq", "defReq", "agiReq"] # stats where max matters
 build_unique_stats = ["averageDps", "atkSpd"] # stats that only appear once
 item_only_stats = ["id", "displayName", "restrict", "allowCraftsman", "category", "type"] # stats like item displayName that are not used in build stat aggregation
+item_only_stats += skill_point_types # fix counting skill points twice
+
 #added_stats = ["nDam", "sdPct", "sdRaw", ...] # stats that can be += like spellDmg - TODO do it properly. TEMP : not in the others
 
 def load_game_data(filepath):
@@ -58,7 +61,6 @@ def load_game_data(filepath):
 
 
 # --- BASE DATA STRUCTURES ---
-skill_point_types = ["str", "dex", "int", "def", "agi"]
 
 class BuildInfo:
     def __init__(self, weapon_type, items=None, skill_points=None, available_skill_points = None, max_reqs=None, exclusive_flags=None):
@@ -217,10 +219,9 @@ def generate_builds(imposed_items=None, weapon_type="Bow"):
 
 
 def stat_to_max(stat):
-    # returns max stat from range. Ex: stat_to_max("0-18") -> int(18)
-    if type(stat) == str and '-' in stat:
-        stat.split('-')
-        stat = int(stat[-1])
+    # Returns max stat from range. Ex: "0-18" -> 18
+    if isinstance(stat, str) and '-' in stat:
+        return int(stat.split('-')[-1])
     return stat
 
 
