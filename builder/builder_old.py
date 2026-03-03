@@ -1,6 +1,5 @@
 import copy
 import json
-from numpy import clip as clamp
 
 # --- IMPORT ITEMS ---
 
@@ -150,82 +149,68 @@ class BuildInfo:
 
 # --- THE SEARCH ALGORITHM ---
 
-def generate_builds(imposed_items=[], weapon_type="Wand", equip_orders=None, top_k=3):
+def generate_builds(imposed_items=None, weapon_type="Bow"):
     best_build = None
     best_score = -float('inf')
     
     # 1. Setup Initial State
     initial_build = BuildInfo(weapon_type=weapon_type)
     if imposed_items:
-        for slot, itemName in imposed_items:
-            # get item from displayName in database:
-            item = None
-            for it in items_database[slot].values():
-                if it["displayName"] == itemName:
-                    item = it
-                    break
-            if item is None:
-                raise ValueError(f"Imposed item {itemName} not found in database for slot {slot}.")
-            equippable, newly_attributed, new_available = can_equip(item, initial_build)
+        for slot, item in imposed_items.items():
+            equippable, item_info = can_equip(item, initial_build)
             assert equippable, f"Imposed items cannot be equipped together."
-            item_info = (item, newly_attributed, new_available)
             initial_build = initial_build.add_item(slot, item_info)
             
-    # Default order if none is provided. You can prioritize high-req slots first (like Chestplate/Leggings)
-    if not equip_orders:
-        equip_orders = [
-            ["Chestplate", "Leggings", "Helmet", "Boots", "Ring1", "Ring2", "Bracelet", "Necklace", weapon_type]
-        ]
+    all_slots = initial_build.items.keys()
+    
+    # Only search slots that haven't been imposed
+    remaining_slots = [s for s in all_slots if initial_build.items[s] is None]
 
-    # 2. The Recursive DFS (Now strictly follows the given order)
-    def dfs(current_build: BuildInfo, current_order):
+    # 2. The Recursive DFS
+    def dfs(current_build : BuildInfo, slots_left):
         nonlocal best_build, best_score
 
-        # Base Case: The order is complete, meaning the build is full
-        if not current_order:
+        # Base Case: The build is complete
+        if not slots_left:
             current_build.calculate_stats()
             current_score = score_build_function(current_build)
-            
+            #print(f"Completed a build with score {current_score}")
             if current_score > best_score:
                 best_score = current_score
                 best_build = current_build
                 print(f"New best build found! Score: {best_score}")
                 print(f" - ".join(slot + ": " + item['displayName'] for slot, item in best_build.items.items() if item is not None))
+                #print(f"Skill Points: {best_build.skill_points}")
                 print(f"Available SP: {best_build.available_skill_points}")
                 print(f"Stats: {best_build.stats}")
                 print("------")
             return
 
-        # Recursive Step: Take the FIRST slot in the current order
-        slot_name = current_order[0]
-        
-        # If the slot is already filled (e.g., via imposed_items), skip it and move forward
-        if current_build.items.get(slot_name) is not None:
-            dfs(current_build, current_order[1:])
-            return
+        # Recursive Step: Try picking a slot to fill next (Iterating orders)
+        for i, slot_name in enumerate(slots_left):
             
-        # Map Ring1 and Ring2 to the overarching "Ring" type for your search
-        item_type = "Ring" if slot_name in ["Ring1", "Ring2"] else slot_name
-        
-        # Get the top K candidates for this specific slot
-        candidates = search_items(item_type, current_build, score_item_function, top_k)
-        
-        for item_info in candidates:
-            # Equip item and create the next branch of the tree
-            next_build = current_build.add_item(slot_name, item_info)
+            # Map Ring1 and Ring2 to the overarching "Ring" type for your search
+            item_type = "Ring" if slot_name in ["Ring1", "Ring2"] else slot_name
             
-            # Dive deeper into the tree, passing the REST of the order
-            dfs(next_build, current_order[1:])
+            # Get candidates for this specific slot at this specific point in the tree
+            candidates = search_items(item_type, current_build, score_item_function)
+            
+            for item_info in candidates:
+                #print(f"Trying to equip {item_info[0]['displayName']} in slot {slot_name} with new attributions {item_info[1]} (available: {item_info[2]})")
+                # Equip item and create the next branch of the tree
+                next_build = current_build.add_item(slot_name, item_info)
+                
+                # Remove the slot we just filled from the remaining list
+                next_slots_left = slots_left[:i] + slots_left[i+1:]
+                
+                # Dive deeper into the tree
+                dfs(next_build, next_slots_left)
 
     # 3. Start Search
     print("Starting build generation...")
-    for order in equip_orders:
-        print(f"Evaluating order: {order}")
-        dfs(initial_build, order)
-        
+    dfs(initial_build, remaining_slots)
     return best_build
 
-    
 
 
 def stat_to_max(stat):
@@ -282,12 +267,13 @@ def can_equip(item: dict, partial_build_info: BuildInfo):
     return True, newly_attributed, new_available
 
 
-def search_items(item_type: str, partial_build_info: BuildInfo, score_item_function, top_k: int):
+def search_items(item_type: str, partial_build_info: BuildInfo, score_item_function):
     """
     Search items that are equippable and maximize score.
-    Returns a list of up to top_k tuples:
+    Returns a list of up to 3 tuples:
     (item, new_skill_point_attributions, new_available_skill_points)
     """
+
     top_items = []  # list of tuples: (item_info, score)
 
     for item in items_database[item_type].values():
@@ -299,17 +285,15 @@ def search_items(item_type: str, partial_build_info: BuildInfo, score_item_funct
         score = score_item_function(item, partial_build_info)
         item_info = (item, new_attributions, new_available_skill_points)
 
-        # Insert and keep only top_k sorted by score (descending)
+        # Insert and keep only top 3 sorted by score (descending)
         top_items.append((item_info, score))
         top_items.sort(key=lambda x: x[1], reverse=True)
 
-        if len(top_items) > top_k:
+        if len(top_items) > 3:
             top_items.pop()  # remove lowest
 
     return [item_info for item_info, _ in top_items]
 
-
-# --- SCORING FUNCTIONS ---
 
 def score_build_spellDmg(build_info : BuildInfo):
     # TODO use proper formulas with elements and skill points, adjust fields names
@@ -317,15 +301,7 @@ def score_build_spellDmg(build_info : BuildInfo):
     spellPct = build_info.stats["sdPct"] if "sdPct" in build_info.stats else 0
     dps = build_info.stats["averageDps"] if "averageDps" in build_info.stats else 0
     skStr = build_info.skill_points["str"]["attributed"] + build_info.skill_points["str"]["items_counting"] + build_info.skill_points["str"]["items_not_counting"]
-    return max(0, dps+spellRaw)*(1+spellPct/100)*(1+clamp(skStr, 0, 150)*(0.7/150)) # approx
-
-def score_build_ehp(build_info : BuildInfo):
-    # TODO use proper formulas with elements and skill points, adjust fields names
-    hp = build_info.stats["hp"] if "hp" in build_info.stats else 0
-    hp += build_info.stats["hpBonus"] if "hpBonus" in build_info.stats else 0
-    skDef = build_info.skill_points["def"]["attributed"] + build_info.skill_points["def"]["items_counting"] + build_info.skill_points["def"]["items_not_counting"]
-    skAgi = build_info.skill_points["agi"]["attributed"] + build_info.skill_points["agi"]["items_counting"] + build_info.skill_points["agi"]["items_not_counting"]
-    return hp*(1+clamp(skDef, 0, 150)*(0.7/150))*(1+clamp(skAgi, 0, 150)*(0.7/150)) # approx
+    return max(0, dps+spellRaw)*(1+spellPct/100)*(1+max(0,skStr)*(0.7/150)) # approx
 
 def score_item_spellDmg(item : dict, partial_build_info : BuildInfo):
     # TODO use proper formulas with elements, adjust fields names
@@ -334,26 +310,8 @@ def score_item_spellDmg(item : dict, partial_build_info : BuildInfo):
     spellRawItem = stat_to_max(item["sdRaw"]) if "sdRaw" in item else 0
     spellPctBuild = partial_build_info.stats["sdPct"] if "sdPct" in partial_build_info.stats else 0
     spellPctItem = stat_to_max(item["sdPct"]) if "sdPct" in item else 0
-    skStrBuild = partial_build_info.skill_points["str"]["attributed"] + partial_build_info.skill_points["str"]["items_counting"] + partial_build_info.skill_points["str"]["items_not_counting"]
-    skStrItem = stat_to_max(item["str"]) if "str" in item else 0
-    if item.get("category") == "weapon":
-        dps = item["averageDps"] if "averageDps" in item else 0
-    else:
-        dps = partial_build_info.stats["averageDps"] if "averageDps" in partial_build_info.stats else 0 # 160 is not perfect but more representative of a weapon than 0
-    return max(0, dps+spellRawBuild+spellRawItem)*(1+(spellPctBuild+spellPctItem)/100)*(1+clamp(skStrBuild+skStrItem, 0, 150)*(0.7/150)) # approx
-
-def score_item_ehp(item : dict, partial_build_info : BuildInfo):
-    # TODO use proper formulas with elements, adjust fields names
-    hpBuild = partial_build_info.stats["hp"] if "hp" in partial_build_info.stats else 0
-    hpBuild += partial_build_info.stats["hpBonus"] if "hpBonus" in partial_build_info.stats else 0
-    hpItem = stat_to_max(item["hp"]) if "hp" in item else 0
-    hpItem += stat_to_max(item["hpBonus"]) if "hpBonus" in item else 0
-    skDefBuild = partial_build_info.skill_points["def"]["attributed"] + partial_build_info.skill_points["def"]["items_counting"] + partial_build_info.skill_points["def"]["items_not_counting"]
-    skDefItem = stat_to_max(item["def"]) if "def" in item else 0
-    skAgiBuild = partial_build_info.skill_points["agi"]["attributed"] + partial_build_info.skill_points["agi"]["items_counting"] + partial_build_info.skill_points["agi"]["items_not_counting"]
-    skAgiItem = stat_to_max(item["agi"]) if "agi" in item else 0
-    
-    return (hpBuild+hpItem)*(1+clamp(skDefBuild+skDefItem, 0, 150)*(0.7/150))*(1+clamp(skAgiBuild+skAgiItem, 0, 150)*(0.7/150)) # approx
+    dps = partial_build_info.stats["averageDps"] if "averageDps" in partial_build_info.stats else 0 # 160 is not perfect but more representative of a weapon than 0
+    return max(0, dps+spellRawBuild+spellRawItem)*(1+(spellPctBuild+spellPctItem)/100)
 
 def score_item_custom(item : dict, partial_build_info : BuildInfo):
     return 0 # replace with your objective
@@ -361,27 +319,17 @@ def score_item_custom(item : dict, partial_build_info : BuildInfo):
 def score_build_custom(build_info : BuildInfo):
     return 0 # replace with your objective
 
-
-# --- MAIN EXECUTION ---
-
 score_build_function  = score_build_spellDmg
 score_item_function = score_item_spellDmg
 
 items_database, sets_database = load_game_data('items.json')
 
 if __name__ == "__main__":
-    orders_to_test = [
-        # Standard heavy-to-light armor, then accessories, then weapon
-        ["Chestplate", "Leggings", "Helmet", "Boots", "Ring1", "Ring2", "Bracelet", "Necklace", "Wand"],
-        
-        # Sometimes weapon first helps define the required elements early
-        ["Wand", "Chestplate", "Leggings", "Helmet", "Boots", "Ring1", "Ring2", "Bracelet", "Necklace"]
-    ]
-    
-    # Try increasing top_k to 4 or 5 now that permutations are under control!
-    generate_builds(imposed_items=[("Wand", "Quetzalcoatl")], weapon_type="Wand", equip_orders=orders_to_test, top_k=3)
+    generate_builds(imposed_items=None, weapon_type="Wand")
+
 
 '''
+TODO do skill req pernalty to branch into more possibilities
 TODO make incremental improvements
 TODO make progress indicators
 TODO add crafted
