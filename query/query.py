@@ -35,10 +35,11 @@ class Query(NamedTuple):
     min_proj: np.ndarray
     max_proj: np.ndarray
     weights_proj: np.ndarray
+    pos_weight_mask_proj: np.ndarray
+    neg_weight_mask_proj: np.ndarray
 
     has_min_mask_proj: np.ndarray
     has_max_mask_proj: np.ndarray
-    weight_mask_proj: np.ndarray
 
     stat_index_keys_proj: List[str]
     req_mask_proj: np.ndarray
@@ -112,7 +113,8 @@ def build_query(
     has_min_mask_proj = has_min_mask[active_indices]
     has_max_mask_proj = has_max_mask[active_indices]
 
-    weight_mask_proj = weights_proj != 0.0
+    pos_weight_mask_proj = weights_proj >= 0.0
+    neg_weight_mask_proj = weights_proj <= 0.0
 
     stat_index_keys_proj = [
         next(name for name, i in STAT_INDEX.items() if i == idx)
@@ -141,7 +143,8 @@ def build_query(
         weights_proj=weights_proj,
         has_min_mask_proj=has_min_mask_proj,
         has_max_mask_proj=has_max_mask_proj,
-        weight_mask_proj=weight_mask_proj,
+        pos_weight_mask_proj=pos_weight_mask_proj,
+        neg_weight_mask_proj=neg_weight_mask_proj,
         stat_index_keys_proj=stat_index_keys_proj,
         req_mask_proj = req_mask_proj,
     )

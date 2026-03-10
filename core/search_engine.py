@@ -6,8 +6,6 @@ import numpy as np
 from numba import njit
 from time import time
 
-from core.pruning import prune
-
 
 # ============================================================
 # DFS (numba)
@@ -25,11 +23,15 @@ def dfs(
     best_solution,
     db_stat_min,
     db_stat_max,
+    db_contrib_pos_mask,
+    db_contrib_neg_mask,
     db_count,
     meta_void_eff,
     durability_idx,
     has_min_mask,
     has_max_mask,
+    pos_weight_mask,
+    neg_weight_mask,
     min_vals,
     max_vals,
     weights,
@@ -63,15 +65,47 @@ def dfs(
 
         return
 
-    # Pruning hook (stat-based pruning to be improved later)
-    if prune(depth, k, current_min, current_max):
-        return
 
     for i in range(start_index, db_count):
 
-        ingredients[depth] = i
-
         eff = meta_void_eff[depth]
+        
+        # ============================================================
+        # PRUNING
+        # ============================================================
+        
+        useful = False
+        eff_is_positive = eff > 0
+        for s in range(len(current_min)):
+        
+            if db_contrib_pos_mask[i, s]:
+                if eff_is_positive and (has_min_mask[s] or pos_weight_mask[s]):
+                    useful = True
+                    break
+                if not eff_is_positive and (has_max_mask[s] or neg_weight_mask[s]):
+                    useful = True
+                    break
+        
+            if db_contrib_neg_mask[i, s]:
+                if not eff_is_positive and (has_max_mask[s] or neg_weight_mask[s]):
+                    useful = True
+                    break
+                if eff_is_positive and (has_min_mask[s] or pos_weight_mask[s]):
+                    useful = True
+                    break
+        
+        if not useful:
+            continue
+        
+        # ---- durability pruning ----
+        if current_max[durability_idx] + db_stat_min[i, durability_idx] < min_vals[durability_idx]:
+            continue
+        
+        # ============================================================
+        # 
+        # ============================================================
+
+        ingredients[depth] = i
 
         # Apply ingredient contribution
         for s in range(len(current_min)):
@@ -97,11 +131,15 @@ def dfs(
             best_solution,
             db_stat_min,
             db_stat_max,
+            db_contrib_pos_mask,
+            db_contrib_neg_mask,
             db_count,
             meta_void_eff,
             durability_idx,
             has_min_mask,
             has_max_mask,
+            pos_weight_mask,
+            neg_weight_mask,
             min_vals,
             max_vals,
             weights,
@@ -131,10 +169,14 @@ def search_meta_batch(
     base_max_matrix,
     db_stat_min,
     db_stat_max,
+    db_contrib_pos_mask,
+    db_contrib_neg_mask,
     db_count,
     durability_idx,
     has_min_mask,
     has_max_mask,
+    pos_weight_mask,
+    neg_weight_mask,
     min_vals,
     max_vals,
     weights,
@@ -169,11 +211,15 @@ def search_meta_batch(
             best_solution_local,
             db_stat_min,
             db_stat_max,
+            db_contrib_pos_mask,
+            db_contrib_neg_mask,
             db_count,
             void_eff_matrix[m],
             durability_idx,
             has_min_mask,
             has_max_mask,
+            pos_weight_mask,
+            neg_weight_mask,
             min_vals,
             max_vals,
             weights,
@@ -206,6 +252,12 @@ def search(all_meta_sets, db, query):
             durability_idx = i
             break
         
+    if durability_idx == -1:
+        print("Durability not found in query. Aborting.")
+        return None
+    elif(query.min_proj[durability_idx] < 1):
+        print("Min durability should be strictly positive. Aborting.")
+        return None
 
     for meta_batch in all_meta_sets:
         start_time = time()
@@ -221,10 +273,14 @@ def search(all_meta_sets, db, query):
             meta_batch.base_max_matrix,
             db.stat_min_matrix,
             db.stat_max_matrix,
+            db.contrib_pos_mask,
+            db.contrib_neg_mask,
             db.count,
             durability_idx,
             query.has_min_mask_proj,
             query.has_max_mask_proj,
+            query.pos_weight_mask_proj,
+            query.neg_weight_mask_proj,
             query.min_proj,
             query.max_proj,
             query.weights_proj,
@@ -255,8 +311,8 @@ def search(all_meta_sets, db, query):
 
     print()
     print("SEARCHED FINISHED")
-    print("Total combinations :", total_possibilities)
-    print("Total evaluated :", total_searched[0])
+    print(f"Total combinations : {total_possibilities:,}")
+    print(f"Total evaluated : {total_searched[0]:,}")
     print(f"Pruning efficiency : {(1-total_searched[0]/total_possibilities)*100:.2f}% skipped")
     print()
     return best_full_slots

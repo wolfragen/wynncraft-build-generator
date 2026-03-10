@@ -25,12 +25,27 @@ def main():
     # ---------- Build User Query ----------
     user_query = {
         "mr": {"min": 1, "weight": 10000},
-        "spd": {"weight": 10000},
+        "spd": {"min": 1, "weight": 10000},
+        "agi": {"min": 1, "weight": 10000},
+        "int": {"min": 1, "weight": 10000},
+        "strReq": {"max": 50},
+        "dexReq": {"max": 50},
+        "intReq": {"max": 50},
+        "defReq": {"max": 50},
+        "agiReq": {"max": 50},
         "durability": {"min": 40, "weight": 1},
     }
 
     skill = "WEAPONSMITHING"
     item_type = "SPEAR"
+    
+    # ---------- Build Query Object ----------
+    query = build_query(
+        user_json=user_query,
+        search_for_inversion=True, # negative effectiveness included
+        item_type=item_type,
+        skill=skill
+    )
 
     # ---------- Load recipes (Materials => Stats) ----------
     recipes = load_recipes("data/recipes_compress.json")
@@ -43,20 +58,13 @@ def main():
         lvl_max=105,
     )
 
-    recipe = build_recipe(recipe_raw, tier=3) # builds final recipe using material tier
-
-    # ---------- Build Query Object ----------
-    query = build_query(
-        user_json=user_query,
-        search_for_inversion=True, # negative effectiveness included
-        item_type=item_type,
-        skill=skill
-    )
+    recipe = build_recipe(recipe_raw, query, tier=3) # builds final recipe using material tier
 
     # ---------- Filter raw ingredients ----------
     filtered_raw = filter_raw_ingredients(
         ingredients_raw,
         query,
+        recipe,
     )
 
     # ---------- Build compact DB ----------

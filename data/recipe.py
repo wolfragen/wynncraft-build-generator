@@ -19,7 +19,7 @@ class Recipe(NamedTuple):
     scaled_dura_max: int
 
 
-def build_recipe(raw_recipe: dict, tier: int) -> Recipe:
+def build_recipe(raw_recipe: dict, query, tier: int) -> Recipe:
     recipe_data = raw_recipe.data
     
     base_dura_min = recipe_data["durability"]["minimum"]
