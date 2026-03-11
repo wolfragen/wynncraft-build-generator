@@ -327,6 +327,22 @@ def score_build_ehp(build_info : BuildInfo):
     skAgi = build_info.skill_points["agi"]["attributed"] + build_info.skill_points["agi"]["items_counting"] + build_info.skill_points["agi"]["items_not_counting"]
     return hp*(1+clamp(skDef, 0, 150)*(0.7/150))*(1+clamp(skAgi, 0, 150)*(0.7/150)) # approx
 
+def score_build_raw_hp_hpr_thorns_reflex(build_info : BuildInfo):
+    hpWeight = 1
+    hprWeight = 8
+
+    hp = build_info.stats["hp"] if "hp" in build_info.stats else 0
+    hp += build_info.stats["hpBonus"] if "hpBonus" in build_info.stats else 0
+    hprRaw = build_info.stats["hprRaw"] if "hprRaw" in build_info.stats else 0
+    hrpPct = build_info.stats["hprPct"] if "hprPct" in build_info.stats else 0
+    trueHpr = hprRaw*(1+hrpPct/100)
+    thorns = build_info.stats["thorns"] if "thorns" in build_info.stats else 0
+    reflexion = build_info.stats["ref"] if "ref" in build_info.stats else 0
+    if (thorns < 100 or reflexion < 100):
+        return 0
+    else:
+        return hp*hpWeight + trueHpr*hprWeight
+
 def score_item_spellDmg(item : dict, partial_build_info : BuildInfo):
     # TODO use proper formulas with elements, adjust fields names
     # Use both items stats and partial build to evaluate actual impact
@@ -355,17 +371,45 @@ def score_item_ehp(item : dict, partial_build_info : BuildInfo):
     
     return (hpBuild+hpItem)*(1+clamp(skDefBuild+skDefItem, 0, 150)*(0.7/150))*(1+clamp(skAgiBuild+skAgiItem, 0, 150)*(0.7/150)) # approx
 
-def score_item_custom(item : dict, partial_build_info : BuildInfo):
-    return 0 # replace with your objective
+def score_item_raw_hp_hpr_thorns_reflex(item : dict, partial_build_info : BuildInfo):
+    hpWeight = 2
+    hprWeight = 16
+    thornsWeight = 8
+    reflexionWeight = 8
+
+
+    hpBuild = partial_build_info.stats["hp"] if "hp" in partial_build_info.stats else 0
+    hpBuild += partial_build_info.stats["hpBonus"] if "hpBonus" in partial_build_info.stats else 0
+    hpItem = stat_to_max(item["hp"]) if "hp" in item else 0
+    hpItem += stat_to_max(item["hpBonus"]) if "hpBonus" in item else 0
+    hprRawBuild = partial_build_info.stats["hprRaw"] if "hprRaw" in partial_build_info.stats else 0
+    hprRawItem = stat_to_max(item["hprRaw"]) if "hprRaw" in item else 0
+    hrpPctBuild = partial_build_info.stats["hprPct"] if "hprPct" in partial_build_info.stats else 0
+    hrpPctItem = stat_to_max(item["hprPct"]) if "hprPct" in item else 0
+    trueHpr = (hprRawBuild+hprRawItem)*(1+(hrpPctBuild+hrpPctItem)/100)
+
+    thornsBuild = partial_build_info.stats["thorns"] if "thorns" in partial_build_info.stats else 0
+    thornsItem = stat_to_max(item["thorns"]) if "thorns" in item else 0
+    reflexionBuild = partial_build_info.stats["ref"] if "ref" in partial_build_info.stats else 0
+    reflexionItem = stat_to_max(item["ref"]) if "ref" in item else 0
+    
+    if thornsBuild+thornsItem > 100:
+        thornsWeight = 0
+    if reflexionBuild+reflexionItem > 100:
+        reflexionWeight = 0
+    
+    return (hpBuild+hpItem)*hpWeight + trueHpr*hprWeight + (thornsBuild+thornsItem)*thornsWeight + (reflexionBuild+reflexionItem)*reflexionWeight
+
 
 def score_build_custom(build_info : BuildInfo):
     return 0 # replace with your objective
 
+def score_item_custom(item : dict, partial_build_info : BuildInfo):
+    return 0 # replace with your objective
 
 # --- MAIN EXECUTION ---
 
-score_build_function  = score_build_spellDmg
-score_item_function = score_item_spellDmg
+
 
 items_database, sets_database = load_game_data('items.json')
 
@@ -375,12 +419,19 @@ if __name__ == "__main__":
         ["Chestplate", "Leggings", "Helmet", "Boots", "Ring1", "Ring2", "Bracelet", "Necklace", "Wand"],
         
         # Sometimes weapon first helps define the required elements early
-        ["Wand", "Chestplate", "Leggings", "Helmet", "Boots", "Ring1", "Ring2", "Bracelet", "Necklace"]
+        ["Wand", "Leggings", "Helmet", "Boots", "Ring1", "Ring2", "Bracelet", "Necklace", "Chestplate"]
     ]
     
     # Try increasing top_k to 4 or 5 now that permutations are under control!
+    '''
+    score_build_function  = score_build_spellDmg
+    score_item_function = score_item_spellDmg
     generate_builds(imposed_items=[("Wand", "Quetzalcoatl")], weapon_type="Wand", equip_orders=orders_to_test, top_k=3)
-
+    '''
+    score_build_function  = score_build_raw_hp_hpr_thorns_reflex
+    score_item_function = score_item_raw_hp_hpr_thorns_reflex
+    #generate_builds(imposed_items=[("Wand", "Depressing Stick"), ("Chestplate", "About-Face")], weapon_type="Wand", equip_orders=orders_to_test, top_k=6)
+    generate_builds(imposed_items=[("Wand", "Depressing Stick")], weapon_type="Wand", equip_orders=orders_to_test, top_k=4)
 '''
 TODO make incremental improvements
 TODO make progress indicators
