@@ -4,7 +4,7 @@ skill_point_types = ["str", "dex", "int", "def", "agi"]
 not_import_stats = ["icon", "name", "drop", "classReq", "lore", "tier", "dropInfo", "quest", "armourMaterial"]
 maximized_stats = ["lvl", "strReq", "dexReq", "intReq", "defReq", "agiReq"]
 build_unique_stats = ["averageDps", "atkSpd"]
-item_only_stats = ["id", "displayName", "restrict", "allowCraftsman", "category", "type"] + skill_point_types
+item_only_stats = ["id", "displayName", "restrict", "allowCraftsman", "category", "type", "majorIds"] + skill_point_types
 
 def load_game_data(filepath):
     """

@@ -1,3 +1,4 @@
+import copy
 from models import BuildInfo
 from data_loader import skill_point_types, stat_to_max
 
@@ -50,90 +51,128 @@ def search_items(item_type: str, partial_build_info: BuildInfo, score_item_funct
 
     return [item_info for item_info, _ in top_items]
 
-def generate_builds(items_database, score_build_function, score_item_function, imposed_items=None, weapon_type="Wand", equip_orders=None, top_k=3):
-    if imposed_items is None:
-        imposed_items = []
-        
-    best_build = None
-    best_score = -float('inf')
+def item_sp_net(item):
+    return sum(stat_to_max(item.get(sk, 0)) for sk in skill_point_types)
+
+def build_base_from_items(weapon_type, items_dict):
+    build = BuildInfo(weapon_type=weapon_type)
+    remaining = [(slot, item) for slot, item in items_dict.items() if item is not None]
     
-    initial_build = BuildInfo(weapon_type=weapon_type)
-    if imposed_items:
-        for slot, itemName in imposed_items:
-            item_type = "Ring" if slot in ["Ring1", "Ring2"] else slot
-            item = None
-            for it in items_database[item_type].values():
-                if it["displayName"] == itemName:
-                    item = it
-                    break
-            if item is None:
-                raise ValueError(f"Imposed item {itemName} not found in database for slot {slot}.")
-            equippable, newly_attributed, new_available = can_equip(item, initial_build)
-            assert equippable, f"Imposed items cannot be equipped together."
-            item_info = (item, newly_attributed, new_available)
-            initial_build = initial_build.add_item(slot, item_info)
+    # Sort remaining items: those that give the most total skill points first
+    remaining.sort(key=lambda x: item_sp_net(x[1]), reverse=True)
+    
+    while remaining:
+        progress = False
+        for i in range(len(remaining)):
+            slot, item = remaining[i]
+            equipable, attributions, new_avail = can_equip(item, build)
+            if equipable:
+                build = build.add_item(slot, (item, attributions, new_avail))
+                remaining.pop(i)
+                progress = True
+                break
+        if not progress:
+            return None
+    return build
+
+class BuildPool:
+    def __init__(self, max_size):
+        self.max_size = max_size
+        self.builds = [] # list of (score, build, hash)
+        self.seen_hashes = set()
+        self.max_score = -float('inf')
+        
+    def add(self, build, score):
+        b_hash = tuple(sorted((k, v["displayName"]) for k, v in build.items.items() if v))
+        if b_hash in self.seen_hashes:
+            return
+        
+        if score > self.max_score:
+            self.max_score = score
+            print(f"New max score: {score:.2f}")
             
-    if not equip_orders:
-        equip_orders = [
-            ["Chestplate", "Leggings", "Helmet", "Boots", "Ring1", "Ring2", "Bracelet", "Necklace", weapon_type]
-        ]
+        self.builds.append((score, build, b_hash))
+        self.builds.sort(key=lambda x: x[0], reverse=True)
+        
+        if len(self.builds) > self.max_size:
+            removed = self.builds.pop()
+            if (removed[2] in self.seen_hashes):
+                self.seen_hashes.remove(removed[2])
+            
+        self.seen_hashes.add(b_hash)
+        
+    def get_builds(self):
+        return [(b[0], b[1]) for b in self.builds]
 
-    def dfs(current_build: BuildInfo, current_order):
-        nonlocal best_build, best_score
+class UnifiedBuilder:
+    def __init__(self, items_database, score_build_fn, score_item_fn):
+        self.items_database = items_database
+        self.score_build = score_build_fn
+        self.score_item = score_item_fn
 
-        if not current_order:
+    def _dfs(self, current_build, remaining_order, top_k, pool):
+        if not remaining_order:
             current_build.calculate_stats()
-            current_score = score_build_function(current_build)
-            
-            if current_score > best_score:
-                best_score = current_score
-                best_build = current_build
-                print(f"New best build found! Score: {best_score}")
-                print(f" - ".join(slot + ": " + item['displayName'] for slot, item in best_build.items.items() if item is not None))
-                print(f"Available SP: {best_build.available_skill_points}")
-                print(f"Stats: {best_build.stats}")
-                print("------")
+            score = self.score_build(current_build)
+            pool.add(current_build, score)
             return
 
-        slot_name = current_order[0]
+        slot_name = remaining_order[0]
         
         if current_build.items.get(slot_name) is not None:
-            dfs(current_build, current_order[1:])
+            self._dfs(current_build, remaining_order[1:], top_k, pool)
             return
             
         item_type = "Ring" if slot_name in ["Ring1", "Ring2"] else slot_name
-        
-        candidates = search_items(item_type, current_build, score_item_function, top_k, items_database)
+        candidates = search_items(item_type, current_build, self.score_item, top_k, self.items_database)
         
         for item_info in candidates:
             next_build = current_build.add_item(slot_name, item_info)
-            dfs(next_build, current_order[1:])
+            self._dfs(next_build, remaining_order[1:], top_k, pool)
 
-    print("Starting build generation...")
-    for order in equip_orders:
-        print(f"Evaluating order: {order}")
-        dfs(initial_build, order)
+    def generate(self, weapon_type, imposed_items, fill_orders, top_k, top_i):
+        pool = BuildPool(top_i)
         
-    return best_build
-
-def replace_item_in_build(build: BuildInfo, slot_to_replace: str, items_database: dict, score_build_function, score_item_function, top_k=3):
-    """
-    Takes an existing build, removes the item in `slot_to_replace`, and finds the best replacement.
-    """
-    print(f"Replacing {slot_to_replace} in current build...")
-    
-    imposed_items = []
-    for slot, item in build.items.items():
-        if item is not None and slot != slot_to_replace:
+        base_items = {}
+        for slot, item_name in imposed_items:
             item_type = "Ring" if slot in ["Ring1", "Ring2"] else slot
-            imposed_items.append((slot, item["displayName"]))
+            item = None
+            for it in self.items_database[item_type].values():
+                if it["displayName"] == item_name:
+                    item = it
+                    break
+            if item is None:
+                raise ValueError(f"Imposed item {item_name} not found.")
+            base_items[slot] = item
             
-    return generate_builds(
-        items_database=items_database,
-        score_build_function=score_build_function,
-        score_item_function=score_item_function,
-        imposed_items=imposed_items,
-        weapon_type=build.weapon_type,
-        equip_orders=[[slot_to_replace]],
-        top_k=top_k
-    )
+        base_build = build_base_from_items(weapon_type, base_items)
+        if base_build is None:
+            print("Could not equip the imposed items together.")
+            return []
+            
+        for order in fill_orders:
+            self._dfs(base_build, order, top_k, pool)
+            
+        return pool.get_builds()
+
+    def refine(self, builds, replace_orders, imposed_slots, top_j, top_l):
+        pool = BuildPool(top_l)
+        
+        for score, build in builds:
+            # Keep the original build in the pool as a baseline
+            pool.add(build, score)
+            
+            for order in replace_orders:
+                # Filter out imposed slots from the replacement order
+                actual_order = [s for s in order if s not in imposed_slots]
+                
+                # Determine which items to keep
+                kept_items = {s: item for s, item in build.items.items() if s not in actual_order and item is not None}
+                
+                base_build = build_base_from_items(build.weapon_type, kept_items)
+                if base_build is None:
+                    continue # Skip if the remaining items cannot be equipped without the replaced ones
+                    
+                self._dfs(base_build, actual_order, top_j, pool)
+                
+        return pool.get_builds()
