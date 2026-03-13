@@ -1,9 +1,9 @@
 from data_loader import load_game_data
-from scoring import *
+from scoring import score_build_spellDmg, score_item_spellDmg
 from search import UnifiedBuilder
 
 def print_build(build, score, rank):
-    print(f"\\n--- Rank {rank} Build (Score: {score:.2f}) ---")
+    print(f"\n--- Rank {rank} Build (Score: {score:.2f}) ---")
     for slot, item in build.items.items():
         if item:
             print(f"{slot}: {item['displayName']}")
@@ -20,18 +20,18 @@ def main():
         score_item_fn=score_item_spellDmg
     )
 
-    imposed_items = [("Wand", "Pure")]
+    imposed_items = [("Wand", "Continuum")]
     weapon_type = "Wand"
     
     fill_orders = [
         ["Chestplate", "Leggings", "Helmet", "Boots", "Ring1", "Ring2", "Bracelet", "Necklace", "Wand"],
-        ["Wand", "Leggings", "Helmet", "Boots", "Ring1", "Ring2", "Bracelet", "Necklace", "Chestplate"]
+        ["Wand", "Boots", "Helmet", "Leggings", "Ring1", "Ring2", "Bracelet", "Necklace", "Chestplate"]
     ]
     
-    top_k = 3 # number of best items to create tree branches on
-    top_i = 3 # number of best builds kept
+    top_k = 3
+    top_i = 3
     
-    print(f"\\n--- Phase 1: Generating Top {top_i} Builds ---")
+    print(f"\n--- Phase 1: Generating Top {top_i} Builds ---")
     best_builds = builder.generate(
         weapon_type=weapon_type,
         imposed_items=imposed_items,
@@ -41,17 +41,15 @@ def main():
     )
     
     replace_orders = [
-        ["Chestplate", "Leggings", "Helmet", "Boots", "Ring1", "Ring2", "Bracelet", "Necklace", "Wand"],
-        ["Wand", "Leggings", "Helmet", "Boots", "Ring1", "Ring2", "Bracelet", "Necklace", "Chestplate"]
-        #["Helmet", "Chestplate"],
-        #["Ring1", "Ring2", "Bracelet", "Necklace"]
+        ["Wand", "Helmet", "Chestplate", "Leggings", "Boots"],
+        ["Ring1", "Ring2", "Bracelet", "Necklace"]
     ]
     imposed_slots = [slot for slot, _ in imposed_items]
     
-    top_j = 3 # number of best replacements to explore down the tree
-    top_l = 3 # final number of best builds to keep
+    top_j = 3
+    top_l = 3
     
-    print(f"\\n--- Phase 2: Refining Builds (Top {top_l} final) ---")
+    print(f"\n--- Phase 2: Refining Builds (Top {top_l} final) ---")
     final_builds = builder.refine(
         builds=best_builds,
         replace_orders=replace_orders,
@@ -60,7 +58,7 @@ def main():
         top_l=top_l
     )
     
-    print(f"\\n--- Final Top {top_l} Builds ---")
+    print(f"\n--- Final Top {top_l} Builds ---")
     for rank, (score, build) in enumerate(final_builds, 1):
         print_build(build, score, rank)
 

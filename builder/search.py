@@ -1,6 +1,6 @@
 import copy
 from models import BuildInfo
-from data_loader import skill_point_types, stat_to_max
+from data_loader import skill_point_types
 
 def can_equip(item: dict, partial_build_info: BuildInfo):
     newly_attributed = {}
@@ -11,13 +11,17 @@ def can_equip(item: dict, partial_build_info: BuildInfo):
         item_req = item.get(sk + "Req", -150)
         
         if item.get("category") == "weapon":
-            item_bonus = 0
+            # Weapons don't count their positive skill points for requirements, but negative ones still hurt
+            item_bonus = min(0, item.get(sk, 0))
         else:
-            item_bonus = stat_to_max(item.get(sk, 0))
+            item_bonus = item.get(sk, 0)
             
         needed_to_equip = max(0, item_req - (current_attr + current_items))
         net_after_equip = current_attr + current_items + needed_to_equip + item_bonus
-        needed_to_sustain = max(0, partial_build_info.max_reqs[sk] - net_after_equip)
+        
+        # Must satisfy previous items' max requirements AND the current item's requirement after it's equipped
+        total_max_req = max(partial_build_info.max_reqs[sk], item_req)
+        needed_to_sustain = max(0, total_max_req - net_after_equip)
         
         newly_attributed[sk] = needed_to_equip + needed_to_sustain
         
@@ -52,10 +56,10 @@ def search_items(item_type: str, partial_build_info: BuildInfo, score_item_funct
     return [item_info for item_info, _ in top_items]
 
 def item_sp_net(item):
-    return sum(stat_to_max(item.get(sk, 0)) for sk in skill_point_types)
+    return sum(item.get(sk, 0) for sk in skill_point_types)
 
-def build_base_from_items(weapon_type, items_dict):
-    build = BuildInfo(weapon_type=weapon_type)
+def build_base_from_items(weapon_type, items_dict, available_skill_points=200):
+    build = BuildInfo(weapon_type=weapon_type, available_skill_points=available_skill_points)
     remaining = [(slot, item) for slot, item in items_dict.items() if item is not None]
     
     # Sort remaining items: those that give the most total skill points first
@@ -93,13 +97,11 @@ class BuildPool:
             
         self.builds.append((score, build, b_hash))
         self.builds.sort(key=lambda x: x[0], reverse=True)
+        self.seen_hashes.add(b_hash)
         
         if len(self.builds) > self.max_size:
             removed = self.builds.pop()
-            if (removed[2] in self.seen_hashes):
-                self.seen_hashes.remove(removed[2])
-            
-        self.seen_hashes.add(b_hash)
+            self.seen_hashes.remove(removed[2])
         
     def get_builds(self):
         return [(b[0], b[1]) for b in self.builds]
@@ -130,7 +132,7 @@ class UnifiedBuilder:
             next_build = current_build.add_item(slot_name, item_info)
             self._dfs(next_build, remaining_order[1:], top_k, pool)
 
-    def generate(self, weapon_type, imposed_items, fill_orders, top_k, top_i):
+    def generate(self, weapon_type, imposed_items, fill_orders, top_k, top_i, available_skill_points=200):
         pool = BuildPool(top_i)
         
         base_items = {}
@@ -145,7 +147,7 @@ class UnifiedBuilder:
                 raise ValueError(f"Imposed item {item_name} not found.")
             base_items[slot] = item
             
-        base_build = build_base_from_items(weapon_type, base_items)
+        base_build = build_base_from_items(weapon_type, base_items, available_skill_points=available_skill_points)
         if base_build is None:
             print("Could not equip the imposed items together.")
             return []
@@ -169,7 +171,8 @@ class UnifiedBuilder:
                 # Determine which items to keep
                 kept_items = {s: item for s, item in build.items.items() if s not in actual_order and item is not None}
                 
-                base_build = build_base_from_items(build.weapon_type, kept_items)
+                initial_sp = build.available_skill_points + sum(build.skill_points[sk]["attributed"] for sk in skill_point_types)
+                base_build = build_base_from_items(build.weapon_type, kept_items, available_skill_points=initial_sp)
                 if base_build is None:
                     continue # Skip if the remaining items cannot be equipped without the replaced ones
                     
