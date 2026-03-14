@@ -5,7 +5,7 @@ from data.recipe import build_recipe
 from query.query import build_query
 from query.ingredient_filter import filter_raw_ingredients
 from utils.hash_generator import generate_crafter_url
-from data.stats import STAT_INDEX, STAT_COUNT
+from data.stats import STAT_INDEX, STAT_COUNT, CONSU_SKILLS
 from data.meta_set_loader import load_meta_sets
 
 from core.search_engine import search
@@ -13,7 +13,6 @@ from core.search_engine import search
 from time import time
 import cProfile
 import pstats
-
 
 
 
@@ -26,25 +25,21 @@ def main():
     user_query = {
         "mr": {"min": 1, "weight": 10000},
         "spd": {"min": 1, "weight": 10000},
-        "agi": {"min": 1, "weight": 10000},
-        "int": {"min": 1, "weight": 10000},
-        "strReq": {"max": 50},
-        "dexReq": {"max": 50},
-        "intReq": {"max": 50},
-        "defReq": {"max": 50},
-        "agiReq": {"max": 50},
-        "durability": {"min": 40, "weight": 1},
+        "duration": {"min": 1800, "weight": 1},
+        "charges": {"min": 3},
     }
 
-    skill = "WEAPONSMITHING"
-    item_type = "SPEAR"
+    skill = "ALCHEMISM"
+    item_type = "POTION"
+    consumable = skill in CONSU_SKILLS
     
     # ---------- Build Query Object ----------
     query = build_query(
         user_json=user_query,
         search_for_inversion=True, # negative effectiveness included
         item_type=item_type,
-        skill=skill
+        skill=skill,
+        consumable=consumable,
     )
 
     # ---------- Load recipes (Materials => Stats) ----------
@@ -128,7 +123,24 @@ if __name__ == "__main__":
     
     print(f"Elapsed time: {time()-start_time:.0f}s")
     
+"""
+TODO : 
+derived_type        = [HPR_EFF, DPS]
 
+derived_dep_start   = [0, 2]
+derived_dep_count   = [2, 4]
+
+derived_deps        =
+[
+  idx_hprRaw,
+  idx_hprPct,
+
+  idx_sdRaw,
+  idx_sdPct,
+  idx_str,
+  idx_dex
+]
+"""
 
 
 

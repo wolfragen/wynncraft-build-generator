@@ -5,12 +5,13 @@ import math
 import os
 
 from data.recipe_loader import load_recipes
+from data.stats import CONSU_SKILLS
 
 def load_raw_data(ingred_path):
     with open(ingred_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def get_filtered_ingredients(all_ingreds, profession, include_dura):
+def get_filtered_ingredients(all_ingreds, profession, include_dura, dura_str):
     """Filters ingredients and pre-extracts min/max for all relevant stats."""
     filtered = []
     for ing in all_ingreds:
@@ -20,12 +21,18 @@ def get_filtered_ingredients(all_ingreds, profession, include_dura):
         pos = ing.get("posMods", {})
         has_pos_mods = any(v != 0 for v in pos.values())
         has_ingred_eff = "ingredEff" in ing.get("ids", {})
-        is_meta = has_pos_mods or has_ingred_eff
         
         item_ids = ing.get("itemIDs", {})
         cons_ids = ing.get("consumableIDs", {})
+        charges = cons_ids.get("charges", 0)
         
-        dura = item_ids.get("dura", 0)
+        is_meta = has_pos_mods or has_ingred_eff or charges != 0
+        
+        durability = item_ids.get("dura", 0)
+        duration = cons_ids.get("dura", 0)
+        dura = durability
+        if dura_str == "duration":
+            dura = duration
         is_dura = dura > 0
         
         if is_meta or (include_dura and is_dura):
@@ -43,12 +50,10 @@ def get_filtered_ingredients(all_ingreds, profession, include_dura):
                     stats[r] = {"min": val, "max": val}
 
             static_stats = {}
-            if dura != 0: static_stats["durability"] = {"min": dura, "max": dura}
+            if dura != 0: static_stats[dura_str] = {"min": dura, "max": dura}
             
-            for s in ["duration", "charges"]:
-                val = cons_ids.get(s, 0)
-                if val != 0:
-                    static_stats[s] = {"min": val, "max": val}
+            if charges != 0:
+                static_stats["charges"] = {"min": charges, "max": charges}
             
             filtered.append({
                 "id": ing["id"],
@@ -211,6 +216,11 @@ def get_unique_permutations(ing_multiset):
             yield perm
 
 def run_precalculation(profession, include_dura_ingredients=True, pre_filled=5, min_dura=None):
+    
+    dura = "durability"
+    if profession in CONSU_SKILLS:
+        dura = "duration"
+    
     should_check_dura = min_dura is not None
     print(f"--- PRECALCULATING: {profession} ---")
     data_dir = "data"
@@ -219,7 +229,7 @@ def run_precalculation(profession, include_dura_ingredients=True, pre_filled=5, 
     os.makedirs(precalc_dir, exist_ok=True)
     
     all_data = load_raw_data(ingred_path)
-    filtered = get_filtered_ingredients(all_data, profession, include_dura_ingredients)
+    filtered = get_filtered_ingredients(all_data, profession, include_dura_ingredients, dura_str=dura)
     print(f"Relevant ingredients found: {len(filtered)}")
     
     for i in range(1, pre_filled+1):
@@ -255,9 +265,9 @@ def run_precalculation(profession, include_dura_ingredients=True, pre_filled=5, 
                         recipe_data = calculate_recipe_stats(grid)
                         total_generated += 1
                         
-                        # --- durability prune ---
+                        # --- dura prune ---
                         if should_check_dura:
-                            dura_stat = recipe_data.get("stats", {}).get("durability")
+                            dura_stat = recipe_data.get("stats", {}).get(dura)
                             if dura_stat is not None:
                                 if dura_stat["max"] < min_dura:
                                     total_culled += 1
@@ -294,14 +304,20 @@ def run_precalculation(profession, include_dura_ingredients=True, pre_filled=5, 
 # MIN DURA FINDER 
 # ============================================================ 
 def compute_min_dura_for_profession(recipes, profession, lvl_min, lvl_max): 
-    """ Compute minimum allowed durability threshold for a profession. 
-    We find the maximum base durability among all recipes of this profession in the given level range. 
+    """ Compute minimum allowed dura threshold for a profession. 
+    We find the maximum base dura among all recipes of this profession in the given level range. 
     Any set consuming more than that is impossible. Returns: min_dura (negative int) 
     """ 
+    
+    dura_str = "durability"
+    if profession in CONSU_SKILLS:
+        dura_str = "duration"
+        
     max_dura = 0 
     for r in recipes: 
+        r = r.data
         if ( r["skill"] == profession and r["lvl"]["minimum"] == lvl_min and r["lvl"]["maximum"] == lvl_max ): 
-            dura = r["durability"]["maximum"] 
+            dura = r[dura_str]["maximum"] 
             if dura > max_dura: 
                 max_dura = dura
     if max_dura == 0: 
@@ -310,14 +326,14 @@ def compute_min_dura_for_profession(recipes, profession, lvl_min, lvl_max):
 
 
 if __name__ == "__main__":
-    professions = ["JEWELING", "TAILORING", "ARMOURING", "WEAPONSMITHING", "WOODWORKING"]
+    professions = ["ALCHEMISM", "SCRIBING", "COOKING"]
     if os.path.exists("data/ingreds_compress.json"):
         for TARGET_PROFESSION in professions:
         
             LEVEL_MIN = 103 
             LEVEL_MAX = 105
             RECIPES_PATH = "data/recipes_compress.json" 
-            recipes_data = load_recipes(RECIPES_PATH) # Compute durability threshold for profession 
+            recipes_data = load_recipes(RECIPES_PATH) # Compute dura threshold for profession 
             min_dura = compute_min_dura_for_profession( recipes_data, TARGET_PROFESSION, LEVEL_MIN, LEVEL_MAX )
             run_precalculation(TARGET_PROFESSION, include_dura_ingredients=True, pre_filled=5, min_dura=min_dura)
     else:

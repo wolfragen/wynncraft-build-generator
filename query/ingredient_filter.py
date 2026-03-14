@@ -9,7 +9,7 @@ adapted to dense stat vectors.
 Effectiveness filtering removed.
 """
 
-from data.stats import STAT_INDEX, IDX_DURABILITY
+from data.stats import STAT_INDEX, IDX_DURABILITY, IDX_DURATION, IDX_CHARGES
 from data.ingredient_loader import SKILL_INDEX
 
 import numpy as np
@@ -58,14 +58,21 @@ def filter_raw_ingredients(
         min_stats = ing.stats_min
         max_stats = ing.stats_max
     
-        # ---- positive dura filter ----
-        if max_stats[IDX_DURABILITY] > 0:
-            continue
+        if not query.consumable :
+            # ---- positive durability filter ----
+            if max_stats[IDX_DURABILITY] > 0:
+                continue
+        else:
+            # ---- positive duration filter ----
+            if max_stats[IDX_DURATION] > 0:
+                continue
+            if max_stats[IDX_CHARGES] != 0:
+                continue
 
         # ---- Normal stats ----
         for stat_name, idx in stat_index.items():
 
-            if idx == IDX_DURABILITY:
+            if idx == IDX_DURABILITY or idx == IDX_DURATION:
                 continue
 
             # Skip stats not used in query
@@ -141,7 +148,9 @@ def pareto_cull_ingredients(ingredients, query, recipe):
             min_val = ing.stats_min[stat_idx]
             max_val = ing.stats_max[stat_idx]
 
-            dur_idx = STAT_INDEX.get("durability")
+            dur_idx = IDX_DURABILITY
+            if query.consumable:
+                dur_idx = IDX_DURATION
 
             for i, ing in enumerate(ingredients):
             
@@ -150,7 +159,7 @@ def pareto_cull_ingredients(ingredients, query, recipe):
                     min_val = ing.stats_min[stat_idx]
                     max_val = ing.stats_max[stat_idx]
             
-                    # ---- apply recipe durability shift ----
+                    # ---- apply recipe dura shift ----
                     if stat_idx == dur_idx:
                         min_val += recipe.scaled_dura_min
                         max_val += recipe.scaled_dura_max

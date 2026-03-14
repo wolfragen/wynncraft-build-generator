@@ -27,7 +27,7 @@ def dfs(
     db_contrib_neg_mask,
     db_count,
     meta_void_eff,
-    durability_idx,
+    dura_idx,
     has_min_mask,
     has_max_mask,
     pos_weight_mask,
@@ -97,8 +97,8 @@ def dfs(
         if not useful:
             continue
         
-        # ---- durability pruning ----
-        if current_max[durability_idx] + db_stat_min[i, durability_idx] < min_vals[durability_idx]:
+        # ---- dura pruning ----
+        if current_max[dura_idx] + db_stat_min[i, dura_idx] < min_vals[dura_idx]:
             continue
         
         # ============================================================
@@ -109,7 +109,7 @@ def dfs(
 
         # Apply ingredient contribution
         for s in range(len(current_min)):
-            if(s == durability_idx):
+            if(s == dura_idx):
                 current_min[s] += db_stat_min[i, s]
                 current_max[s] += db_stat_max[i, s]
             else:
@@ -135,7 +135,7 @@ def dfs(
             db_contrib_neg_mask,
             db_count,
             meta_void_eff,
-            durability_idx,
+            dura_idx,
             has_min_mask,
             has_max_mask,
             pos_weight_mask,
@@ -148,7 +148,7 @@ def dfs(
 
         # Undo
         for s in range(len(current_min)):
-            if(s == durability_idx):
+            if(s == dura_idx):
                 current_min[s] -= db_stat_min[i, s]
                 current_max[s] -= db_stat_max[i, s]
             else:
@@ -172,7 +172,7 @@ def search_meta_batch(
     db_contrib_pos_mask,
     db_contrib_neg_mask,
     db_count,
-    durability_idx,
+    dura_idx,
     has_min_mask,
     has_max_mask,
     pos_weight_mask,
@@ -215,7 +215,7 @@ def search_meta_batch(
             db_contrib_neg_mask,
             db_count,
             void_eff_matrix[m],
-            durability_idx,
+            dura_idx,
             has_min_mask,
             has_max_mask,
             pos_weight_mask,
@@ -246,17 +246,20 @@ def search(all_meta_sets, db, query):
     total_searched = np.array([0], dtype=np.int64)
     total_possibilities = 0
 
-    durability_idx = -1
+    dura_idx = -1
     for i, name in enumerate(query.stat_index_keys_proj):
         if name == "durability":
-            durability_idx = i
+            dura_idx = i
+            break
+        if name == "duration":
+            dura_idx = i
             break
         
-    if durability_idx == -1:
-        print("Durability not found in query. Aborting.")
+    if dura_idx == -1:
+        print("Dura not found in query. Aborting.")
         return None
-    elif(query.min_proj[durability_idx] < 1):
-        print("Min durability should be strictly positive. Aborting.")
+    elif(query.min_proj[dura_idx] < 1):
+        print("Min dura should be strictly positive. Aborting.")
         return None
 
     for meta_batch in all_meta_sets:
@@ -276,7 +279,7 @@ def search(all_meta_sets, db, query):
             db.contrib_pos_mask,
             db.contrib_neg_mask,
             db.count,
-            durability_idx,
+            dura_idx,
             query.has_min_mask_proj,
             query.has_max_mask_proj,
             query.pos_weight_mask_proj,

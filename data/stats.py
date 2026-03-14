@@ -19,7 +19,6 @@ Query system uses this registry to map stat names -> indices.
 # IDENTIFICATION STATS (ids)
 # ============================================================
 
-# Sorted deterministically to guarantee stable indexing
 IDS_STATS = tuple(sorted([
     "aDamPct", "aDamRaw", "aDefPct", "aSdPct",
     "agi",
@@ -91,6 +90,24 @@ SPECIAL_STATS = (
     STAT_CHARGES,
 )
 
+# ============================================================
+# DERIVED STATS
+# ============================================================
+
+DERIVED_STATS = (
+    "hprEff",
+)
+
+DERIVED_DEPENDENCIES = {
+    "hprEff": ("hprRaw", "hprPct"),
+}
+
+# ============================================================
+# CONSU SKILLS
+# ============================================================
+
+CONSU_SKILLS = ["ALCHEMISM", "SCRIBING", "COOKING"]
+
 
 # ============================================================
 # GLOBAL STAT LIST
@@ -101,7 +118,79 @@ ALL_STATS = IDS_STATS + REQ_STATS + SPECIAL_STATS
 STAT_COUNT = len(ALL_STATS)
 
 # Fast name -> index lookup (only used during load/query parsing)
-STAT_INDEX = {name: i for i, name in enumerate(ALL_STATS)}
+STAT_INDEX = {
+    'aDamPct': 0,
+    'aDamRaw': 1,
+    'aDefPct': 2,
+    'aSdPct': 3,
+    'agi': 4,
+    'atkTier': 5,
+    'damPct': 6,
+    'def': 7,
+    'dex': 8,
+    'eDamPct': 9,
+    'eDefPct': 10,
+    'eMdRaw': 11,
+    'eSdPct': 12,
+    'eSdRaw': 13,
+    'eSteal': 14,
+    'expd': 15,
+    'fDamPct': 16,
+    'fDamRaw': 17,
+    'fDefPct': 18,
+    'fMdRaw': 19,
+    'fSdPct': 20,
+    'fSdRaw': 21,
+    'gSpd': 22,
+    'gXp': 23,
+    'healPct': 24,
+    'hpBonus': 25,
+    'hprPct': 26,
+    'hprRaw': 27,
+    'int': 28,
+    'jh': 29,
+    'kb': 30,
+    'lb': 31,
+    'lq': 32,
+    'ls': 33,
+    'maxMana': 34,
+    'mdPct': 35,
+    'mdRaw': 36,
+    'mr': 37,
+    'ms': 38,
+    'nDamRaw': 39,
+    'nMdRaw': 40,
+    'poison': 41,
+    'rDamPct': 42,
+    'rDefPct': 43,
+    'ref': 44,
+    'sdPct': 45,
+    'sdRaw': 46,
+    'spd': 47,
+    'sprint': 48,
+    'sprintReg': 49,
+    'str': 50,
+    'tDamPct': 51,
+    'tDamRaw': 52,
+    'tDefPct': 53,
+    'tMdRaw': 54,
+    'thorns': 55,
+    'wDamPct': 56,
+    'wDamRaw': 57,
+    'wDefPct': 58,
+    'wMdRaw': 59,
+    'wSdPct': 60,
+    'wSdRaw': 61,
+    'xpb': 62,
+    'strReq': 63,
+    'dexReq': 64,
+    'intReq': 65,
+    'defReq': 66,
+    'agiReq': 67,
+    'durability': 68,
+    'duration': 69,
+    'charges': 70,
+}
 
 
 # ============================================================

@@ -174,7 +174,7 @@ def cull_recipes(filename):
     print(f"Done! Saved to {out_path}")
 
 if __name__ == "__main__":
-    professions = ["JEWELING", "TAILORING", "ARMOURING", "WEAPONSMITHING", "WOODWORKING"]
+    professions = ["ALCHEMISM", "SCRIBING", "COOKING"]
     for TARGET_PROFESSION in professions:
         for i in range(1,6):
             cull_recipes(f"{TARGET_PROFESSION}_META_{i}.json")

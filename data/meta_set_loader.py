@@ -102,8 +102,6 @@ def refine_meta_sets(raw_meta_sets: list, query, recipe, culling=True):
     first_ings = raw_meta_sets[0]["ings"]
     void_count = sum(1 for v in first_ings if v == -1)
 
-    dur_idx_full = STAT_INDEX.get("durability")
-
     ings_matrix = np.zeros((num_sets, 6), dtype=np.int32)
     void_eff_matrix = np.zeros((num_sets, void_count), dtype=np.int32)
     void_real_slot_matrix = np.zeros((num_sets, void_count), dtype=np.int32)
@@ -141,15 +139,8 @@ def refine_meta_sets(raw_meta_sets: list, query, recipe, culling=True):
             base_min_full[idx] = min_val
             base_max_full[idx] = max_val
 
-        base_min_proj = base_min_full[active_indices]
-        base_max_proj = base_max_full[active_indices]
-
-        if dur_idx_full is not None:
-            for proj_idx, full_idx in enumerate(active_indices):
-                if full_idx == dur_idx_full:
-                    base_min_proj[proj_idx] += recipe.scaled_dura_min
-                    base_max_proj[proj_idx] += recipe.scaled_dura_max
-                    break
+        base_min_proj = base_min_full[active_indices] + recipe.base_min_stats_proj
+        base_max_proj = base_max_full[active_indices] + recipe.base_max_stats_proj
 
         base_min_matrix[i] = base_min_proj
         base_max_matrix[i] = base_max_proj

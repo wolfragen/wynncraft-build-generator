@@ -14,7 +14,7 @@ Design goals:
 import numpy as np
 from typing import NamedTuple, Optional, List
 
-from data.stats import STAT_INDEX, STAT_COUNT, REQ_STATS
+from data.stats import STAT_INDEX, STAT_COUNT, REQ_STATS, DERIVED_DEPENDENCIES
 
 
 class Query(NamedTuple):
@@ -28,6 +28,9 @@ class Query(NamedTuple):
 
     has_min_mask: np.ndarray
     has_max_mask: np.ndarray
+
+    base_min_stats_proj: np.ndarray
+    base_max_stats_proj: np.ndarray
 
     active_indices: np.ndarray
     stat_count: int
@@ -43,6 +46,9 @@ class Query(NamedTuple):
 
     stat_index_keys_proj: List[str]
     req_mask_proj: np.ndarray
+    proj_stats_idx: np.ndarray
+    
+    consumable: bool
 
 
 def build_query(
@@ -50,6 +56,7 @@ def build_query(
     search_for_inversion: bool,
     item_type: Optional[str] = None,
     skill: Optional[str] = None,
+    consumable: bool = False,
 ) -> Query:
     """
     Parse user query.
@@ -70,6 +77,9 @@ def build_query(
 
     has_min_mask = np.zeros(STAT_COUNT, dtype=np.bool_)
     has_max_mask = np.zeros(STAT_COUNT, dtype=np.bool_)
+    
+    base_min_stats = np.zeros(STAT_COUNT, dtype=np.int32)
+    base_max_stats = np.zeros(STAT_COUNT, dtype=np.int32)
 
     active_mask = np.zeros(STAT_COUNT, dtype=np.bool_)
 
@@ -77,6 +87,20 @@ def build_query(
     # Parse user JSON
     # ------------------------------------------------------------
     for stat_name, config in user_json.items():
+        
+        deps = DERIVED_DEPENDENCIES.get(stat_name)
+
+        if deps is not None:
+            for dep in deps:
+                idx = STAT_INDEX[dep]
+                active_mask[idx] = True
+            
+            stat_min = config.get("min")
+            stat_max = config.get("max")
+            stat_weight = config.get("weight")
+            #TODO derived_min and max
+            
+            continue
 
         idx = STAT_INDEX.get(stat_name)
         if idx is None:
@@ -99,11 +123,28 @@ def build_query(
         if stat_weight is not None:
             weights[idx] = stat_weight
             active_mask[idx] = True
+            
+        stat_base = config.get("base")
+        stat_min_base = config.get("min_base")
+        stat_max_base = config.get("max_base")
+        
+        if stat_base is not None:
+            base_min_stats[idx] = stat_base
+            base_max_stats[idx] = stat_base
+        
+        if stat_min_base is not None:
+            base_min_stats[idx] = stat_min_base
+        
+        if stat_max_base is not None:
+            base_max_stats[idx] = stat_max_base
 
     # ------------------------------------------------------------
     # Build projected stat space (for search phase)
     # ------------------------------------------------------------
     active_indices = np.nonzero(active_mask)[0].astype(np.int32)
+    proj_stats_idx = np.full(STAT_COUNT, -1, dtype=np.int32)
+    proj_stats_idx[active_indices] = np.arange(len(active_indices), dtype=np.int32)
+        
     stat_count = len(active_indices)
 
     min_proj = min_stats[active_indices]
@@ -112,6 +153,9 @@ def build_query(
 
     has_min_mask_proj = has_min_mask[active_indices]
     has_max_mask_proj = has_max_mask[active_indices]
+    
+    base_min_stats_proj = base_min_stats[active_indices]
+    base_max_stats_proj = base_max_stats[active_indices]
 
     pos_weight_mask_proj = weights_proj >= 0.0
     neg_weight_mask_proj = weights_proj <= 0.0
@@ -136,6 +180,8 @@ def build_query(
         weights=weights,
         has_min_mask=has_min_mask,
         has_max_mask=has_max_mask,
+        base_min_stats_proj=base_min_stats_proj,
+        base_max_stats_proj=base_max_stats_proj,
         active_indices=active_indices,
         stat_count=stat_count,
         min_proj=min_proj,
@@ -147,6 +193,8 @@ def build_query(
         neg_weight_mask_proj=neg_weight_mask_proj,
         stat_index_keys_proj=stat_index_keys_proj,
         req_mask_proj = req_mask_proj,
+        proj_stats_idx=proj_stats_idx,
+        consumable=consumable,
     )
 
 
