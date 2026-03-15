@@ -9,7 +9,7 @@ adapted to dense stat vectors.
 Effectiveness filtering removed.
 """
 
-from data.stats import STAT_INDEX, IDX_DURABILITY, IDX_DURATION, IDX_CHARGES
+from data.stats import STAT_INDEX, IDX_DURABILITY, IDX_DURATION, IDX_CHARGES, REQ_STATS
 from data.ingredient_loader import SKILL_INDEX
 
 import numpy as np
@@ -32,6 +32,7 @@ def filter_raw_ingredients(
     weights = query.weights
     search_inv = query.search_for_inversion
     skill = query.skill
+    filter_req_mask = query.filter_mask
     stat_index = STAT_INDEX
 
     # Pre-resolve skill index if needed
@@ -77,6 +78,10 @@ def filter_raw_ingredients(
 
             # Skip stats not used in query
             if not (has_min[idx] or has_max[idx] or weights[idx] != 0):
+                continue
+            
+            # skip req stats that shouldn't be used as filter
+            if stat_name in REQ_STATS and not filter_req_mask[idx]:
                 continue
 
             min_val = min_stats[idx]

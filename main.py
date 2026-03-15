@@ -25,12 +25,22 @@ def main():
     user_query = {
         "mr": {"min": 1, "weight": 10000},
         "spd": {"min": 1, "weight": 10000},
-        "duration": {"min": 1800, "weight": 1},
-        "charges": {"min": 3},
+        "str": {"weight": 2500},
+        "dex": {"weight": 2500},
+        "int": {"weight": 2500},
+        "def": {"weight": 2500},
+        "agi": {"weight": 2500},
+        "strReq": {"max": 25, "ingredient_filter":False},
+        "dexReq": {"max": 25, "ingredient_filter":False},
+        "intReq": {"max": 25, "ingredient_filter":False},
+        "defReq": {"max": 25, "ingredient_filter":False},
+        "agiReq": {"max": 25, "ingredient_filter":False},
+        "durability": {"min": 40, "weight": 1},
+        #"charges": {"min": 3},
     }
 
-    skill = "ALCHEMISM"
-    item_type = "POTION"
+    skill = "WEAPONSMITHING"
+    item_type = "SPEAR"
     consumable = skill in CONSU_SKILLS
     
     # ---------- Build Query Object ----------
@@ -68,7 +78,7 @@ def main():
     print("Raw ingredients:", len(ingredients_raw))
     print("Filtered ingredients:", len(db))
     
-    meta_sets = load_meta_sets(skill, query, recipe)
+    meta_sets = load_meta_sets(skill, query, recipe, max_cull=query.suggested_max_cull, should_print=True)
     print("Meta sets loaded")
     print()
                 

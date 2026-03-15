@@ -46,9 +46,11 @@ class Query(NamedTuple):
 
     stat_index_keys_proj: List[str]
     req_mask_proj: np.ndarray
+    filter_mask: np.ndarray
     proj_stats_idx: np.ndarray
     
     consumable: bool
+    suggested_max_cull: int
 
 
 def build_query(
@@ -86,6 +88,7 @@ def build_query(
     # ------------------------------------------------------------
     # Parse user JSON
     # ------------------------------------------------------------
+    should_filter = np.zeros(STAT_COUNT, dtype=np.bool_)
     for stat_name, config in user_json.items():
         
         deps = DERIVED_DEPENDENCIES.get(stat_name)
@@ -137,6 +140,10 @@ def build_query(
         
         if stat_max_base is not None:
             base_max_stats[idx] = stat_max_base
+            
+        should_filter_stat = config.get("ingredient_filter")
+        if should_filter_stat is not None and should_filter_stat == False:
+            should_filter[idx] = False
 
     # ------------------------------------------------------------
     # Build projected stat space (for search phase)
@@ -166,10 +173,18 @@ def build_query(
     ]
     
     req_mask_full = np.zeros(STAT_COUNT, dtype=np.bool_)
+    filter_mask_full = np.zeros(STAT_COUNT, dtype=np.bool_)
     for name in REQ_STATS:
         req_mask_full[STAT_INDEX[name]] = True
+        if should_filter[STAT_INDEX[name]]:
+            filter_mask_full[STAT_INDEX[name]] = True
     
     req_mask_proj = req_mask_full[active_indices]
+    
+    suggested_max_cull = 5 # For meta-sets culling.
+    if any(req for req in req_mask_proj):
+        suggested_max_cull = 4 # Si on a au moins un req défini, il vaut mieux ne pas cull le 5
+    
 
     return Query(
         search_for_inversion=search_for_inversion,
@@ -193,8 +208,10 @@ def build_query(
         neg_weight_mask_proj=neg_weight_mask_proj,
         stat_index_keys_proj=stat_index_keys_proj,
         req_mask_proj = req_mask_proj,
+        filter_mask=filter_mask_full,
         proj_stats_idx=proj_stats_idx,
         consumable=consumable,
+        suggested_max_cull=suggested_max_cull,
     )
 
 

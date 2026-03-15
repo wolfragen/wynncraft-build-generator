@@ -31,7 +31,7 @@ class MetaBatch(NamedTuple):
 # Main Loader
 # ------------------------------------------------------------
 
-def load_meta_sets(skill, query, recipe, culling=True, should_print=False, base_path="data/precalc/generic_cull"):
+def load_meta_sets(skill, query, recipe, culling=True, max_cull=5, should_print=False, base_path="data/precalc/generic_cull"):
 
     full_meta_sets = []
 
@@ -47,6 +47,8 @@ def load_meta_sets(skill, query, recipe, culling=True, should_print=False, base_
 
     # META_1..5
     for n in range(1, 6):
+        if n > max_cull:
+            culling = False
 
         raw_meta_sets = load_raw_meta_sets(skill, n)
 
