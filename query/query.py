@@ -14,7 +14,7 @@ Design goals:
 import numpy as np
 from typing import NamedTuple, Optional, List
 
-from data.stats import STAT_INDEX, STAT_COUNT, REQ_STATS, DERIVED_DEPENDENCIES
+from data.stats import STAT_INDEX, STAT_COUNT, REQ_STATS, DERIVED_DEPENDENCIES, REQ_STATS_IDX
 
 
 class Query(NamedTuple):
@@ -46,6 +46,7 @@ class Query(NamedTuple):
 
     stat_index_keys_proj: List[str]
     req_mask_proj: np.ndarray
+    req_idx: np.ndarray
     filter_mask: np.ndarray
     proj_stats_idx: np.ndarray
     
@@ -185,6 +186,12 @@ def build_query(
     if any(req for req in req_mask_proj):
         suggested_max_cull = 4 # Si on a au moins un req défini, il vaut mieux ne pas cull le 5
     
+    req_idx = np.full(5, -1)
+    i = 0
+    for j, stat_idx in enumerate(active_indices):
+        if stat_idx in REQ_STATS_IDX:
+            req_idx[i] = j
+            i += 1
 
     return Query(
         search_for_inversion=search_for_inversion,
@@ -208,6 +215,7 @@ def build_query(
         neg_weight_mask_proj=neg_weight_mask_proj,
         stat_index_keys_proj=stat_index_keys_proj,
         req_mask_proj = req_mask_proj,
+        req_idx=req_idx,
         filter_mask=filter_mask_full,
         proj_stats_idx=proj_stats_idx,
         consumable=consumable,

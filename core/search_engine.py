@@ -308,6 +308,8 @@ def search(all_meta_sets, db, query):
                 full_slots[real_slot] = db.json_ids[db_idx]
 
             best_full_slots = full_slots
+            # print(best_score)
+            # print(best_full_slots)
             
         print(f"meta batch {6-meta_batch.void_count}: {len(meta_batch.ings_matrix)}, time elapsed: {time()-start_time:.0f}s")
         total_possibilities += len(meta_batch.ings_matrix) * db.count**meta_batch.void_count

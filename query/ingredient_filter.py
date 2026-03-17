@@ -9,7 +9,7 @@ adapted to dense stat vectors.
 Effectiveness filtering removed.
 """
 
-from data.stats import STAT_INDEX, IDX_DURABILITY, IDX_DURATION, IDX_CHARGES, REQ_STATS
+from data.stats import STAT_INDEX, IDX_DURABILITY, IDX_DURATION, IDX_CHARGES, REQ_STATS, REQ_STATS_IDX
 from data.ingredient_loader import SKILL_INDEX
 
 import numpy as np
@@ -142,6 +142,7 @@ def pareto_cull_ingredients(ingredients, query, recipe):
         return ingredients
 
     active = query.active_indices
+    req_idx = query.req_idx
     stat_count = query.stat_count
 
     matrix = np.zeros((len(ingredients), stat_count), dtype=np.int32)
@@ -156,34 +157,35 @@ def pareto_cull_ingredients(ingredients, query, recipe):
             dur_idx = IDX_DURABILITY
             if query.consumable:
                 dur_idx = IDX_DURATION
+            
+            min_val = ing.stats_min[stat_idx]
+            max_val = ing.stats_max[stat_idx]
+    
+            # ---- apply recipe dura shift ----
+            if stat_idx == dur_idx:
+                min_val += recipe.scaled_dura_min
+                max_val += recipe.scaled_dura_max
+    
+            # ---- select best representative value ----
+            if stat_idx in REQ_STATS_IDX:
+                if max_val > 0:
+                    matrix[i, j] = min_val
+                else:
+                    matrix[i, j] = max_val
+            elif max_val > 0:
+                matrix[i, j] = max_val
+            else:
+                matrix[i, j] = min_val
+        
+        # print(f"{i}: {ing.name}")
 
-            for i, ing in enumerate(ingredients):
-            
-                for j, stat_idx in enumerate(active):
-            
-                    min_val = ing.stats_min[stat_idx]
-                    max_val = ing.stats_max[stat_idx]
-            
-                    # ---- apply recipe dura shift ----
-                    if stat_idx == dur_idx:
-                        min_val += recipe.scaled_dura_min
-                        max_val += recipe.scaled_dura_max
-            
-                    # ---- select best representative value ----
-                    if max_val > 0:
-                        matrix[i, j] = max_val
-                    elif min_val < 0:
-                        matrix[i, j] = min_val
-                    else:
-                        matrix[i, j] = 0
-
-    kept_mask = pareto_filter_ingredients(matrix)
+    kept_mask = pareto_filter_ingredients(matrix, req_idx)
 
     return [ingredients[i] for i in range(len(ingredients)) if kept_mask[i]]
 
 
 @njit
-def pareto_filter_ingredients(matrix):
+def pareto_filter_ingredients(matrix, req_idx):
 
     n = matrix.shape[0]
     is_kept = np.ones(n, dtype=np.bool_)
@@ -198,23 +200,26 @@ def pareto_filter_ingredients(matrix):
             if not is_kept[j]:
                 continue
 
-            cmp = compare_stat_vectors(matrix[i], matrix[j])
+            cmp = compare_stat_vectors(matrix[i], matrix[j], req_idx)
 
             if cmp == 1:
                 is_kept[j] = False
+                # print(f"{j} was culled by {i}")
 
             elif cmp == -1:
                 is_kept[i] = False
+                # print(f"{i} was culled by {j}")
                 break
 
             elif cmp == 2:
                 is_kept[j] = False
+                # print(f"{j} was culled by {i}")
 
     return is_kept
 
 
 @njit
-def compare_stat_vectors(a, b):
+def compare_stat_vectors(a, b, req_idx):
     """
     Returns:
         1  if A dominates B
@@ -234,30 +239,39 @@ def compare_stat_vectors(a, b):
         if va == vb:
             continue
 
-        # ---- zero rule ----
-        if va == 0:
-            b_better = True
-
-        elif vb == 0:
-            a_better = True
-
         # ---- sign mismatch → incomparable ----
         elif (va > 0 and vb < 0) or (va < 0 and vb > 0):
             return 0
 
-        # ---- both positive ----
-        elif va > 0:
-            if va > vb:
-                a_better = True
+        elif i in req_idx:
+            # ---- both positive ----
+            if va > 0 or vb > 0:
+                if va > vb:
+                    b_better = True
+                else:
+                    a_better = True
+    
+            # ---- both negative ----
             else:
-                b_better = True
-
-        # ---- both negative ----
+                if va < vb:
+                    b_better = True
+                else:
+                    a_better = True
+                    
         else:
-            if va < vb:
-                a_better = True
+            # ---- both positive ----
+            if va > 0 or vb > 0:
+                if va > vb:
+                    a_better = True
+                else:
+                    b_better = True
+    
+            # ---- both negative ----
             else:
-                b_better = True
+                if va < vb:
+                    a_better = True
+                else:
+                    b_better = True
 
         if a_better and b_better:
             return 0

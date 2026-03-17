@@ -24,17 +24,12 @@ def main():
     # ---------- Build User Query ----------
     user_query = {
         "mr": {"min": 1, "weight": 10000},
-        "spd": {"min": 1, "weight": 10000},
-        "str": {"weight": 2500},
-        "dex": {"weight": 2500},
-        "int": {"weight": 2500},
-        "def": {"weight": 2500},
-        "agi": {"weight": 2500},
-        "strReq": {"max": 25, "ingredient_filter":False},
-        "dexReq": {"max": 25, "ingredient_filter":False},
-        "intReq": {"max": 25, "ingredient_filter":False},
-        "defReq": {"max": 25, "ingredient_filter":False},
-        "agiReq": {"max": 25, "ingredient_filter":False},
+        "spd": {"weight": 1000},
+        "strReq": {"max": 50, "ingredient_filter":False},
+        # "dexReq": {"max": 100, "ingredient_filter":False},
+        # "intReq": {"max": 100, "ingredient_filter":False},
+        # "defReq": {"max": 100, "ingredient_filter":False},
+        # "agiReq": {"max": 100, "ingredient_filter":False},
         "durability": {"min": 40, "weight": 1},
         #"charges": {"min": 3},
     }
@@ -77,6 +72,9 @@ def main():
 
     print("Raw ingredients:", len(ingredients_raw))
     print("Filtered ingredients:", len(db))
+    
+    # for ing in filtered_raw:
+    #     print(ing.name)
     
     meta_sets = load_meta_sets(skill, query, recipe, max_cull=query.suggested_max_cull, should_print=True)
     print("Meta sets loaded")

@@ -4,7 +4,7 @@ import sys
 import numpy as np
 from numba import njit
 
-REQ_STATS = {"strReq", "dexReq", "intReq", "defReq", "agiReq"}
+REQ_STATS = {"strReq", "dexReq", "intReq", "defReq", "agiReq"} #TODO refaire le culling avec la logique correcte pour req_stats
 
 # ---------------------------------------------------------
 # Numba JIT Compiled Functions

@@ -161,7 +161,8 @@ def refine_meta_sets(raw_meta_sets: list, query, recipe, culling=True):
             void_eff_matrix,
             ings_matrix,
             void_count,
-            req_mask_proj
+            req_mask_proj,
+            query.req_idx,
         )
 
         ings_matrix = ings_matrix[kept_indices]
@@ -199,7 +200,7 @@ def refine_meta_sets(raw_meta_sets: list, query, recipe, culling=True):
 # ------------------------------------------------------------
 
 @njit(fastmath=True)
-def compare_vectors(a, b, num_effs):
+def compare_vectors(a, b, num_effs, req_idx):
     """
     Returns:
        1 if A dominates B
@@ -216,6 +217,8 @@ def compare_vectors(a, b, num_effs):
         
         if va == vb:
             continue
+        elif (va > 0 and vb < 0) or (va < 0 and vb > 0):
+            return 0 
             
         if i < num_effs:
             # --- CUSTOM EFFECTIVENESS LOGIC ---
@@ -224,9 +227,6 @@ def compare_vectors(a, b, num_effs):
                 b_better = True
             elif vb == 0:
                 a_better = True
-            # 2. Positive and Negative are incomparable
-            elif (va > 0 and vb < 0) or (va < 0 and vb > 0):
-                return 0 
             # 3. If both positive: higher is better
             elif va > 0: 
                 if va > vb: a_better = True
@@ -236,9 +236,35 @@ def compare_vectors(a, b, num_effs):
                 if va < vb: a_better = True # e.g., -100 < -50
                 else: b_better = True
         else:
-            # --- STANDARD STAT LOGIC ---
-            if va > vb: a_better = True
-            else: b_better = True
+            if i-num_effs in req_idx:
+                # ---- both positive ----
+                if va > 0 or vb > 0:
+                    if va > vb:
+                        b_better = True
+                    else:
+                        a_better = True
+        
+                # ---- both negative ----
+                else:
+                    if va < vb:
+                        b_better = True
+                    else:
+                        a_better = True
+                        
+            else:
+                # ---- both positive ----
+                if va > 0 or vb > 0:
+                    if va > vb:
+                        a_better = True
+                    else:
+                        b_better = True
+        
+                # ---- both negative ----
+                else:
+                    if va < vb:
+                        a_better = True
+                    else:
+                        b_better = True
             
         # Early exit: if both have a "better" dimension, they are incomparable
         if a_better and b_better:
@@ -250,7 +276,7 @@ def compare_vectors(a, b, num_effs):
 
 
 @njit
-def pareto_filter(matrix, num_effs):
+def pareto_filter(matrix, num_effs, req_idx):
     """Computes the Pareto frontier using the modified effectiveness rules."""
     n = matrix.shape[0]
     is_kept = np.ones(n, dtype=np.bool_)
@@ -263,7 +289,7 @@ def pareto_filter(matrix, num_effs):
             if not is_kept[j]: 
                 continue
             
-            cmp = compare_vectors(matrix[i], matrix[j], num_effs)
+            cmp = compare_vectors(matrix[i], matrix[j], num_effs, req_idx)
             
             if cmp == 1:
                 is_kept[j] = False
@@ -282,7 +308,8 @@ def numba_cull(base_min_matrix,
                void_eff_matrix,
                ings_matrix,
                void_count,
-               req_mask_proj):
+               req_mask_proj, 
+               req_idx):
 
     num_sets, num_stats = base_min_matrix.shape
     matrix = np.zeros((num_sets, void_count + num_stats), dtype=np.int32)
@@ -302,10 +329,37 @@ def numba_cull(base_min_matrix,
         # Stats
         # --------------------------
         for s in range(num_stats):
-            if req_mask_proj[s]:
-                matrix[i, void_count + s] = -base_min_matrix[i, s]
+            max_val = base_max_matrix[i, s]
+            if s in req_idx:
+                if max_val > 0:
+                    matrix[i, void_count + s] = base_min_matrix[i, s]
+                else:
+                    matrix[i, void_count + s] = max_val
             else:
-                matrix[i, void_count + s] = base_max_matrix[i, s]
+                if max_val > 0:
+                    matrix[i, void_count + s] = max_val
+                else:
+                    matrix[i, void_count + s] = base_min_matrix[i, s]
 
-    is_kept = pareto_filter(matrix, void_count)
+    is_kept = pareto_filter(matrix, void_count, req_idx)
     return np.where(is_kept)[0]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
