@@ -53,6 +53,10 @@ class Query(NamedTuple):
     consumable: bool
     suggested_max_cull: int
 
+    # Projected-space index of durability (crafted) or duration (consumable).
+    # -1 if neither is active — search will abort in that case.
+    dura_proj_idx: int
+
 
 def build_query(
     user_json: dict,
@@ -89,21 +93,24 @@ def build_query(
     # ------------------------------------------------------------
     # Parse user JSON
     # ------------------------------------------------------------
+    # Any stat with a constraint (min/max/weight) is used as an ingredient
+    # filter by default; user can opt out per-stat via `"ingredient_filter": False`.
     should_filter = np.zeros(STAT_COUNT, dtype=np.bool_)
+
     for stat_name, config in user_json.items():
-        
+
         deps = DERIVED_DEPENDENCIES.get(stat_name)
 
         if deps is not None:
             for dep in deps:
                 idx = STAT_INDEX[dep]
                 active_mask[idx] = True
-            
+
             stat_min = config.get("min")
             stat_max = config.get("max")
             stat_weight = config.get("weight")
             #TODO derived_min and max
-            
+
             continue
 
         idx = STAT_INDEX.get(stat_name)
@@ -127,6 +134,9 @@ def build_query(
         if stat_weight is not None:
             weights[idx] = stat_weight
             active_mask[idx] = True
+
+        if stat_min is not None or stat_max is not None or stat_weight is not None:
+            should_filter[idx] = True
             
         stat_base = config.get("base")
         stat_min_base = config.get("min_base")
@@ -143,8 +153,8 @@ def build_query(
             base_max_stats[idx] = stat_max_base
             
         should_filter_stat = config.get("ingredient_filter")
-        if should_filter_stat is not None and should_filter_stat == False:
-            should_filter[idx] = False
+        if should_filter_stat is not None:
+            should_filter[idx] = bool(should_filter_stat)
 
     # ------------------------------------------------------------
     # Build projected stat space (for search phase)
@@ -165,8 +175,8 @@ def build_query(
     base_min_stats_proj = base_min_stats[active_indices]
     base_max_stats_proj = base_max_stats[active_indices]
 
-    pos_weight_mask_proj = weights_proj >= 0.0
-    neg_weight_mask_proj = weights_proj <= 0.0
+    pos_weight_mask_proj = weights_proj > 0.0
+    neg_weight_mask_proj = weights_proj < 0.0
 
     stat_index_keys_proj = [
         next(name for name, i in STAT_INDEX.items() if i == idx)
@@ -174,12 +184,11 @@ def build_query(
     ]
     
     req_mask_full = np.zeros(STAT_COUNT, dtype=np.bool_)
-    filter_mask_full = np.zeros(STAT_COUNT, dtype=np.bool_)
     for name in REQ_STATS:
         req_mask_full[STAT_INDEX[name]] = True
-        if should_filter[STAT_INDEX[name]]:
-            filter_mask_full[STAT_INDEX[name]] = True
-    
+
+    filter_mask_full = should_filter
+
     req_mask_proj = req_mask_full[active_indices]
     
     suggested_max_cull = 5 # For meta-sets culling.
@@ -192,6 +201,13 @@ def build_query(
         if stat_idx in REQ_STATS_IDX:
             req_idx[i] = j
             i += 1
+
+    # Resolve dura / duration in projected space (at most one is active).
+    dura_proj_idx = -1
+    for j, name in enumerate(stat_index_keys_proj):
+        if name == "durability" or name == "duration":
+            dura_proj_idx = j
+            break
 
     return Query(
         search_for_inversion=search_for_inversion,
@@ -220,6 +236,7 @@ def build_query(
         proj_stats_idx=proj_stats_idx,
         consumable=consumable,
         suggested_max_cull=suggested_max_cull,
+        dura_proj_idx=dura_proj_idx,
     )
 
 

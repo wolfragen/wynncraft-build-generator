@@ -233,13 +233,15 @@ def run_precalculation(profession, include_dura_ingredients=True, pre_filled=5, 
     print(f"Relevant ingredients found: {len(filtered)}")
     
     for i in range(1, pre_filled+1):
-        filename = os.path.join(precalc_dir, f"{profession}_META_{i}.json")
-        
+        skill_dir = os.path.join(precalc_dir, profession)
+        os.makedirs(skill_dir, exist_ok=True)
+        filename = os.path.join(skill_dir, f"META_{i}.json")
+
         num_multisets = math.comb(len(filtered) + i - 1, i)
         num_slot_combos = math.comb(6, i)
         total_generated_expected = num_slot_combos * (len(filtered) ** i)
-        
-        print(f"\nStarting {profession}_META_{i}.json")
+
+        print(f"\nStarting {profession}/META_{i}.json")
         print(f"Expected generated combinations: {total_generated_expected:,}")
         
         start_time = time.time()
@@ -294,7 +296,7 @@ def run_precalculation(profession, include_dura_ingredients=True, pre_filled=5, 
             
             f.write("\n]")
             
-        print(f"\nFinished {profession}_META_{i}.json in {time.time() - start_time:.2f}s")
+        print(f"\nFinished {profession}/META_{i}.json in {time.time() - start_time:.2f}s")
         print(f"Final Batch Stats - Saved: {total_saved:,} | Culled: {total_culled:,} ", end="")
         if total_generated > 0:
             print(f"({(total_culled / total_generated) * 100:.2f}% size reduction)")

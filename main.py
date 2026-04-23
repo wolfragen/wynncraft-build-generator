@@ -8,7 +8,8 @@ from utils.hash_generator import generate_crafter_url
 from data.stats import STAT_INDEX, STAT_COUNT, CONSU_SKILLS
 from data.meta_set_loader import load_meta_sets
 
-from core.search_engine import search
+from core.search_engine import search, search_pipelined
+from core.warmup import warm_numba
 
 from time import time
 import cProfile
@@ -18,18 +19,28 @@ import pstats
 
 def main():
 
+    # ---------- Pre-compile numba kernels ----------
+    t_warm = time()
+    warm_numba()
+    print(f"Numba warm-up: {time() - t_warm:.1f}s")
+
     # ---------- Load all ingredients ----------
     ingredients_raw = load_ingredients("data/ingreds_compress.json")
 
     # ---------- Build User Query ----------
     user_query = {
-        "mr": {"min": 1, "weight": 10000},
-        "spd": {"weight": 1000},
-        "strReq": {"max": 50, "ingredient_filter":False},
-        # "dexReq": {"max": 100, "ingredient_filter":False},
-        # "intReq": {"max": 100, "ingredient_filter":False},
-        # "defReq": {"max": 100, "ingredient_filter":False},
-        # "agiReq": {"max": 100, "ingredient_filter":False},
+        "mr": {"min": 1, "weight": 10000, "ingredient_filter":True},
+        "spd": {"min": 1, "weight": 1000, "ingredient_filter":True},
+        "str": {"min": 1, "ingredient_filter":True},
+        "dex": {"min": 1, "ingredient_filter":True},
+        "int": {"min": 1, "ingredient_filter":True},
+        "def": {"min": 1, "ingredient_filter":True},
+        "agi": {"min": 1, "ingredient_filter":True},
+        "strReq": {"max": 50, "ingredient_filter":True},
+        "dexReq": {"max": 100, "ingredient_filter":True},
+        "intReq": {"max": 100, "ingredient_filter":True},
+        "defReq": {"max": 100, "ingredient_filter":True},
+        "agiReq": {"max": 100, "ingredient_filter":True},
         "durability": {"min": 40, "weight": 1},
         #"charges": {"min": 3},
     }
@@ -76,12 +87,12 @@ def main():
     # for ing in filtered_raw:
     #     print(ing.name)
     
-    meta_sets = load_meta_sets(skill, query, recipe, max_cull=query.suggested_max_cull, should_print=True)
-    print("Meta sets loaded")
-    print()
-                
-    # ---------- Search ----------
-    best_solution = search(meta_sets, db, query)
+    # ---------- Load + Search (pipelined, overlapped) ----------
+    t_pipeline = time()
+    best_solution = search_pipelined(
+        skill, query, recipe, db, max_cull=query.suggested_max_cull,
+    )
+    print(f"Load+search pipeline: {time() - t_pipeline:.1f}s")
 
     print("Best solution:", best_solution)
     
