@@ -40,7 +40,47 @@ _DFS_SIG = types.void(
     types.int32[:, ::1],      # future_min_ub
     types.int32[:, ::1],      # future_max_lb
     types.int32[:, ::1],      # future_min_lb
+    types.int64,              # comp_count
+    types.int32[::1],         # comp_formula
+    types.int32[::1],         # comp_dep_a_proj
+    types.int32[::1],         # comp_dep_b_proj
+    types.int32[::1],         # comp_min
+    types.int32[::1],         # comp_max
+    types.Array(types.bool_, 1, "C"),  # comp_has_min
+    types.Array(types.bool_, 1, "C"),  # comp_has_max
+    types.float32[::1],       # comp_weight
 )
+
+
+# ============================================================
+# Composite-stat 4-corner bound on a*b//100 over rectangle [a_lo,a_hi]x[b_lo,b_hi].
+# ============================================================
+
+@njit(cache=True)
+def _product_bounds_div100(a_lo, a_hi, b_lo, b_hi):
+    """
+    Bounds on ((a*b) // 100) where a ∈ [a_lo, a_hi], b ∈ [b_lo, b_hi].
+    The product of two real-valued intervals has its extrema at the rectangle
+    corners, regardless of sign — so evaluate 4 corners and take min/max.
+    Intermediate math in int64 to avoid int32 overflow on wide builds.
+    """
+    al = np.int64(a_lo)
+    ah = np.int64(a_hi)
+    bl = np.int64(b_lo)
+    bh = np.int64(b_hi)
+    p1 = al * bl
+    p2 = al * bh
+    p3 = ah * bl
+    p4 = ah * bh
+    lo = p1
+    if p2 < lo: lo = p2
+    if p3 < lo: lo = p3
+    if p4 < lo: lo = p4
+    hi = p1
+    if p2 > hi: hi = p2
+    if p3 > hi: hi = p3
+    if p4 > hi: hi = p4
+    return lo // 100, hi // 100
 
 
 # ============================================================
@@ -154,6 +194,15 @@ def dfs(
     future_min_ub,
     future_max_lb,
     future_min_lb,
+    comp_count,
+    comp_formula,
+    comp_dep_a_proj,
+    comp_dep_b_proj,
+    comp_min,
+    comp_max,
+    comp_has_min,
+    comp_has_max,
+    comp_weight,
 ):
     # Leaf
     if depth == k:
@@ -175,6 +224,21 @@ def dfs(
 
             score += weights[s] * max_v * 0.99
             score += weights[s] * min_v * 0.01
+
+        # Composite stats: compute a*b//100 on the finalized build, check
+        # constraints, add weighted contribution. Only mul_div_100 for now.
+        for c in range(comp_count):
+            a = comp_dep_a_proj[c]
+            b = comp_dep_b_proj[c]
+            cmax = (np.int64(current_max[a]) * np.int64(current_max[b])) // 100
+            cmin = (np.int64(current_min[a]) * np.int64(current_min[b])) // 100
+
+            if comp_has_min[c] and cmax < comp_min[c]:
+                return
+            if comp_has_max[c] and cmin > comp_max[c]:
+                return
+
+            score += comp_weight[c] * (cmax * 0.99 + cmin * 0.01)
 
         if score > best_score_ref[0]:
             best_score_ref[0] = score
@@ -261,6 +325,45 @@ def dfs(
                 min_v = current_min[s] + future_min_lb[next_depth, s]
                 ub_score += w * (max_v * 0.99 + min_v * 0.01)
 
+        # Composite UB: 4-corner product bound on current_max deps (gives
+        # bounds on final comp_max) and on current_min deps (bounds on final
+        # comp_min). Admissible — product of bounded intervals is bounded by
+        # its rectangle corners. Loose vs true joint feasible set, but correct.
+        for c in range(comp_count):
+            a = comp_dep_a_proj[c]
+            b = comp_dep_b_proj[c]
+            w = comp_weight[c]
+
+            if w > 0.0:
+                # UB of comp_max: final_max_a upper-bounded, final_max_b upper-bounded.
+                _, pmax_hi = _product_bounds_div100(
+                    current_max[a] + future_max_lb[next_depth, a],
+                    current_max[a] + future_max_ub[next_depth, a],
+                    current_max[b] + future_max_lb[next_depth, b],
+                    current_max[b] + future_max_ub[next_depth, b],
+                )
+                _, pmin_hi = _product_bounds_div100(
+                    current_min[a] + future_min_lb[next_depth, a],
+                    current_min[a] + future_min_ub[next_depth, a],
+                    current_min[b] + future_min_lb[next_depth, b],
+                    current_min[b] + future_min_ub[next_depth, b],
+                )
+                ub_score += w * (pmax_hi * 0.99 + pmin_hi * 0.01)
+            elif w < 0.0:
+                pmax_lo, _ = _product_bounds_div100(
+                    current_max[a] + future_max_lb[next_depth, a],
+                    current_max[a] + future_max_ub[next_depth, a],
+                    current_max[b] + future_max_lb[next_depth, b],
+                    current_max[b] + future_max_ub[next_depth, b],
+                )
+                pmin_lo, _ = _product_bounds_div100(
+                    current_min[a] + future_min_lb[next_depth, a],
+                    current_min[a] + future_min_ub[next_depth, a],
+                    current_min[b] + future_min_lb[next_depth, b],
+                    current_min[b] + future_min_ub[next_depth, b],
+                )
+                ub_score += w * (pmax_lo * 0.99 + pmin_lo * 0.01)
+
         if ub_score <= best_score_ref[0]:
             # Undo and skip — no descendant can beat the current best.
             for s in range(len(current_min)):
@@ -309,6 +412,15 @@ def dfs(
             future_min_ub,
             future_max_lb,
             future_min_lb,
+            comp_count,
+            comp_formula,
+            comp_dep_a_proj,
+            comp_dep_b_proj,
+            comp_min,
+            comp_max,
+            comp_has_min,
+            comp_has_max,
+            comp_weight,
         )
 
         # Undo
@@ -344,6 +456,15 @@ def _search_meta_batch_k1(
     max_vals,
     weights,
     init_best_score,
+    comp_count,
+    comp_formula,
+    comp_dep_a_proj,
+    comp_dep_b_proj,
+    comp_min,
+    comp_max,
+    comp_has_min,
+    comp_has_max,
+    comp_weight,
 ):
     M = base_min_matrix.shape[0]
     S = base_min_matrix.shape[1]
@@ -358,6 +479,10 @@ def _search_meta_batch_k1(
         local_best_i = -1
         local_searched = 0
 
+        # Per-iter storage so composite can reread dep values after the base loop.
+        final_min = np.empty(S, dtype=np.int32)
+        final_max = np.empty(S, dtype=np.int32)
+
         for i in range(db_count):
             feasible = True
             score = 0.0
@@ -369,6 +494,9 @@ def _search_meta_batch_k1(
                     min_v = base_min_matrix[m, s] + (db_stat_min[i, s] * eff) // 100
                     max_v = base_max_matrix[m, s] + (db_stat_max[i, s] * eff) // 100
 
+                final_min[s] = min_v
+                final_max[s] = max_v
+
                 if has_min_mask[s] and max_v < min_vals[s]:
                     feasible = False
                     break
@@ -378,11 +506,30 @@ def _search_meta_batch_k1(
 
                 score += weights[s] * (max_v * 0.99 + min_v * 0.01)
 
-            if feasible:
-                local_searched += 1
-                if score > local_best:
-                    local_best = score
-                    local_best_i = i
+            if not feasible:
+                continue
+
+            # Composite constraint + score
+            for c in range(comp_count):
+                a = comp_dep_a_proj[c]
+                b = comp_dep_b_proj[c]
+                cmax = (np.int64(final_max[a]) * np.int64(final_max[b])) // 100
+                cmin = (np.int64(final_min[a]) * np.int64(final_min[b])) // 100
+                if comp_has_min[c] and cmax < comp_min[c]:
+                    feasible = False
+                    break
+                if comp_has_max[c] and cmin > comp_max[c]:
+                    feasible = False
+                    break
+                score += comp_weight[c] * (cmax * 0.99 + cmin * 0.01)
+
+            if not feasible:
+                continue
+
+            local_searched += 1
+            if score > local_best:
+                local_best = score
+                local_best_i = i
 
         best_scores[m] = local_best
         if local_best_i >= 0:
@@ -428,6 +575,15 @@ def _search_meta_batch_k2(
     max_vals,
     weights,
     init_best_score,
+    comp_count,
+    comp_formula,
+    comp_dep_a_proj,
+    comp_dep_b_proj,
+    comp_min,
+    comp_max,
+    comp_has_min,
+    comp_has_max,
+    comp_weight,
 ):
     M = base_min_matrix.shape[0]
     S = base_min_matrix.shape[1]
@@ -487,6 +643,13 @@ def _search_meta_batch_k2(
         local_best_i1 = -1
         local_searched = 0
 
+        # Per-i0 after-state, needed again for composite UB.
+        after_min_arr = np.empty(S, dtype=np.int32)
+        after_max_arr = np.empty(S, dtype=np.int32)
+        # Per-i1 final-state, needed again for composite leaf check + score.
+        final_min_arr = np.empty(S, dtype=np.int32)
+        final_max_arr = np.empty(S, dtype=np.int32)
+
         for i0 in range(db_count):
             # Apply i0: running state after placing first ingredient.
             # Compute UB on final score assuming slot 1 takes the best-possible ingredient.
@@ -499,6 +662,9 @@ def _search_meta_batch_k2(
                     after_min = base_min_matrix[m, s] + (db_stat_min[i0, s] * eff0) // 100
                     after_max = base_max_matrix[m, s] + (db_stat_max[i0, s] * eff0) // 100
 
+                after_min_arr[s] = after_min
+                after_max_arr[s] = after_max
+
                 w = weights[s]
                 if w > 0.0:
                     ub_max = after_max + slot1_best_max[s]
@@ -508,6 +674,40 @@ def _search_meta_batch_k2(
                     lb_max = after_max + slot1_worst_max[s]
                     lb_min = after_min + slot1_worst_min[s]
                     ub_score += w * (lb_max * 0.99 + lb_min * 0.01)
+
+            # Composite UB: 4 corners on [after_max + slot1_{worst,best}_max] rectangle.
+            for c in range(comp_count):
+                a = comp_dep_a_proj[c]
+                b = comp_dep_b_proj[c]
+                w = comp_weight[c]
+                if w > 0.0:
+                    _, pmax_hi = _product_bounds_div100(
+                        after_max_arr[a] + slot1_worst_max[a],
+                        after_max_arr[a] + slot1_best_max[a],
+                        after_max_arr[b] + slot1_worst_max[b],
+                        after_max_arr[b] + slot1_best_max[b],
+                    )
+                    _, pmin_hi = _product_bounds_div100(
+                        after_min_arr[a] + slot1_worst_min[a],
+                        after_min_arr[a] + slot1_best_min[a],
+                        after_min_arr[b] + slot1_worst_min[b],
+                        after_min_arr[b] + slot1_best_min[b],
+                    )
+                    ub_score += w * (pmax_hi * 0.99 + pmin_hi * 0.01)
+                elif w < 0.0:
+                    pmax_lo, _ = _product_bounds_div100(
+                        after_max_arr[a] + slot1_worst_max[a],
+                        after_max_arr[a] + slot1_best_max[a],
+                        after_max_arr[b] + slot1_worst_max[b],
+                        after_max_arr[b] + slot1_best_max[b],
+                    )
+                    pmin_lo, _ = _product_bounds_div100(
+                        after_min_arr[a] + slot1_worst_min[a],
+                        after_min_arr[a] + slot1_best_min[a],
+                        after_min_arr[b] + slot1_worst_min[b],
+                        after_min_arr[b] + slot1_best_min[b],
+                    )
+                    ub_score += w * (pmax_lo * 0.99 + pmin_lo * 0.01)
 
             if ub_score <= local_best:
                 continue
@@ -529,6 +729,9 @@ def _search_meta_batch_k2(
                                  + (db_stat_max[i0, s] * eff0) // 100
                                  + (db_stat_max[i1, s] * eff1) // 100)
 
+                    final_min_arr[s] = v_min
+                    final_max_arr[s] = v_max
+
                     if has_min_mask[s] and v_max < min_vals[s]:
                         feasible = False
                         break
@@ -538,12 +741,31 @@ def _search_meta_batch_k2(
 
                     score += weights[s] * (v_max * 0.99 + v_min * 0.01)
 
-                if feasible:
-                    local_searched += 1
-                    if score > local_best:
-                        local_best = score
-                        local_best_i0 = i0
-                        local_best_i1 = i1
+                if not feasible:
+                    continue
+
+                # Composite constraint + score on the finalized k=2 build.
+                for c in range(comp_count):
+                    a = comp_dep_a_proj[c]
+                    b = comp_dep_b_proj[c]
+                    cmax = (np.int64(final_max_arr[a]) * np.int64(final_max_arr[b])) // 100
+                    cmin = (np.int64(final_min_arr[a]) * np.int64(final_min_arr[b])) // 100
+                    if comp_has_min[c] and cmax < comp_min[c]:
+                        feasible = False
+                        break
+                    if comp_has_max[c] and cmin > comp_max[c]:
+                        feasible = False
+                        break
+                    score += comp_weight[c] * (cmax * 0.99 + cmin * 0.01)
+
+                if not feasible:
+                    continue
+
+                local_searched += 1
+                if score > local_best:
+                    local_best = score
+                    local_best_i0 = i0
+                    local_best_i1 = i1
 
         best_scores[m] = local_best
         if local_best_i0 >= 0:
@@ -595,6 +817,15 @@ def search_meta_batch(
     weights,
     total_searched,
     init_best_score,
+    comp_count,
+    comp_formula,
+    comp_dep_a_proj,
+    comp_dep_b_proj,
+    comp_min,
+    comp_max,
+    comp_has_min,
+    comp_has_max,
+    comp_weight,
 ):
     M = ings_matrix.shape[0]
     k = void_count
@@ -646,6 +877,15 @@ def search_meta_batch(
             future_min_ub,
             future_max_lb,
             future_min_lb,
+            comp_count,
+            comp_formula,
+            comp_dep_a_proj,
+            comp_dep_b_proj,
+            comp_min,
+            comp_max,
+            comp_has_min,
+            comp_has_max,
+            comp_weight,
         )
 
         best_scores[m] = best_score_ref[0]
@@ -694,6 +934,15 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             query.max_proj,
             query.weights_proj,
             best_score,
+            query.comp_count,
+            query.comp_formula,
+            query.comp_dep_a_proj,
+            query.comp_dep_b_proj,
+            query.comp_min,
+            query.comp_max,
+            query.comp_has_min,
+            query.comp_has_max,
+            query.comp_weight,
         )
         total_searched[0] += added
         return score, meta_index, sol
@@ -713,6 +962,15 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             query.max_proj,
             query.weights_proj,
             best_score,
+            query.comp_count,
+            query.comp_formula,
+            query.comp_dep_a_proj,
+            query.comp_dep_b_proj,
+            query.comp_min,
+            query.comp_max,
+            query.comp_has_min,
+            query.comp_has_max,
+            query.comp_weight,
         )
         total_searched[0] += added
         return score, meta_index, sol
@@ -738,6 +996,15 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
         query.weights_proj,
         total_searched,
         best_score,
+        query.comp_count,
+        query.comp_formula,
+        query.comp_dep_a_proj,
+        query.comp_dep_b_proj,
+        query.comp_min,
+        query.comp_max,
+        query.comp_has_min,
+        query.comp_has_max,
+        query.comp_weight,
     )
 
 

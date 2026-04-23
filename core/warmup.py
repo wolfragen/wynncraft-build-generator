@@ -51,11 +51,11 @@ def _warm_ingredient_filter():
 def _warm_search_engine():
     """
     Force the JIT compile of `dfs` and `search_meta_batch` (parallel=True is
-    expensive to compile, 1-2s per process). We call with M=1, k=1, S=1, N=1
+    expensive to compile, 1-2s per process). We call with M=1, k=1, S=2, N=1
     and a harmless configuration so the kernel body runs to completion without
-    degenerate shapes.
+    degenerate shapes. S=2 so we have one dep_a + one dep_b for the composite.
     """
-    M, k, S, N = 1, 1, 1, 1
+    M, k, S, N = 1, 1, 2, 1
     ings = np.zeros((M, 6), dtype=np.int32)
     void_eff = np.full((M, k), 100, dtype=np.int32)
     base_min = np.zeros((M, S), dtype=np.int32)
@@ -73,6 +73,18 @@ def _warm_search_engine():
     weights = np.zeros(S, dtype=np.float32)
     total_searched = np.zeros(1, dtype=np.int64)
 
+    # One composite to force the composite code path into every kernel.
+    # Positive weight ensures the w>0 branches in UB get compiled.
+    comp_count = 1
+    comp_formula = np.zeros(1, dtype=np.int32)
+    comp_dep_a = np.array([0], dtype=np.int32)
+    comp_dep_b = np.array([1], dtype=np.int32)
+    comp_min = np.zeros(1, dtype=np.int32)
+    comp_max = np.zeros(1, dtype=np.int32)
+    comp_has_min = np.zeros(1, dtype=np.bool_)
+    comp_has_max = np.zeros(1, dtype=np.bool_)
+    comp_weight = np.array([1.0], dtype=np.float32)
+
     se.search_meta_batch(
         ings, k, void_eff, base_min, base_max,
         db_stat_min, db_stat_max, db_contrib_pos_mask, db_contrib_neg_mask,
@@ -80,6 +92,8 @@ def _warm_search_engine():
         has_min_mask, has_max_mask, pos_weight_mask, neg_weight_mask,
         min_vals, max_vals, weights, total_searched,
         -1e18,
+        comp_count, comp_formula, comp_dep_a, comp_dep_b,
+        comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
     )
 
     # Specialized k=1 fast path — different argument list.
@@ -88,6 +102,8 @@ def _warm_search_engine():
         db_stat_min, db_stat_max, N, 0,
         has_min_mask, has_max_mask, min_vals, max_vals, weights,
         -1e18,
+        comp_count, comp_formula, comp_dep_a, comp_dep_b,
+        comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
     )
 
     # Specialized k=2 fast path needs void_eff of shape (M, 2).
@@ -97,4 +113,6 @@ def _warm_search_engine():
         db_stat_min, db_stat_max, N, 0,
         has_min_mask, has_max_mask, min_vals, max_vals, weights,
         -1e18,
+        comp_count, comp_formula, comp_dep_a, comp_dep_b,
+        comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
     )

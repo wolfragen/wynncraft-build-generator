@@ -102,6 +102,23 @@ DERIVED_DEPENDENCIES = {
     "hprEff": ("hprRaw", "hprPct"),
 }
 
+# Formula tag per derived stat. Mapped to int in query.py for numba passage.
+# Supported formulas:
+#   "mul_div_100" : a * b // 100  (exactly two deps)
+DERIVED_FORMULA = {
+    "hprEff": "mul_div_100",
+}
+
+# Stats whose "empty" value is non-zero (i.e. a fresh item already has them).
+# Applied to base_min_stats / base_max_stats when the stat becomes active,
+# unless the user passes an explicit "base" / "min_base" / "max_base".
+DEFAULT_BASE = {
+    "hprPct": 100,
+}
+
+# Numba-compatible formula int tags. Keep in sync with DERIVED_FORMULA values.
+FORMULA_MUL_DIV_100 = 0
+
 # ============================================================
 # CONSU SKILLS
 # ============================================================

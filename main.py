@@ -30,7 +30,7 @@ def main():
     # ---------- Build User Query ----------
     user_query = {
         "mr": {"min": 1, "weight": 10000, "ingredient_filter":True},
-        "spd": {"min": 1, "weight": 1000, "ingredient_filter":True},
+        "hprEff": {"min": 1, "weight": 1000, "ingredient_filter":True},
         "str": {"min": 1, "ingredient_filter":True},
         "dex": {"min": 1, "ingredient_filter":True},
         "int": {"min": 1, "ingredient_filter":True},
