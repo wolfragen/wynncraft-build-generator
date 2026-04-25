@@ -9,6 +9,15 @@ from queue import Queue
 from threading import Thread
 from time import time
 
+from data.stats import FORMULA_MUL_DIV_100, FORMULA_RAW_TO_PCT, FORMULA_EHP, FORMULA_EHPR
+from data.skillpoint_lookup import SKP_HEADLINE_PCT, SKP_DEF, SKP_AGI, SKP_MAX
+
+# Numba captures module-level numpy arrays as constants (read-only refs); the
+# table is precomputed once at import time and never mutated, so this is safe
+# even with cache=True.
+_SKP_DEF_ROW = SKP_HEADLINE_PCT[SKP_DEF].copy()  # shape (151,) float64
+_SKP_AGI_ROW = SKP_HEADLINE_PCT[SKP_AGI].copy()
+
 
 # Explicit signature so the recursive dfs can be persisted to disk with
 # cache=True — numba cannot otherwise resolve the self-reference symbol.
@@ -44,6 +53,8 @@ _DFS_SIG = types.void(
     types.int32[::1],         # comp_formula
     types.int32[::1],         # comp_dep_a_proj
     types.int32[::1],         # comp_dep_b_proj
+    types.int32[::1],         # comp_dep_c_proj
+    types.int32[::1],         # comp_dep_d_proj
     types.int32[::1],         # comp_min
     types.int32[::1],         # comp_max
     types.Array(types.bool_, 1, "C"),  # comp_has_min
@@ -81,6 +92,187 @@ def _product_bounds_div100(a_lo, a_hi, b_lo, b_hi):
     if p3 > hi: hi = p3
     if p4 > hi: hi = p4
     return lo // 100, hi // 100
+
+
+# ============================================================
+# rawToPct: wynnbuilder's sign-asymmetric raw/pct combiner.
+#   raw > 0:  (raw * (100 + delta)) // 100
+#   raw < 0:  min(0, (raw * (100 - delta)) // 100)
+#   raw = 0:  0
+# `delta` is stored as a signed delta (not 100+delta).
+# ============================================================
+
+@njit(cache=True)
+def _raw_to_pct(raw, delta):
+    r = np.int64(raw)
+    d = np.int64(delta)
+    if r > 0:
+        return (r * (100 + d)) // 100
+    if r < 0:
+        v = (r * (100 - d)) // 100
+        if v < 0:
+            return v
+        return np.int64(0)
+    return np.int64(0)
+
+
+@njit(cache=True)
+def _raw_to_pct_bounds(raw_lo, raw_hi, delta_lo, delta_hi):
+    """
+    Admissible bounds on _raw_to_pct(raw, delta) over the rectangle
+    [raw_lo, raw_hi] × [delta_lo, delta_hi]. Split on sign of raw:
+      - positive half (raw ≥ 0): bilinear raw*(100+delta), floor-div at end.
+      - negative half (raw ≤ 0): bilinear g = raw*(100-delta), clamped by min(0, g).
+    Floor(max(·)) == max(floor(·)) for monotone floor, so the bound is consistent
+    with the leaf's // 100 floor (not with wynnbuilder's float math — ±1 divergence
+    on negative intermediate values, same divergence as the leaf, so consistent).
+    """
+    dl = np.int64(delta_lo)
+    dh = np.int64(delta_hi)
+
+    first = True
+    lo = np.int64(0)
+    hi = np.int64(0)
+
+    if raw_hi > 0:
+        rl = np.int64(raw_lo)
+        if rl < 0:
+            rl = np.int64(0)
+        rh = np.int64(raw_hi)
+        c1 = rl * (100 + dl)
+        c2 = rl * (100 + dh)
+        c3 = rh * (100 + dl)
+        c4 = rh * (100 + dh)
+        p_lo = c1
+        if c2 < p_lo: p_lo = c2
+        if c3 < p_lo: p_lo = c3
+        if c4 < p_lo: p_lo = c4
+        p_hi = c1
+        if c2 > p_hi: p_hi = c2
+        if c3 > p_hi: p_hi = c3
+        if c4 > p_hi: p_hi = c4
+        p_lo = p_lo // 100
+        p_hi = p_hi // 100
+        lo = p_lo
+        hi = p_hi
+        first = False
+
+    if raw_lo < 0:
+        rl = np.int64(raw_lo)
+        rh = np.int64(raw_hi)
+        if rh > 0:
+            rh = np.int64(0)
+        c1 = rl * (100 - dl)
+        c2 = rl * (100 - dh)
+        c3 = rh * (100 - dl)
+        c4 = rh * (100 - dh)
+        g_lo = c1
+        if c2 < g_lo: g_lo = c2
+        if c3 < g_lo: g_lo = c3
+        if c4 < g_lo: g_lo = c4
+        g_hi = c1
+        if c2 > g_hi: g_hi = c2
+        if c3 > g_hi: g_hi = c3
+        if c4 > g_hi: g_hi = c4
+        g_lo = g_lo // 100
+        g_hi = g_hi // 100
+        # Clamp with min(0, ·)
+        if g_lo > 0: g_lo = np.int64(0)
+        if g_hi > 0: g_hi = np.int64(0)
+        if first:
+            lo = g_lo
+            hi = g_hi
+            first = False
+        else:
+            if g_lo < lo: lo = g_lo
+            if g_hi > hi: hi = g_hi
+
+    return lo, hi
+
+
+# ============================================================
+# ehp / ehpr (build-level effective HP and HP regen)
+# Simplified from wynnbuilder's getDefenseStats — assumes:
+#   - level-base hp = 0 (only hpBonus contributes to totalHp)
+#   - classDef = 0 (no weapon-class adjustment)
+#   - defMult = 1 (no potion/buff multipliers)
+#   - agiDef = 0 (so agi_reduction = 1.0)
+# Resulting formulas:
+#   ehp  = max(5, hpBonus) / (1 - (1 - agi_pct) * def_pct)
+#   ehpr = rawToPct(hprRaw, hprPct) / (1 - (1 - agi_pct) * def_pct)
+# def_pct, agi_pct from SKP_HEADLINE_PCT (clamp counts to [0, 150]).
+# ============================================================
+
+
+@njit(cache=True)
+def _clamp_skp(c):
+    if c < 0:
+        return np.int64(0)
+    if c > SKP_MAX:
+        return np.int64(SKP_MAX)
+    return np.int64(c)
+
+
+@njit(cache=True)
+def _denom_range(def_lo, def_hi, agi_lo, agi_hi):
+    """
+    Range of D = 1 - (1 - agi_pct) * def_pct over (def_count, agi_count) ranges.
+    def_pct, agi_pct nondecreasing in skillpoint count, both in [0, ~0.81].
+    Bilinear: D_min when (1-a)*d max → (a_min, d_max); D_max at (a_max, d_min).
+    D > 0 always in this domain (max product ≤ 1 * ~0.7 = 0.7).
+    """
+    dl = _clamp_skp(def_lo)
+    dh = _clamp_skp(def_hi)
+    al = _clamp_skp(agi_lo)
+    ah = _clamp_skp(agi_hi)
+    def_pct_lo = _SKP_DEF_ROW[dl]
+    def_pct_hi = _SKP_DEF_ROW[dh]
+    agi_pct_lo = _SKP_AGI_ROW[al]
+    agi_pct_hi = _SKP_AGI_ROW[ah]
+    d_min = 1.0 - (1.0 - agi_pct_lo) * def_pct_hi
+    d_max = 1.0 - (1.0 - agi_pct_hi) * def_pct_lo
+    return d_min, d_max
+
+
+@njit(cache=True)
+def _ehp_bounds(hp_lo, hp_hi, def_lo, def_hi, agi_lo, agi_hi):
+    """
+    Bounds on max(5, hpBonus) / (1 - (1-agi_pct)*def_pct) over the 3D rectangle.
+    Used at both leaf (cmin/cmax of the build under independent rolls) and
+    UB sites (with future_*_lb/ub-expanded ranges).
+    """
+    if hp_lo < 5: hp_lo = 5
+    if hp_hi < 5: hp_hi = 5
+    d_min, d_max = _denom_range(def_lo, def_hi, agi_lo, agi_hi)
+    # Positive totalHp, positive D: max ehp = hp_hi / d_min, min = hp_lo / d_max.
+    cmax_f = hp_hi / d_min
+    cmin_f = hp_lo / d_max
+    return np.int64(cmin_f), np.int64(cmax_f)
+
+
+@njit(cache=True)
+def _ehpr_bounds(raw_lo, raw_hi, pct_lo, pct_hi, def_lo, def_hi, agi_lo, agi_hi):
+    """
+    Bounds on rawToPct(hprRaw, hprPct) / (1 - (1-agi_pct)*def_pct).
+    totalHpr range comes from _raw_to_pct_bounds (sign-aware, can be negative).
+    Then 4-corner bound on (totalHpr, D) — sign of totalHpr decides which D
+    extreme gives max/min of the quotient.
+    """
+    hpr_lo, hpr_hi = _raw_to_pct_bounds(raw_lo, raw_hi, pct_lo, pct_hi)
+    d_min, d_max = _denom_range(def_lo, def_hi, agi_lo, agi_hi)
+    c1 = hpr_lo / d_min
+    c2 = hpr_lo / d_max
+    c3 = hpr_hi / d_min
+    c4 = hpr_hi / d_max
+    cmin_f = c1
+    if c2 < cmin_f: cmin_f = c2
+    if c3 < cmin_f: cmin_f = c3
+    if c4 < cmin_f: cmin_f = c4
+    cmax_f = c1
+    if c2 > cmax_f: cmax_f = c2
+    if c3 > cmax_f: cmax_f = c3
+    if c4 > cmax_f: cmax_f = c4
+    return np.int64(cmin_f), np.int64(cmax_f)
 
 
 # ============================================================
@@ -198,6 +390,8 @@ def dfs(
     comp_formula,
     comp_dep_a_proj,
     comp_dep_b_proj,
+    comp_dep_c_proj,
+    comp_dep_d_proj,
     comp_min,
     comp_max,
     comp_has_min,
@@ -225,13 +419,34 @@ def dfs(
             score += weights[s] * max_v * 0.99
             score += weights[s] * min_v * 0.01
 
-        # Composite stats: compute a*b//100 on the finalized build, check
-        # constraints, add weighted contribution. Only mul_div_100 for now.
+        # Composite stats: compute on the finalized build, check constraints,
+        # add weighted contribution.
         for c in range(comp_count):
             a = comp_dep_a_proj[c]
             b = comp_dep_b_proj[c]
-            cmax = (np.int64(current_max[a]) * np.int64(current_max[b])) // 100
-            cmin = (np.int64(current_min[a]) * np.int64(current_min[b])) // 100
+            f = comp_formula[c]
+            if f == FORMULA_MUL_DIV_100:
+                cmax = (np.int64(current_max[a]) * np.int64(current_max[b])) // 100
+                cmin = (np.int64(current_min[a]) * np.int64(current_min[b])) // 100
+            elif f == FORMULA_RAW_TO_PCT:
+                cmax = _raw_to_pct(current_max[a], current_max[b])
+                cmin = _raw_to_pct(current_min[a], current_min[b])
+            elif f == FORMULA_EHP:
+                cc = comp_dep_c_proj[c]
+                cmin, cmax = _ehp_bounds(
+                    current_min[a], current_max[a],
+                    current_min[b], current_max[b],
+                    current_min[cc], current_max[cc],
+                )
+            else:  # FORMULA_EHPR
+                cc = comp_dep_c_proj[c]
+                dd = comp_dep_d_proj[c]
+                cmin, cmax = _ehpr_bounds(
+                    current_min[a], current_max[a],
+                    current_min[b], current_max[b],
+                    current_min[cc], current_max[cc],
+                    current_min[dd], current_max[dd],
+                )
 
             if comp_has_min[c] and cmax < comp_min[c]:
                 return
@@ -325,43 +540,63 @@ def dfs(
                 min_v = current_min[s] + future_min_lb[next_depth, s]
                 ub_score += w * (max_v * 0.99 + min_v * 0.01)
 
-        # Composite UB: 4-corner product bound on current_max deps (gives
-        # bounds on final comp_max) and on current_min deps (bounds on final
-        # comp_min). Admissible — product of bounded intervals is bounded by
-        # its rectangle corners. Loose vs true joint feasible set, but correct.
+        # Composite UB: per-formula admissible bound on the final comp value,
+        # using the (current_*[s] + future_*_*[next_depth, s]) range for each dep.
+        # Loose vs true joint feasible set, but correct.
         for c in range(comp_count):
             a = comp_dep_a_proj[c]
             b = comp_dep_b_proj[c]
             w = comp_weight[c]
+            if w == 0.0:
+                continue
+            f = comp_formula[c]
+
+            a_max_lo = current_max[a] + future_max_lb[next_depth, a]
+            a_max_hi = current_max[a] + future_max_ub[next_depth, a]
+            b_max_lo = current_max[b] + future_max_lb[next_depth, b]
+            b_max_hi = current_max[b] + future_max_ub[next_depth, b]
+            a_min_lo = current_min[a] + future_min_lb[next_depth, a]
+            a_min_hi = current_min[a] + future_min_ub[next_depth, a]
+            b_min_lo = current_min[b] + future_min_lb[next_depth, b]
+            b_min_hi = current_min[b] + future_min_ub[next_depth, b]
+
+            if f == FORMULA_MUL_DIV_100:
+                pmax_lo, pmax_hi = _product_bounds_div100(a_max_lo, a_max_hi, b_max_lo, b_max_hi)
+                pmin_lo, pmin_hi = _product_bounds_div100(a_min_lo, a_min_hi, b_min_lo, b_min_hi)
+            elif f == FORMULA_RAW_TO_PCT:
+                pmax_lo, pmax_hi = _raw_to_pct_bounds(a_max_lo, a_max_hi, b_max_lo, b_max_hi)
+                pmin_lo, pmin_hi = _raw_to_pct_bounds(a_min_lo, a_min_hi, b_min_lo, b_min_hi)
+            elif f == FORMULA_EHP:
+                cc = comp_dep_c_proj[c]
+                c_max_lo = current_max[cc] + future_max_lb[next_depth, cc]
+                c_max_hi = current_max[cc] + future_max_ub[next_depth, cc]
+                c_min_lo = current_min[cc] + future_min_lb[next_depth, cc]
+                c_min_hi = current_min[cc] + future_min_ub[next_depth, cc]
+                pmax_lo, pmax_hi = _ehp_bounds(a_max_lo, a_max_hi, b_max_lo, b_max_hi, c_max_lo, c_max_hi)
+                pmin_lo, pmin_hi = _ehp_bounds(a_min_lo, a_min_hi, b_min_lo, b_min_hi, c_min_lo, c_min_hi)
+            else:  # FORMULA_EHPR
+                cc = comp_dep_c_proj[c]
+                dd = comp_dep_d_proj[c]
+                c_max_lo = current_max[cc] + future_max_lb[next_depth, cc]
+                c_max_hi = current_max[cc] + future_max_ub[next_depth, cc]
+                d_max_lo = current_max[dd] + future_max_lb[next_depth, dd]
+                d_max_hi = current_max[dd] + future_max_ub[next_depth, dd]
+                c_min_lo = current_min[cc] + future_min_lb[next_depth, cc]
+                c_min_hi = current_min[cc] + future_min_ub[next_depth, cc]
+                d_min_lo = current_min[dd] + future_min_lb[next_depth, dd]
+                d_min_hi = current_min[dd] + future_min_ub[next_depth, dd]
+                pmax_lo, pmax_hi = _ehpr_bounds(
+                    a_max_lo, a_max_hi, b_max_lo, b_max_hi,
+                    c_max_lo, c_max_hi, d_max_lo, d_max_hi,
+                )
+                pmin_lo, pmin_hi = _ehpr_bounds(
+                    a_min_lo, a_min_hi, b_min_lo, b_min_hi,
+                    c_min_lo, c_min_hi, d_min_lo, d_min_hi,
+                )
 
             if w > 0.0:
-                # UB of comp_max: final_max_a upper-bounded, final_max_b upper-bounded.
-                _, pmax_hi = _product_bounds_div100(
-                    current_max[a] + future_max_lb[next_depth, a],
-                    current_max[a] + future_max_ub[next_depth, a],
-                    current_max[b] + future_max_lb[next_depth, b],
-                    current_max[b] + future_max_ub[next_depth, b],
-                )
-                _, pmin_hi = _product_bounds_div100(
-                    current_min[a] + future_min_lb[next_depth, a],
-                    current_min[a] + future_min_ub[next_depth, a],
-                    current_min[b] + future_min_lb[next_depth, b],
-                    current_min[b] + future_min_ub[next_depth, b],
-                )
                 ub_score += w * (pmax_hi * 0.99 + pmin_hi * 0.01)
-            elif w < 0.0:
-                pmax_lo, _ = _product_bounds_div100(
-                    current_max[a] + future_max_lb[next_depth, a],
-                    current_max[a] + future_max_ub[next_depth, a],
-                    current_max[b] + future_max_lb[next_depth, b],
-                    current_max[b] + future_max_ub[next_depth, b],
-                )
-                pmin_lo, _ = _product_bounds_div100(
-                    current_min[a] + future_min_lb[next_depth, a],
-                    current_min[a] + future_min_ub[next_depth, a],
-                    current_min[b] + future_min_lb[next_depth, b],
-                    current_min[b] + future_min_ub[next_depth, b],
-                )
+            else:
                 ub_score += w * (pmax_lo * 0.99 + pmin_lo * 0.01)
 
         if ub_score <= best_score_ref[0]:
@@ -416,6 +651,8 @@ def dfs(
             comp_formula,
             comp_dep_a_proj,
             comp_dep_b_proj,
+            comp_dep_c_proj,
+            comp_dep_d_proj,
             comp_min,
             comp_max,
             comp_has_min,
@@ -460,6 +697,8 @@ def _search_meta_batch_k1(
     comp_formula,
     comp_dep_a_proj,
     comp_dep_b_proj,
+    comp_dep_c_proj,
+    comp_dep_d_proj,
     comp_min,
     comp_max,
     comp_has_min,
@@ -513,8 +752,29 @@ def _search_meta_batch_k1(
             for c in range(comp_count):
                 a = comp_dep_a_proj[c]
                 b = comp_dep_b_proj[c]
-                cmax = (np.int64(final_max[a]) * np.int64(final_max[b])) // 100
-                cmin = (np.int64(final_min[a]) * np.int64(final_min[b])) // 100
+                f = comp_formula[c]
+                if f == FORMULA_MUL_DIV_100:
+                    cmax = (np.int64(final_max[a]) * np.int64(final_max[b])) // 100
+                    cmin = (np.int64(final_min[a]) * np.int64(final_min[b])) // 100
+                elif f == FORMULA_RAW_TO_PCT:
+                    cmax = _raw_to_pct(final_max[a], final_max[b])
+                    cmin = _raw_to_pct(final_min[a], final_min[b])
+                elif f == FORMULA_EHP:
+                    cc = comp_dep_c_proj[c]
+                    cmin, cmax = _ehp_bounds(
+                        final_min[a], final_max[a],
+                        final_min[b], final_max[b],
+                        final_min[cc], final_max[cc],
+                    )
+                else:  # FORMULA_EHPR
+                    cc = comp_dep_c_proj[c]
+                    dd = comp_dep_d_proj[c]
+                    cmin, cmax = _ehpr_bounds(
+                        final_min[a], final_max[a],
+                        final_min[b], final_max[b],
+                        final_min[cc], final_max[cc],
+                        final_min[dd], final_max[dd],
+                    )
                 if comp_has_min[c] and cmax < comp_min[c]:
                     feasible = False
                     break
@@ -579,6 +839,8 @@ def _search_meta_batch_k2(
     comp_formula,
     comp_dep_a_proj,
     comp_dep_b_proj,
+    comp_dep_c_proj,
+    comp_dep_d_proj,
     comp_min,
     comp_max,
     comp_has_min,
@@ -675,38 +937,61 @@ def _search_meta_batch_k2(
                     lb_min = after_min + slot1_worst_min[s]
                     ub_score += w * (lb_max * 0.99 + lb_min * 0.01)
 
-            # Composite UB: 4 corners on [after_max + slot1_{worst,best}_max] rectangle.
+            # Composite UB: per-formula bound on [after_* + slot1_{worst,best}_*] rectangle.
             for c in range(comp_count):
                 a = comp_dep_a_proj[c]
                 b = comp_dep_b_proj[c]
                 w = comp_weight[c]
+                if w == 0.0:
+                    continue
+                f = comp_formula[c]
+
+                a_max_lo = after_max_arr[a] + slot1_worst_max[a]
+                a_max_hi = after_max_arr[a] + slot1_best_max[a]
+                b_max_lo = after_max_arr[b] + slot1_worst_max[b]
+                b_max_hi = after_max_arr[b] + slot1_best_max[b]
+                a_min_lo = after_min_arr[a] + slot1_worst_min[a]
+                a_min_hi = after_min_arr[a] + slot1_best_min[a]
+                b_min_lo = after_min_arr[b] + slot1_worst_min[b]
+                b_min_hi = after_min_arr[b] + slot1_best_min[b]
+
+                if f == FORMULA_MUL_DIV_100:
+                    pmax_lo, pmax_hi = _product_bounds_div100(a_max_lo, a_max_hi, b_max_lo, b_max_hi)
+                    pmin_lo, pmin_hi = _product_bounds_div100(a_min_lo, a_min_hi, b_min_lo, b_min_hi)
+                elif f == FORMULA_RAW_TO_PCT:
+                    pmax_lo, pmax_hi = _raw_to_pct_bounds(a_max_lo, a_max_hi, b_max_lo, b_max_hi)
+                    pmin_lo, pmin_hi = _raw_to_pct_bounds(a_min_lo, a_min_hi, b_min_lo, b_min_hi)
+                elif f == FORMULA_EHP:
+                    cc = comp_dep_c_proj[c]
+                    c_max_lo = after_max_arr[cc] + slot1_worst_max[cc]
+                    c_max_hi = after_max_arr[cc] + slot1_best_max[cc]
+                    c_min_lo = after_min_arr[cc] + slot1_worst_min[cc]
+                    c_min_hi = after_min_arr[cc] + slot1_best_min[cc]
+                    pmax_lo, pmax_hi = _ehp_bounds(a_max_lo, a_max_hi, b_max_lo, b_max_hi, c_max_lo, c_max_hi)
+                    pmin_lo, pmin_hi = _ehp_bounds(a_min_lo, a_min_hi, b_min_lo, b_min_hi, c_min_lo, c_min_hi)
+                else:  # FORMULA_EHPR
+                    cc = comp_dep_c_proj[c]
+                    dd = comp_dep_d_proj[c]
+                    c_max_lo = after_max_arr[cc] + slot1_worst_max[cc]
+                    c_max_hi = after_max_arr[cc] + slot1_best_max[cc]
+                    d_max_lo = after_max_arr[dd] + slot1_worst_max[dd]
+                    d_max_hi = after_max_arr[dd] + slot1_best_max[dd]
+                    c_min_lo = after_min_arr[cc] + slot1_worst_min[cc]
+                    c_min_hi = after_min_arr[cc] + slot1_best_min[cc]
+                    d_min_lo = after_min_arr[dd] + slot1_worst_min[dd]
+                    d_min_hi = after_min_arr[dd] + slot1_best_min[dd]
+                    pmax_lo, pmax_hi = _ehpr_bounds(
+                        a_max_lo, a_max_hi, b_max_lo, b_max_hi,
+                        c_max_lo, c_max_hi, d_max_lo, d_max_hi,
+                    )
+                    pmin_lo, pmin_hi = _ehpr_bounds(
+                        a_min_lo, a_min_hi, b_min_lo, b_min_hi,
+                        c_min_lo, c_min_hi, d_min_lo, d_min_hi,
+                    )
+
                 if w > 0.0:
-                    _, pmax_hi = _product_bounds_div100(
-                        after_max_arr[a] + slot1_worst_max[a],
-                        after_max_arr[a] + slot1_best_max[a],
-                        after_max_arr[b] + slot1_worst_max[b],
-                        after_max_arr[b] + slot1_best_max[b],
-                    )
-                    _, pmin_hi = _product_bounds_div100(
-                        after_min_arr[a] + slot1_worst_min[a],
-                        after_min_arr[a] + slot1_best_min[a],
-                        after_min_arr[b] + slot1_worst_min[b],
-                        after_min_arr[b] + slot1_best_min[b],
-                    )
                     ub_score += w * (pmax_hi * 0.99 + pmin_hi * 0.01)
-                elif w < 0.0:
-                    pmax_lo, _ = _product_bounds_div100(
-                        after_max_arr[a] + slot1_worst_max[a],
-                        after_max_arr[a] + slot1_best_max[a],
-                        after_max_arr[b] + slot1_worst_max[b],
-                        after_max_arr[b] + slot1_best_max[b],
-                    )
-                    pmin_lo, _ = _product_bounds_div100(
-                        after_min_arr[a] + slot1_worst_min[a],
-                        after_min_arr[a] + slot1_best_min[a],
-                        after_min_arr[b] + slot1_worst_min[b],
-                        after_min_arr[b] + slot1_best_min[b],
-                    )
+                else:
                     ub_score += w * (pmax_lo * 0.99 + pmin_lo * 0.01)
 
             if ub_score <= local_best:
@@ -748,8 +1033,29 @@ def _search_meta_batch_k2(
                 for c in range(comp_count):
                     a = comp_dep_a_proj[c]
                     b = comp_dep_b_proj[c]
-                    cmax = (np.int64(final_max_arr[a]) * np.int64(final_max_arr[b])) // 100
-                    cmin = (np.int64(final_min_arr[a]) * np.int64(final_min_arr[b])) // 100
+                    f = comp_formula[c]
+                    if f == FORMULA_MUL_DIV_100:
+                        cmax = (np.int64(final_max_arr[a]) * np.int64(final_max_arr[b])) // 100
+                        cmin = (np.int64(final_min_arr[a]) * np.int64(final_min_arr[b])) // 100
+                    elif f == FORMULA_RAW_TO_PCT:
+                        cmax = _raw_to_pct(final_max_arr[a], final_max_arr[b])
+                        cmin = _raw_to_pct(final_min_arr[a], final_min_arr[b])
+                    elif f == FORMULA_EHP:
+                        cc = comp_dep_c_proj[c]
+                        cmin, cmax = _ehp_bounds(
+                            final_min_arr[a], final_max_arr[a],
+                            final_min_arr[b], final_max_arr[b],
+                            final_min_arr[cc], final_max_arr[cc],
+                        )
+                    else:  # FORMULA_EHPR
+                        cc = comp_dep_c_proj[c]
+                        dd = comp_dep_d_proj[c]
+                        cmin, cmax = _ehpr_bounds(
+                            final_min_arr[a], final_max_arr[a],
+                            final_min_arr[b], final_max_arr[b],
+                            final_min_arr[cc], final_max_arr[cc],
+                            final_min_arr[dd], final_max_arr[dd],
+                        )
                     if comp_has_min[c] and cmax < comp_min[c]:
                         feasible = False
                         break
@@ -821,6 +1127,8 @@ def search_meta_batch(
     comp_formula,
     comp_dep_a_proj,
     comp_dep_b_proj,
+    comp_dep_c_proj,
+    comp_dep_d_proj,
     comp_min,
     comp_max,
     comp_has_min,
@@ -881,6 +1189,8 @@ def search_meta_batch(
             comp_formula,
             comp_dep_a_proj,
             comp_dep_b_proj,
+            comp_dep_c_proj,
+            comp_dep_d_proj,
             comp_min,
             comp_max,
             comp_has_min,
@@ -938,6 +1248,8 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             query.comp_formula,
             query.comp_dep_a_proj,
             query.comp_dep_b_proj,
+            query.comp_dep_c_proj,
+            query.comp_dep_d_proj,
             query.comp_min,
             query.comp_max,
             query.comp_has_min,
@@ -966,6 +1278,8 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             query.comp_formula,
             query.comp_dep_a_proj,
             query.comp_dep_b_proj,
+            query.comp_dep_c_proj,
+            query.comp_dep_d_proj,
             query.comp_min,
             query.comp_max,
             query.comp_has_min,
@@ -1000,6 +1314,8 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
         query.comp_formula,
         query.comp_dep_a_proj,
         query.comp_dep_b_proj,
+        query.comp_dep_c_proj,
+        query.comp_dep_d_proj,
         query.comp_min,
         query.comp_max,
         query.comp_has_min,

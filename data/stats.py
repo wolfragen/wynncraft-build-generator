@@ -95,29 +95,46 @@ SPECIAL_STATS = (
 # ============================================================
 
 DERIVED_STATS = (
-    "hprEff",
+    "hpr",
+    "ehp",
+    "ehpr",
 )
 
 DERIVED_DEPENDENCIES = {
-    "hprEff": ("hprRaw", "hprPct"),
+    "hpr": ("hprRaw", "hprPct"),
+    "ehp": ("hpBonus", "def", "agi"),
+    "ehpr": ("hprRaw", "hprPct", "def", "agi"),
 }
 
 # Formula tag per derived stat. Mapped to int in query.py for numba passage.
 # Supported formulas:
-#   "mul_div_100" : a * b // 100  (exactly two deps)
+#   "mul_div_100" (arity 2): a * b // 100
+#   "raw_to_pct"  (arity 2): wynnbuilder's rawToPct(raw, pct_delta) — sign-asymmetric
+#                   raw>0 → (raw * (100 + delta)) // 100
+#                   raw<0 → min(0, (raw * (100 - delta)) // 100)
+#                   raw=0 → 0
+#   "ehp"         (arity 3): hpBonus / (1 - (1 - agi_pct) * def_pct)
+#                   Simplified from wynnbuilder's getDefenseStats — ignores
+#                   level-base hp, classDef, defMult, agiDef (assumed 0/1/0).
+#                   def_pct, agi_pct from SKP_HEADLINE_PCT lookup, clamped 0..150.
+#   "ehpr"        (arity 4): rawToPct(hprRaw, hprPct) / (1 - (1 - agi_pct) * def_pct)
+#                   Same simplifications as ehp.
 DERIVED_FORMULA = {
-    "hprEff": "mul_div_100",
+    "hpr": "raw_to_pct",
+    "ehp": "ehp",
+    "ehpr": "ehpr",
 }
 
 # Stats whose "empty" value is non-zero (i.e. a fresh item already has them).
 # Applied to base_min_stats / base_max_stats when the stat becomes active,
 # unless the user passes an explicit "base" / "min_base" / "max_base".
-DEFAULT_BASE = {
-    "hprPct": 100,
-}
+DEFAULT_BASE = {}
 
 # Numba-compatible formula int tags. Keep in sync with DERIVED_FORMULA values.
 FORMULA_MUL_DIV_100 = 0
+FORMULA_RAW_TO_PCT = 1
+FORMULA_EHP = 2
+FORMULA_EHPR = 3
 
 # ============================================================
 # CONSU SKILLS

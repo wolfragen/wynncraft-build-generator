@@ -23,7 +23,30 @@ from data.stats import (
     DERIVED_FORMULA,
     DEFAULT_BASE,
     FORMULA_MUL_DIV_100,
+    FORMULA_RAW_TO_PCT,
+    FORMULA_EHP,
+    FORMULA_EHPR,
 )
+
+
+_FORMULA_TAGS = {
+    "mul_div_100": FORMULA_MUL_DIV_100,
+    "raw_to_pct": FORMULA_RAW_TO_PCT,
+    "ehp": FORMULA_EHP,
+    "ehpr": FORMULA_EHPR,
+}
+
+# Arity per formula tag — used by the parser to validate dep counts.
+_FORMULA_ARITY = {
+    FORMULA_MUL_DIV_100: 2,
+    FORMULA_RAW_TO_PCT: 2,
+    FORMULA_EHP: 3,
+    FORMULA_EHPR: 4,
+}
+
+# How many dep slots are stored on Query. Composites use up to MAX_COMP_ARITY
+# slots; unused slots are filled with -1 sentinels.
+MAX_COMP_ARITY = 4
 
 
 class Query(NamedTuple):
@@ -68,11 +91,16 @@ class Query(NamedTuple):
 
     # Composite (derived) stats — Struct-of-Arrays for numba passage.
     # All indexed 0..comp_count-1. Dep indices are in projected stat space.
-    # Formulas: FORMULA_MUL_DIV_100 uses dep_a and dep_b; other slots reserved.
+    # Up to MAX_COMP_ARITY (4) deps; unused slots filled with -1.
+    #   arity 2 (mul_div_100, raw_to_pct):  uses dep_a, dep_b
+    #   arity 3 (ehp):                       uses dep_a, dep_b, dep_c
+    #   arity 4 (ehpr):                      uses all four
     comp_count: int
     comp_formula: np.ndarray        # int32[N]
     comp_dep_a_proj: np.ndarray     # int32[N]
     comp_dep_b_proj: np.ndarray     # int32[N]
+    comp_dep_c_proj: np.ndarray     # int32[N]
+    comp_dep_d_proj: np.ndarray     # int32[N]
     comp_min: np.ndarray            # int32[N]
     comp_max: np.ndarray            # int32[N]
     comp_has_min: np.ndarray        # bool[N]
@@ -187,8 +215,7 @@ def build_query(
     # Pass 2: composite (derived) stats
     # ------------------------------------------------------------
     comp_formulas = []
-    comp_dep_a_names = []
-    comp_dep_b_names = []
+    comp_dep_names = []   # list of tuples, padded to MAX_COMP_ARITY with None
     comp_min_vals = []
     comp_max_vals = []
     comp_has_min_vals = []
@@ -208,9 +235,15 @@ def build_query(
                 )
 
         formula_name = DERIVED_FORMULA.get(stat_name)
-        if formula_name != "mul_div_100" or len(deps) != 2:
-            # Only mul_div_100 (arity 2) supported for now.
+        formula_tag = _FORMULA_TAGS.get(formula_name)
+        if formula_tag is None:
             continue
+        expected_arity = _FORMULA_ARITY[formula_tag]
+        if len(deps) != expected_arity:
+            raise ValueError(
+                f"Composite '{stat_name}' formula '{formula_name}' expects "
+                f"{expected_arity} deps, got {len(deps)}: {deps}"
+            )
 
         # Activate dependency stats + apply DEFAULT_BASE if not overridden.
         for dep in deps:
@@ -243,9 +276,11 @@ def build_query(
             if not explicit_filter_set[dep_idx]:
                 should_filter[dep_idx] = comp_filter
 
-        comp_formulas.append(FORMULA_MUL_DIV_100)
-        comp_dep_a_names.append(deps[0])
-        comp_dep_b_names.append(deps[1])
+        # Pad deps tuple to MAX_COMP_ARITY with None.
+        padded = list(deps) + [None] * (MAX_COMP_ARITY - len(deps))
+
+        comp_formulas.append(formula_tag)
+        comp_dep_names.append(tuple(padded))
         comp_min_vals.append(stat_min if has_min else 0)
         comp_max_vals.append(stat_max if has_max else 0)
         comp_has_min_vals.append(has_min)
@@ -310,11 +345,24 @@ def build_query(
     # ------------------------------------------------------------
     comp_count = len(comp_formulas)
     comp_formula_arr = np.asarray(comp_formulas, dtype=np.int32)
+
+    # Build per-slot projected dep arrays. Unused slots (None) → -1 sentinel.
+    def _proj_or_sentinel(name):
+        if name is None:
+            return np.int32(-1)
+        return np.int32(proj_stats_idx[STAT_INDEX[name]])
+
     comp_dep_a_proj = np.array(
-        [proj_stats_idx[STAT_INDEX[n]] for n in comp_dep_a_names], dtype=np.int32,
+        [_proj_or_sentinel(deps[0]) for deps in comp_dep_names], dtype=np.int32,
     )
     comp_dep_b_proj = np.array(
-        [proj_stats_idx[STAT_INDEX[n]] for n in comp_dep_b_names], dtype=np.int32,
+        [_proj_or_sentinel(deps[1]) for deps in comp_dep_names], dtype=np.int32,
+    )
+    comp_dep_c_proj = np.array(
+        [_proj_or_sentinel(deps[2]) for deps in comp_dep_names], dtype=np.int32,
+    )
+    comp_dep_d_proj = np.array(
+        [_proj_or_sentinel(deps[3]) for deps in comp_dep_names], dtype=np.int32,
     )
     comp_min_arr = np.asarray(comp_min_vals, dtype=np.int32)
     comp_max_arr = np.asarray(comp_max_vals, dtype=np.int32)
@@ -327,6 +375,8 @@ def build_query(
         comp_formula_arr = np.zeros(0, dtype=np.int32)
         comp_dep_a_proj = np.zeros(0, dtype=np.int32)
         comp_dep_b_proj = np.zeros(0, dtype=np.int32)
+        comp_dep_c_proj = np.zeros(0, dtype=np.int32)
+        comp_dep_d_proj = np.zeros(0, dtype=np.int32)
         comp_min_arr = np.zeros(0, dtype=np.int32)
         comp_max_arr = np.zeros(0, dtype=np.int32)
         comp_has_min_arr = np.zeros(0, dtype=np.bool_)
@@ -365,6 +415,8 @@ def build_query(
         comp_formula=comp_formula_arr,
         comp_dep_a_proj=comp_dep_a_proj,
         comp_dep_b_proj=comp_dep_b_proj,
+        comp_dep_c_proj=comp_dep_c_proj,
+        comp_dep_d_proj=comp_dep_d_proj,
         comp_min=comp_min_arr,
         comp_max=comp_max_arr,
         comp_has_min=comp_has_min_arr,

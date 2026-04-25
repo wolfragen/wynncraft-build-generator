@@ -29,20 +29,21 @@ def main():
 
     # ---------- Build User Query ----------
     user_query = {
-        "mr": {"min": 1, "weight": 10000, "ingredient_filter":True},
-        "hprEff": {"min": 1, "weight": 1000, "ingredient_filter":True},
-        "str": {"min": 1, "ingredient_filter":True},
-        "dex": {"min": 1, "ingredient_filter":True},
-        "int": {"min": 1, "ingredient_filter":True},
-        "def": {"min": 1, "ingredient_filter":True},
-        "agi": {"min": 1, "ingredient_filter":True},
-        "strReq": {"max": 50, "ingredient_filter":True},
-        "dexReq": {"max": 100, "ingredient_filter":True},
-        "intReq": {"max": 100, "ingredient_filter":True},
-        "defReq": {"max": 100, "ingredient_filter":True},
-        "agiReq": {"max": 100, "ingredient_filter":True},
+        # "mr": {"min": 1, "weight": 10000, "ingredient_filter": True},
+        # "ehp":  {"weight": 50, "ingredient_filter": True},
+        "ehpr": {"min": 1, "weight": 100, "ingredient_filter": True},
+        # "str": {"min": 1, "ingredient_filter": True},
+        # "dex": {"min": 1, "ingredient_filter": True},
+        # "int": {"min": 1, "ingredient_filter": True},
+        # "def": {"min": 1, "ingredient_filter": True},
+        # "agi": {"min": 1, "ingredient_filter": True},
+        "strReq": {"max": 100, "ingredient_filter": True},
+        "dexReq": {"max": 100, "ingredient_filter": True},
+        "intReq": {"max": 100, "ingredient_filter": True},
+        "defReq": {"max": 100, "ingredient_filter": True},
+        "agiReq": {"max": 100, "ingredient_filter": True},
         "durability": {"min": 40, "weight": 1},
-        #"charges": {"min": 3},
+        # "charges": {"min": 3},
     }
 
     skill = "WEAPONSMITHING"
