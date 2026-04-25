@@ -98,8 +98,20 @@ DERIVED_STATS = (
     "hpr",
     "ehp",
     "ehpr",
+    # Spells (see data/spells.py for catalog order — must match SPELL ids)
     "mage_meteor",
+    "mage_ice_snake",
     "warrior_bash",
+    "warrior_uppercut",
+    "warrior_war_scream",
+    "archer_arrow_storm",
+    "archer_arrow_bomb",
+    "assassin_spin_attack",
+    "assassin_multihit",
+    "assassin_smoke_bomb",
+    "shaman_totem",
+    "shaman_aura",
+    "shaman_uproot",
 )
 
 DERIVED_DEPENDENCIES = {
@@ -110,7 +122,29 @@ DERIVED_DEPENDENCIES = {
     # (mirrored here so the parser doesn't need to import that module).
     "mage_meteor": ("nDamRaw", "sdPct", "sdRaw", "damPct",
                     "eDamPct", "eSdPct", "eSdRaw"),
+    "mage_ice_snake": ("nDamRaw", "sdPct", "sdRaw", "damPct",
+                       "wDamRaw", "wDamPct", "wSdPct", "wSdRaw"),
     "warrior_bash": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw", "eMdRaw"),
+    "warrior_uppercut": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw", "eMdRaw",
+                         "tDamRaw", "tDamPct", "tMdRaw"),
+    "warrior_war_scream": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw",
+                           "fDamRaw", "fDamPct", "fMdRaw"),
+    "archer_arrow_storm": ("nDamRaw", "sdPct", "sdRaw", "damPct",
+                           "tDamRaw", "tDamPct"),
+    "archer_arrow_bomb": ("nDamRaw", "sdPct", "sdRaw", "damPct",
+                          "fDamRaw", "fDamPct", "fSdPct", "fSdRaw"),
+    "assassin_spin_attack": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw",
+                             "tDamRaw", "tDamPct", "tMdRaw"),
+    "assassin_multihit": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw",
+                          "wDamRaw", "wDamPct", "wMdRaw"),
+    "assassin_smoke_bomb": ("nDamRaw", "sdPct", "sdRaw", "damPct", "eSdRaw",
+                            "aDamRaw", "aDamPct", "aSdPct"),
+    "shaman_totem": ("nDamRaw", "sdPct", "sdRaw", "damPct",
+                     "aDamRaw", "aDamPct", "aSdPct"),
+    "shaman_aura": ("nDamRaw", "sdPct", "sdRaw", "damPct",
+                    "wDamRaw", "wDamPct", "wSdPct", "wSdRaw"),
+    "shaman_uproot": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw", "eMdRaw",
+                      "tDamRaw", "tDamPct", "tMdRaw"),
 }
 
 # Formula tag per derived stat. Mapped to int in query.py for numba passage.
@@ -134,8 +168,20 @@ DERIVED_FORMULA = {
     "hpr": "raw_to_pct",
     "ehp": "ehp",
     "ehpr": "ehpr",
-    "mage_meteor": ("spell", 0),
-    "warrior_bash": ("spell", 1),
+    # Spell IDs match SPELLS list in data/spells.py.
+    "mage_meteor":          ("spell", 0),
+    "mage_ice_snake":       ("spell", 1),
+    "warrior_bash":         ("spell", 2),
+    "warrior_uppercut":     ("spell", 3),
+    "warrior_war_scream":   ("spell", 4),
+    "archer_arrow_storm":   ("spell", 5),
+    "archer_arrow_bomb":    ("spell", 6),
+    "assassin_spin_attack": ("spell", 7),
+    "assassin_multihit":    ("spell", 8),
+    "assassin_smoke_bomb":  ("spell", 9),
+    "shaman_totem":         ("spell", 10),
+    "shaman_aura":          ("spell", 11),
+    "shaman_uproot":        ("spell", 12),
 }
 
 # Stats whose "empty" value is non-zero (i.e. a fresh item already has them).

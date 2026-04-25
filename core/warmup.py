@@ -12,6 +12,7 @@ from data.stats import (
     FORMULA_MUL_DIV_100, FORMULA_RAW_TO_PCT, FORMULA_EHP, FORMULA_EHPR,
     FORMULA_SPELL_DAMAGE_BASE,
 )
+from data.spells import SPELL_COUNT
 from query import ingredient_filter as ingf
 from query.query import BUILD_CTX_SIZE
 from core import search_engine as se
@@ -56,11 +57,12 @@ def _warm_ingredient_filter():
 def _warm_search_engine():
     """
     Force the JIT compile of `dfs` and `search_meta_batch` (parallel=True is
-    expensive to compile, 1-2s per process). M=1, k=1, S=8, N=1 — S=8 so the
-    8-dep spell formula (Meteor) can read its slots. We run each kernel once
-    per formula tag so every branch compiles eagerly.
+    expensive to compile, 1-2s per process). M=1, k=1, S=10, N=1 — S=10 so the
+    largest spell formula (Uppercut/Uproot, 9 deps) can read its slots. We
+    invoke each kernel once per formula tag (fixed + every spell) so all
+    branches compile eagerly.
     """
-    M, k, S, N = 1, 1, 8, 1
+    M, k, S, N = 1, 1, 10, 1
     ings = np.zeros((M, 6), dtype=np.int32)
     void_eff = np.full((M, k), 100, dtype=np.int32)
     base_min = np.zeros((M, S), dtype=np.int32)
@@ -79,12 +81,12 @@ def _warm_search_engine():
     total_searched = np.zeros(1, dtype=np.int64)
 
     # One composite per warmup pass; positive weight ensures w>0 UB branches
-    # compile. Flat dep_indices contains 8 entries [0..7] so the spell formula
-    # (8 deps) and shorter formulas all read valid slots without OOB.
+    # compile. Flat dep_indices spans S so any spell formula (max 9 deps) and
+    # shorter formulas all read valid slots without OOB.
     comp_count = 1
-    comp_dep_indices = np.array([0, 1, 2, 3, 4, 5, 6, 7], dtype=np.int32)
+    comp_dep_indices = np.arange(S, dtype=np.int32)
     comp_dep_offset = np.array([0], dtype=np.int32)
-    comp_dep_count = np.array([8], dtype=np.int32)
+    comp_dep_count = np.array([S], dtype=np.int32)
     comp_min = np.zeros(1, dtype=np.int32)
     comp_max = np.zeros(1, dtype=np.int32)
     comp_has_min = np.zeros(1, dtype=np.bool_)
@@ -97,12 +99,13 @@ def _warm_search_engine():
 
     void_eff_k2 = np.full((M, 2), 100, dtype=np.int32)
 
-    # Spell tags: FORMULA_SPELL_DAMAGE_BASE+spell_id. Cover both Meteor (id=0)
-    # and Bash (id=1) so both spell formula branches compile eagerly.
-    for tag in (FORMULA_MUL_DIV_100, FORMULA_RAW_TO_PCT, FORMULA_EHP, FORMULA_EHPR,
-                FORMULA_SPELL_DAMAGE_BASE,      # Meteor
-                FORMULA_SPELL_DAMAGE_BASE + 1,  # Bash
-                ):
+    # Cover every formula tag (fixed + every spell_id). Each loop iteration
+    # warms all 3 kernels with that tag. After the first iteration the kernel
+    # is fully compiled — subsequent iterations re-run the dispatch with the
+    # new tag value to ensure the runtime branch for each spell is exercised.
+    fixed_tags = (FORMULA_MUL_DIV_100, FORMULA_RAW_TO_PCT, FORMULA_EHP, FORMULA_EHPR)
+    spell_tags = tuple(FORMULA_SPELL_DAMAGE_BASE + i for i in range(SPELL_COUNT))
+    for tag in fixed_tags + spell_tags:
         comp_formula = np.array([tag], dtype=np.int32)
 
         se.search_meta_batch(

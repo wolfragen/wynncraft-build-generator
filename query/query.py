@@ -30,7 +30,7 @@ from data.stats import (
 )
 from data.spells import ATK_SPEED_MULT, SPELL_COUNT
 from data.skillpoint_lookup import (
-    SKP_HEADLINE_PCT,
+    SKP_ELEMENT_PCT,
     SKP_STR, SKP_DEX, SKP_INT, SKP_DEF, SKP_AGI, SKP_MAX,
 )
 
@@ -57,9 +57,14 @@ _FORMULA_ARITY = {
 
 # Build context layout (numpy float64 array passed to numba kernels).
 # Indices are stable; the spell evaluator reads via these constants.
+# Values come from SKP_ELEMENT_PCT (skillpoint_damage_mult variant), which is
+# what wynnbuilder's calculateSpellDamage uses for both per-element boosts AND
+# the global str_boost. For str/dex/def/agi these are identical to the
+# headline values; for int the damage version uses 1.0 mult (vs 0.619 for
+# mana cost reduction, which we don't currently compute).
 BUILD_CTX_STR_PCT = 0     # skillPointsToPercentage(str) * 1.0
 BUILD_CTX_DEX_PCT = 1     # skillPointsToPercentage(dex) * 1.0
-BUILD_CTX_INT_PCT = 2     # skillPointsToPercentage(int) * final_mult[2] (~0.619)
+BUILD_CTX_INT_PCT = 2     # skillPointsToPercentage(int) * 1.0 (water dmg boost)
 BUILD_CTX_DEF_PCT = 3     # ... * 0.867
 BUILD_CTX_AGI_PCT = 4     # ... * 0.951
 BUILD_CTX_ATK_SPD = 5     # baseDamageMultiplier[atk_speed]
@@ -85,7 +90,7 @@ def _build_ctx_array(ctx_dict):
                 count = 0
             elif count > SKP_MAX:
                 count = SKP_MAX
-            arr[skp_idx] = float(SKP_HEADLINE_PCT[skp_idx, count])
+            arr[skp_idx] = float(SKP_ELEMENT_PCT[skp_idx, count])
         atk_speed = ctx_dict.get("atk_speed", "NORMAL")
         arr[BUILD_CTX_ATK_SPD] = float(ATK_SPEED_MULT.get(atk_speed, ATK_SPEED_MULT["NORMAL"]))
         arr[BUILD_CTX_CRIT_PCT] = float(ctx_dict.get("crit_dam_pct", 0))
