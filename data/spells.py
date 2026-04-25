@@ -49,6 +49,18 @@ SPELLS = [
         "deps": ("nDamRaw", "sdPct", "sdRaw", "damPct",
                  "eDamPct", "eSdPct", "eSdRaw"),
     },
+    {
+        "name": "warrior_bash",
+        "class_name": "warrior",
+        "display": "Bash",
+        "mults": (170, 30, 0, 0, 0, 0),
+        "use_spell": False,  # melee attack — uses mdPct/mdRaw not sdPct/sdRaw
+        "ignore_speed": False,
+        # Earth weapon damage = 0 (no eDamRaw stat); earth contribution comes
+        # only from eMdRaw raw bonus. Per-element % bonuses on earth (eDamPct)
+        # are dead-multiplied (× 0 weapon) so we drop them from deps.
+        "deps": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw", "eMdRaw"),
+    },
 ]
 
 

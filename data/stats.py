@@ -99,6 +99,7 @@ DERIVED_STATS = (
     "ehp",
     "ehpr",
     "mage_meteor",
+    "warrior_bash",
 )
 
 DERIVED_DEPENDENCIES = {
@@ -109,6 +110,7 @@ DERIVED_DEPENDENCIES = {
     # (mirrored here so the parser doesn't need to import that module).
     "mage_meteor": ("nDamRaw", "sdPct", "sdRaw", "damPct",
                     "eDamPct", "eSdPct", "eSdRaw"),
+    "warrior_bash": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw", "eMdRaw"),
 }
 
 # Formula tag per derived stat. Mapped to int in query.py for numba passage.
@@ -133,6 +135,7 @@ DERIVED_FORMULA = {
     "ehp": "ehp",
     "ehpr": "ehpr",
     "mage_meteor": ("spell", 0),
+    "warrior_bash": ("spell", 1),
 }
 
 # Stats whose "empty" value is non-zero (i.e. a fresh item already has them).

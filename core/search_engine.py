@@ -21,8 +21,9 @@ from data.skillpoint_lookup import SKP_HEADLINE_PCT, SKP_DEF, SKP_AGI, SKP_MAX
 _SKP_DEF_ROW = SKP_HEADLINE_PCT[SKP_DEF].copy()  # shape (151,) float64
 _SKP_AGI_ROW = SKP_HEADLINE_PCT[SKP_AGI].copy()
 
-# Spell ID 0 = Mage Meteor (matches data/spells.py SPELLS[0]).
+# Spell IDs — match the order in data/spells.py SPELLS list.
 _SPELL_METEOR = 0
+_SPELL_BASH = 1
 
 # Build-context indices (must match BUILD_CTX_* in query/query.py)
 _BCTX_STR_PCT = 0
@@ -428,6 +429,105 @@ def _meteor_k2_ub_branch(off, dep_indices, after, slot1_worst, slot1_best, build
     )
 
 
+# --- Warrior Bash — melee, neutral + earth ---
+# Multipliers (170, 30, 0, 0, 0, 0). use_spell=False (uses mdPct/mdRaw).
+# Earth weapon damage = 0 (no eDamRaw); earth contribution comes from eMdRaw
+# raw bonus only. Per-element % on earth multiplied by 0 weapon → not in deps.
+# Deps: (nDamRaw, mdPct, mdRaw, damPct, nMdRaw, eMdRaw).
+
+@njit(cache=True)
+def _bash_bounds(
+    nr_lo, nr_hi, mp_lo, mp_hi, mr_lo, mr_hi,
+    dp_lo, dp_hi, nmr_lo, nmr_hi, emr_lo, emr_hi,
+    build_ctx,
+):
+    str_pct = build_ctx[_BCTX_STR_PCT]
+    atk_spd = build_ctx[_BCTX_ATK_SPD]
+    str_boost = 1.0 + str_pct
+    n_mult = 1.70   # 170% neutral
+
+    # Neutral weapon contribution — bilinear in (nDamRaw, mdPct + damPct).
+    md_dam_lo = mp_lo + dp_lo
+    md_dam_hi = mp_hi + dp_hi
+    pct_lo_factor = 1.0 + md_dam_lo / 100.0
+    pct_hi_factor = 1.0 + md_dam_hi / 100.0
+    c1 = nr_lo * pct_lo_factor
+    c2 = nr_lo * pct_hi_factor
+    c3 = nr_hi * pct_lo_factor
+    c4 = nr_hi * pct_hi_factor
+    n_weapon_min = c1
+    if c2 < n_weapon_min: n_weapon_min = c2
+    if c3 < n_weapon_min: n_weapon_min = c3
+    if c4 < n_weapon_min: n_weapon_min = c4
+    n_weapon_max = c1
+    if c2 > n_weapon_max: n_weapon_max = c2
+    if c3 > n_weapon_max: n_weapon_max = c3
+    if c4 > n_weapon_max: n_weapon_max = c4
+    n_weapon_min *= n_mult * atk_spd
+    n_weapon_max *= n_mult * atk_spd
+
+    # Total raw bonuses — mdRaw goes to neutral (default conversion);
+    # nMdRaw to neutral, eMdRaw to earth. Earth weapon = 0 so e_dmg = eMdRaw.
+    # All raw added then scaled by global str_boost.
+    raw_min = mr_lo + nmr_lo + emr_lo
+    raw_max = mr_hi + nmr_hi + emr_hi
+
+    total_min = (n_weapon_min + raw_min) * str_boost
+    total_max = (n_weapon_max + raw_max) * str_boost
+    return np.int64(total_min), np.int64(total_max)
+
+
+@njit(cache=True)
+def _bash_leaf(off, dep_indices, mins, maxs, build_ctx):
+    return _bash_bounds(
+        mins[dep_indices[off + 0]], maxs[dep_indices[off + 0]],
+        mins[dep_indices[off + 1]], maxs[dep_indices[off + 1]],
+        mins[dep_indices[off + 2]], maxs[dep_indices[off + 2]],
+        mins[dep_indices[off + 3]], maxs[dep_indices[off + 3]],
+        mins[dep_indices[off + 4]], maxs[dep_indices[off + 4]],
+        mins[dep_indices[off + 5]], maxs[dep_indices[off + 5]],
+        build_ctx,
+    )
+
+
+@njit(cache=True)
+def _bash_dfs_ub_branch(off, dep_indices, current, future_lb, future_ub, next_depth, build_ctx):
+    return _bash_bounds(
+        current[dep_indices[off + 0]] + future_lb[next_depth, dep_indices[off + 0]],
+        current[dep_indices[off + 0]] + future_ub[next_depth, dep_indices[off + 0]],
+        current[dep_indices[off + 1]] + future_lb[next_depth, dep_indices[off + 1]],
+        current[dep_indices[off + 1]] + future_ub[next_depth, dep_indices[off + 1]],
+        current[dep_indices[off + 2]] + future_lb[next_depth, dep_indices[off + 2]],
+        current[dep_indices[off + 2]] + future_ub[next_depth, dep_indices[off + 2]],
+        current[dep_indices[off + 3]] + future_lb[next_depth, dep_indices[off + 3]],
+        current[dep_indices[off + 3]] + future_ub[next_depth, dep_indices[off + 3]],
+        current[dep_indices[off + 4]] + future_lb[next_depth, dep_indices[off + 4]],
+        current[dep_indices[off + 4]] + future_ub[next_depth, dep_indices[off + 4]],
+        current[dep_indices[off + 5]] + future_lb[next_depth, dep_indices[off + 5]],
+        current[dep_indices[off + 5]] + future_ub[next_depth, dep_indices[off + 5]],
+        build_ctx,
+    )
+
+
+@njit(cache=True)
+def _bash_k2_ub_branch(off, dep_indices, after, slot1_worst, slot1_best, build_ctx):
+    return _bash_bounds(
+        after[dep_indices[off + 0]] + slot1_worst[dep_indices[off + 0]],
+        after[dep_indices[off + 0]] + slot1_best[dep_indices[off + 0]],
+        after[dep_indices[off + 1]] + slot1_worst[dep_indices[off + 1]],
+        after[dep_indices[off + 1]] + slot1_best[dep_indices[off + 1]],
+        after[dep_indices[off + 2]] + slot1_worst[dep_indices[off + 2]],
+        after[dep_indices[off + 2]] + slot1_best[dep_indices[off + 2]],
+        after[dep_indices[off + 3]] + slot1_worst[dep_indices[off + 3]],
+        after[dep_indices[off + 3]] + slot1_best[dep_indices[off + 3]],
+        after[dep_indices[off + 4]] + slot1_worst[dep_indices[off + 4]],
+        after[dep_indices[off + 4]] + slot1_best[dep_indices[off + 4]],
+        after[dep_indices[off + 5]] + slot1_worst[dep_indices[off + 5]],
+        after[dep_indices[off + 5]] + slot1_best[dep_indices[off + 5]],
+        build_ctx,
+    )
+
+
 # ============================================================
 # Precompute per-meta-set bounds for B&B pruning
 # ============================================================
@@ -611,6 +711,10 @@ def dfs(
                 spell_id = f - FORMULA_SPELL_DAMAGE_BASE
                 if spell_id == _SPELL_METEOR:
                     cmin, cmax = _meteor_leaf(
+                        off, comp_dep_indices, current_min, current_max, build_ctx,
+                    )
+                elif spell_id == _SPELL_BASH:
+                    cmin, cmax = _bash_leaf(
                         off, comp_dep_indices, current_min, current_max, build_ctx,
                     )
                 else:
@@ -802,6 +906,15 @@ def dfs(
                         future_max_lb, future_max_ub, next_depth, build_ctx,
                     )
                     pmin_lo, pmin_hi = _meteor_dfs_ub_branch(
+                        off, comp_dep_indices, current_min,
+                        future_min_lb, future_min_ub, next_depth, build_ctx,
+                    )
+                elif spell_id == _SPELL_BASH:
+                    pmax_lo, pmax_hi = _bash_dfs_ub_branch(
+                        off, comp_dep_indices, current_max,
+                        future_max_lb, future_max_ub, next_depth, build_ctx,
+                    )
+                    pmin_lo, pmin_hi = _bash_dfs_ub_branch(
                         off, comp_dep_indices, current_min,
                         future_min_lb, future_min_ub, next_depth, build_ctx,
                     )
@@ -1001,6 +1114,10 @@ def _search_meta_batch_k1(
                     spell_id = f - FORMULA_SPELL_DAMAGE_BASE
                     if spell_id == _SPELL_METEOR:
                         cmin, cmax = _meteor_leaf(
+                            off, comp_dep_indices, final_min, final_max, build_ctx,
+                        )
+                    elif spell_id == _SPELL_BASH:
+                        cmin, cmax = _bash_leaf(
                             off, comp_dep_indices, final_min, final_max, build_ctx,
                         )
                     else:
@@ -1262,6 +1379,15 @@ def _search_meta_batch_k2(
                             off, comp_dep_indices, after_min_arr,
                             slot1_worst_min, slot1_best_min, build_ctx,
                         )
+                    elif spell_id == _SPELL_BASH:
+                        pmax_lo, pmax_hi = _bash_k2_ub_branch(
+                            off, comp_dep_indices, after_max_arr,
+                            slot1_worst_max, slot1_best_max, build_ctx,
+                        )
+                        pmin_lo, pmin_hi = _bash_k2_ub_branch(
+                            off, comp_dep_indices, after_min_arr,
+                            slot1_worst_min, slot1_best_min, build_ctx,
+                        )
                     else:
                         pmax_lo = np.int64(0); pmax_hi = np.int64(0)
                         pmin_lo = np.int64(0); pmin_hi = np.int64(0)
@@ -1344,6 +1470,10 @@ def _search_meta_batch_k2(
                         spell_id = f - FORMULA_SPELL_DAMAGE_BASE
                         if spell_id == _SPELL_METEOR:
                             cmin, cmax = _meteor_leaf(
+                                off, comp_dep_indices, final_min_arr, final_max_arr, build_ctx,
+                            )
+                        elif spell_id == _SPELL_BASH:
+                            cmin, cmax = _bash_leaf(
                                 off, comp_dep_indices, final_min_arr, final_max_arr, build_ctx,
                             )
                         else:

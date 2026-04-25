@@ -97,8 +97,12 @@ def _warm_search_engine():
 
     void_eff_k2 = np.full((M, 2), 100, dtype=np.int32)
 
-    for tag in (FORMULA_MUL_DIV_100, FORMULA_RAW_TO_PCT, FORMULA_EHP,
-                FORMULA_EHPR, FORMULA_SPELL_DAMAGE_BASE):  # last → spell_id=0 (Meteor)
+    # Spell tags: FORMULA_SPELL_DAMAGE_BASE+spell_id. Cover both Meteor (id=0)
+    # and Bash (id=1) so both spell formula branches compile eagerly.
+    for tag in (FORMULA_MUL_DIV_100, FORMULA_RAW_TO_PCT, FORMULA_EHP, FORMULA_EHPR,
+                FORMULA_SPELL_DAMAGE_BASE,      # Meteor
+                FORMULA_SPELL_DAMAGE_BASE + 1,  # Bash
+                ):
         comp_formula = np.array([tag], dtype=np.int32)
 
         se.search_meta_batch(
