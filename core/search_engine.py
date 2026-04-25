@@ -9,7 +9,10 @@ from queue import Queue
 from threading import Thread
 from time import time
 
-from data.stats import FORMULA_MUL_DIV_100, FORMULA_RAW_TO_PCT, FORMULA_EHP, FORMULA_EHPR
+from data.stats import (
+    FORMULA_MUL_DIV_100, FORMULA_RAW_TO_PCT, FORMULA_EHP, FORMULA_EHPR,
+    FORMULA_SPELL_DAMAGE_BASE,
+)
 from data.skillpoint_lookup import SKP_HEADLINE_PCT, SKP_DEF, SKP_AGI, SKP_MAX
 
 # Numba captures module-level numpy arrays as constants (read-only refs); the
@@ -17,6 +20,13 @@ from data.skillpoint_lookup import SKP_HEADLINE_PCT, SKP_DEF, SKP_AGI, SKP_MAX
 # even with cache=True.
 _SKP_DEF_ROW = SKP_HEADLINE_PCT[SKP_DEF].copy()  # shape (151,) float64
 _SKP_AGI_ROW = SKP_HEADLINE_PCT[SKP_AGI].copy()
+
+# Spell ID 0 = Mage Meteor (matches data/spells.py SPELLS[0]).
+_SPELL_METEOR = 0
+
+# Build-context indices (must match BUILD_CTX_* in query/query.py)
+_BCTX_STR_PCT = 0
+_BCTX_ATK_SPD = 5
 
 
 # Explicit signature so the recursive dfs can be persisted to disk with
@@ -59,6 +69,7 @@ _DFS_SIG = types.void(
     types.Array(types.bool_, 1, "C"),  # comp_has_min
     types.Array(types.bool_, 1, "C"),  # comp_has_max
     types.float32[::1],       # comp_weight
+    types.float64[::1],       # build_ctx (skp pcts, atk_spd, crit)
 )
 
 
@@ -275,6 +286,149 @@ def _ehpr_bounds(raw_lo, raw_hi, pct_lo, pct_hi, def_lo, def_hi, agi_lo, agi_hi)
 
 
 # ============================================================
+# Spell damage formulas (per-spell, dispatched by spell_id)
+# ============================================================
+# Wynnbuilder formula (simplified):
+#   For each element e where spell_mult[e] > 0:
+#     base[e]   = weapon_dam[e] * spell_mult[e]/100 * atk_speed_mult
+#     boost[e]  = 1 + (sdPct + damPct + elem_pct) / 100 + skp_boost[e]
+#     dmg[e]    = base[e] * boost[e] + raw_bonus[e]
+#     dmg[e]    = dmg[e] * (1 + str_pct)        # global strBoost
+#   total = sum_e dmg[e]
+# Simplifications across all spells:
+#   - Conversions assumed default: 100% neutral (no item conversion stats yet)
+#   - No critical hit damage (use normal only)
+#   - Global raw bonuses (sdRaw/damRaw) attributed entirely to neutral element
+#     (wynnbuilder distributes proportionally — for default conversion this is
+#     equivalent up to per-element splitting, which the bound logic ignores)
+
+
+@njit(cache=True)
+def _meteor_bounds(
+    nr_lo, nr_hi, sp_lo, sp_hi, sr_lo, sr_hi,
+    dp_lo, dp_hi,
+    ep_lo, ep_hi, esp_lo, esp_hi, esr_lo, esr_hi,
+    build_ctx,
+):
+    """
+    Bounds on Mage Meteor damage over the rectangle of all 7 dep ranges:
+      (nDamRaw, sdPct, sdRaw, damPct, eDamPct, eSdPct, eSdRaw).
+
+    Multipliers: (330, 70, 0, 0, 0, 0). use_spell_damage=True, ignore_speed=False.
+    Earth weapon contribution is 0 (no eDamRaw stat in our registry); earth
+    damage comes from eSdRaw raw bonus only, scaled by global str multiplier.
+    Neutral component is bilinear in (nDamRaw, sdPct+damPct) — 4-corner bound.
+    Linear additions for raw terms. Global damRaw is treated as 0 (not in our
+    stat registry).
+    """
+    str_pct = build_ctx[_BCTX_STR_PCT]
+    atk_spd = build_ctx[_BCTX_ATK_SPD]
+    str_boost = 1.0 + str_pct
+    n_mult = 3.30   # 330% neutral
+
+    # ---- Neutral component ----
+    # n_weapon = nDamRaw * n_mult * atk_spd * (1 + (sdPct + damPct)/100)
+    # bilinear in (nDamRaw, sdPct+damPct); 4-corner over the (nr × sd_sum) rect.
+    sd_sum_lo = sp_lo + dp_lo
+    sd_sum_hi = sp_hi + dp_hi
+    pct_lo_factor = 1.0 + sd_sum_lo / 100.0
+    pct_hi_factor = 1.0 + sd_sum_hi / 100.0
+    c1 = nr_lo * pct_lo_factor
+    c2 = nr_lo * pct_hi_factor
+    c3 = nr_hi * pct_lo_factor
+    c4 = nr_hi * pct_hi_factor
+    n_weapon_min = c1
+    if c2 < n_weapon_min: n_weapon_min = c2
+    if c3 < n_weapon_min: n_weapon_min = c3
+    if c4 < n_weapon_min: n_weapon_min = c4
+    n_weapon_max = c1
+    if c2 > n_weapon_max: n_weapon_max = c2
+    if c3 > n_weapon_max: n_weapon_max = c3
+    if c4 > n_weapon_max: n_weapon_max = c4
+    n_weapon_min *= n_mult * atk_spd
+    n_weapon_max *= n_mult * atk_spd
+
+    # n_raw = sdRaw  (no damRaw in our registry → treated as 0)
+    n_raw_min = sr_lo
+    n_raw_max = sr_hi
+
+    # n_dmg = (n_weapon + n_raw) * str_boost  [str_boost > 0]
+    n_dmg_min = (n_weapon_min + n_raw_min) * str_boost
+    n_dmg_max = (n_weapon_max + n_raw_max) * str_boost
+
+    # ---- Earth component ----
+    # e_weapon = 0 (no eDamRaw stat)
+    # e_raw = eSdRaw, scaled only by str_boost
+    e_dmg_min = esr_lo * str_boost
+    e_dmg_max = esr_hi * str_boost
+
+    return np.int64(n_dmg_min + e_dmg_min), np.int64(n_dmg_max + e_dmg_max)
+
+
+# --- Meteor — leaf and UB-range adapters ---
+# Each adapter reads the 8 Meteor deps from the appropriate (lo, hi) source
+# arrays via comp_dep_indices[off+0..7] and returns (cmin, cmax) via _meteor_bounds.
+
+@njit(cache=True)
+def _meteor_leaf(off, dep_indices, mins, maxs, build_ctx):
+    """Bounds at the leaf — `mins`/`maxs` are the build's roll min/max arrays."""
+    return _meteor_bounds(
+        mins[dep_indices[off + 0]], maxs[dep_indices[off + 0]],
+        mins[dep_indices[off + 1]], maxs[dep_indices[off + 1]],
+        mins[dep_indices[off + 2]], maxs[dep_indices[off + 2]],
+        mins[dep_indices[off + 3]], maxs[dep_indices[off + 3]],
+        mins[dep_indices[off + 4]], maxs[dep_indices[off + 4]],
+        mins[dep_indices[off + 5]], maxs[dep_indices[off + 5]],
+        mins[dep_indices[off + 6]], maxs[dep_indices[off + 6]],
+        build_ctx,
+    )
+
+
+@njit(cache=True)
+def _meteor_dfs_ub_branch(off, dep_indices, current, future_lb, future_ub, next_depth, build_ctx):
+    """Bounds at the dfs UB site for one branch (max-range or min-range)."""
+    return _meteor_bounds(
+        current[dep_indices[off + 0]] + future_lb[next_depth, dep_indices[off + 0]],
+        current[dep_indices[off + 0]] + future_ub[next_depth, dep_indices[off + 0]],
+        current[dep_indices[off + 1]] + future_lb[next_depth, dep_indices[off + 1]],
+        current[dep_indices[off + 1]] + future_ub[next_depth, dep_indices[off + 1]],
+        current[dep_indices[off + 2]] + future_lb[next_depth, dep_indices[off + 2]],
+        current[dep_indices[off + 2]] + future_ub[next_depth, dep_indices[off + 2]],
+        current[dep_indices[off + 3]] + future_lb[next_depth, dep_indices[off + 3]],
+        current[dep_indices[off + 3]] + future_ub[next_depth, dep_indices[off + 3]],
+        current[dep_indices[off + 4]] + future_lb[next_depth, dep_indices[off + 4]],
+        current[dep_indices[off + 4]] + future_ub[next_depth, dep_indices[off + 4]],
+        current[dep_indices[off + 5]] + future_lb[next_depth, dep_indices[off + 5]],
+        current[dep_indices[off + 5]] + future_ub[next_depth, dep_indices[off + 5]],
+        current[dep_indices[off + 6]] + future_lb[next_depth, dep_indices[off + 6]],
+        current[dep_indices[off + 6]] + future_ub[next_depth, dep_indices[off + 6]],
+        build_ctx,
+    )
+
+
+@njit(cache=True)
+def _meteor_k2_ub_branch(off, dep_indices, after, slot1_worst, slot1_best, build_ctx):
+    """Bounds at the k=2 UB site for one branch (max-range or min-range)."""
+    return _meteor_bounds(
+        after[dep_indices[off + 0]] + slot1_worst[dep_indices[off + 0]],
+        after[dep_indices[off + 0]] + slot1_best[dep_indices[off + 0]],
+        after[dep_indices[off + 1]] + slot1_worst[dep_indices[off + 1]],
+        after[dep_indices[off + 1]] + slot1_best[dep_indices[off + 1]],
+        after[dep_indices[off + 2]] + slot1_worst[dep_indices[off + 2]],
+        after[dep_indices[off + 2]] + slot1_best[dep_indices[off + 2]],
+        after[dep_indices[off + 3]] + slot1_worst[dep_indices[off + 3]],
+        after[dep_indices[off + 3]] + slot1_best[dep_indices[off + 3]],
+        after[dep_indices[off + 4]] + slot1_worst[dep_indices[off + 4]],
+        after[dep_indices[off + 4]] + slot1_best[dep_indices[off + 4]],
+        after[dep_indices[off + 5]] + slot1_worst[dep_indices[off + 5]],
+        after[dep_indices[off + 5]] + slot1_best[dep_indices[off + 5]],
+        after[dep_indices[off + 6]] + slot1_worst[dep_indices[off + 6]],
+        after[dep_indices[off + 6]] + slot1_best[dep_indices[off + 6]],
+        build_ctx,
+    )
+
+
+# ============================================================
 # Precompute per-meta-set bounds for B&B pruning
 # ============================================================
 
@@ -395,6 +549,7 @@ def dfs(
     comp_has_min,
     comp_has_max,
     comp_weight,
+    build_ctx,
 ):
     # Leaf
     if depth == k:
@@ -422,22 +577,28 @@ def dfs(
         for c in range(comp_count):
             off = comp_dep_offset[c]
             f = comp_formula[c]
-            a = comp_dep_indices[off]
-            b = comp_dep_indices[off + 1]
             if f == FORMULA_MUL_DIV_100:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
                 cmax = (np.int64(current_max[a]) * np.int64(current_max[b])) // 100
                 cmin = (np.int64(current_min[a]) * np.int64(current_min[b])) // 100
             elif f == FORMULA_RAW_TO_PCT:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
                 cmax = _raw_to_pct(current_max[a], current_max[b])
                 cmin = _raw_to_pct(current_min[a], current_min[b])
             elif f == FORMULA_EHP:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
                 cc = comp_dep_indices[off + 2]
                 cmin, cmax = _ehp_bounds(
                     current_min[a], current_max[a],
                     current_min[b], current_max[b],
                     current_min[cc], current_max[cc],
                 )
-            else:  # FORMULA_EHPR
+            elif f == FORMULA_EHPR:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
                 cc = comp_dep_indices[off + 2]
                 dd = comp_dep_indices[off + 3]
                 cmin, cmax = _ehpr_bounds(
@@ -446,6 +607,15 @@ def dfs(
                     current_min[cc], current_max[cc],
                     current_min[dd], current_max[dd],
                 )
+            else:  # spell composite
+                spell_id = f - FORMULA_SPELL_DAMAGE_BASE
+                if spell_id == _SPELL_METEOR:
+                    cmin, cmax = _meteor_leaf(
+                        off, comp_dep_indices, current_min, current_max, build_ctx,
+                    )
+                else:
+                    cmin = np.int64(0)
+                    cmax = np.int64(0)
 
             if comp_has_min[c] and cmax < comp_min[c]:
                 return
@@ -548,51 +718,96 @@ def dfs(
                 continue
             off = comp_dep_offset[c]
             f = comp_formula[c]
-            a = comp_dep_indices[off]
-            b = comp_dep_indices[off + 1]
-
-            a_max_lo = current_max[a] + future_max_lb[next_depth, a]
-            a_max_hi = current_max[a] + future_max_ub[next_depth, a]
-            b_max_lo = current_max[b] + future_max_lb[next_depth, b]
-            b_max_hi = current_max[b] + future_max_ub[next_depth, b]
-            a_min_lo = current_min[a] + future_min_lb[next_depth, a]
-            a_min_hi = current_min[a] + future_min_ub[next_depth, a]
-            b_min_lo = current_min[b] + future_min_lb[next_depth, b]
-            b_min_hi = current_min[b] + future_min_ub[next_depth, b]
 
             if f == FORMULA_MUL_DIV_100:
-                pmax_lo, pmax_hi = _product_bounds_div100(a_max_lo, a_max_hi, b_max_lo, b_max_hi)
-                pmin_lo, pmin_hi = _product_bounds_div100(a_min_lo, a_min_hi, b_min_lo, b_min_hi)
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
+                pmax_lo, pmax_hi = _product_bounds_div100(
+                    current_max[a] + future_max_lb[next_depth, a],
+                    current_max[a] + future_max_ub[next_depth, a],
+                    current_max[b] + future_max_lb[next_depth, b],
+                    current_max[b] + future_max_ub[next_depth, b],
+                )
+                pmin_lo, pmin_hi = _product_bounds_div100(
+                    current_min[a] + future_min_lb[next_depth, a],
+                    current_min[a] + future_min_ub[next_depth, a],
+                    current_min[b] + future_min_lb[next_depth, b],
+                    current_min[b] + future_min_ub[next_depth, b],
+                )
             elif f == FORMULA_RAW_TO_PCT:
-                pmax_lo, pmax_hi = _raw_to_pct_bounds(a_max_lo, a_max_hi, b_max_lo, b_max_hi)
-                pmin_lo, pmin_hi = _raw_to_pct_bounds(a_min_lo, a_min_hi, b_min_lo, b_min_hi)
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
+                pmax_lo, pmax_hi = _raw_to_pct_bounds(
+                    current_max[a] + future_max_lb[next_depth, a],
+                    current_max[a] + future_max_ub[next_depth, a],
+                    current_max[b] + future_max_lb[next_depth, b],
+                    current_max[b] + future_max_ub[next_depth, b],
+                )
+                pmin_lo, pmin_hi = _raw_to_pct_bounds(
+                    current_min[a] + future_min_lb[next_depth, a],
+                    current_min[a] + future_min_ub[next_depth, a],
+                    current_min[b] + future_min_lb[next_depth, b],
+                    current_min[b] + future_min_ub[next_depth, b],
+                )
             elif f == FORMULA_EHP:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
                 cc = comp_dep_indices[off + 2]
-                c_max_lo = current_max[cc] + future_max_lb[next_depth, cc]
-                c_max_hi = current_max[cc] + future_max_ub[next_depth, cc]
-                c_min_lo = current_min[cc] + future_min_lb[next_depth, cc]
-                c_min_hi = current_min[cc] + future_min_ub[next_depth, cc]
-                pmax_lo, pmax_hi = _ehp_bounds(a_max_lo, a_max_hi, b_max_lo, b_max_hi, c_max_lo, c_max_hi)
-                pmin_lo, pmin_hi = _ehp_bounds(a_min_lo, a_min_hi, b_min_lo, b_min_hi, c_min_lo, c_min_hi)
-            else:  # FORMULA_EHPR
+                pmax_lo, pmax_hi = _ehp_bounds(
+                    current_max[a] + future_max_lb[next_depth, a],
+                    current_max[a] + future_max_ub[next_depth, a],
+                    current_max[b] + future_max_lb[next_depth, b],
+                    current_max[b] + future_max_ub[next_depth, b],
+                    current_max[cc] + future_max_lb[next_depth, cc],
+                    current_max[cc] + future_max_ub[next_depth, cc],
+                )
+                pmin_lo, pmin_hi = _ehp_bounds(
+                    current_min[a] + future_min_lb[next_depth, a],
+                    current_min[a] + future_min_ub[next_depth, a],
+                    current_min[b] + future_min_lb[next_depth, b],
+                    current_min[b] + future_min_ub[next_depth, b],
+                    current_min[cc] + future_min_lb[next_depth, cc],
+                    current_min[cc] + future_min_ub[next_depth, cc],
+                )
+            elif f == FORMULA_EHPR:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
                 cc = comp_dep_indices[off + 2]
                 dd = comp_dep_indices[off + 3]
-                c_max_lo = current_max[cc] + future_max_lb[next_depth, cc]
-                c_max_hi = current_max[cc] + future_max_ub[next_depth, cc]
-                d_max_lo = current_max[dd] + future_max_lb[next_depth, dd]
-                d_max_hi = current_max[dd] + future_max_ub[next_depth, dd]
-                c_min_lo = current_min[cc] + future_min_lb[next_depth, cc]
-                c_min_hi = current_min[cc] + future_min_ub[next_depth, cc]
-                d_min_lo = current_min[dd] + future_min_lb[next_depth, dd]
-                d_min_hi = current_min[dd] + future_min_ub[next_depth, dd]
                 pmax_lo, pmax_hi = _ehpr_bounds(
-                    a_max_lo, a_max_hi, b_max_lo, b_max_hi,
-                    c_max_lo, c_max_hi, d_max_lo, d_max_hi,
+                    current_max[a] + future_max_lb[next_depth, a],
+                    current_max[a] + future_max_ub[next_depth, a],
+                    current_max[b] + future_max_lb[next_depth, b],
+                    current_max[b] + future_max_ub[next_depth, b],
+                    current_max[cc] + future_max_lb[next_depth, cc],
+                    current_max[cc] + future_max_ub[next_depth, cc],
+                    current_max[dd] + future_max_lb[next_depth, dd],
+                    current_max[dd] + future_max_ub[next_depth, dd],
                 )
                 pmin_lo, pmin_hi = _ehpr_bounds(
-                    a_min_lo, a_min_hi, b_min_lo, b_min_hi,
-                    c_min_lo, c_min_hi, d_min_lo, d_min_hi,
+                    current_min[a] + future_min_lb[next_depth, a],
+                    current_min[a] + future_min_ub[next_depth, a],
+                    current_min[b] + future_min_lb[next_depth, b],
+                    current_min[b] + future_min_ub[next_depth, b],
+                    current_min[cc] + future_min_lb[next_depth, cc],
+                    current_min[cc] + future_min_ub[next_depth, cc],
+                    current_min[dd] + future_min_lb[next_depth, dd],
+                    current_min[dd] + future_min_ub[next_depth, dd],
                 )
+            else:  # spell composite
+                spell_id = f - FORMULA_SPELL_DAMAGE_BASE
+                if spell_id == _SPELL_METEOR:
+                    pmax_lo, pmax_hi = _meteor_dfs_ub_branch(
+                        off, comp_dep_indices, current_max,
+                        future_max_lb, future_max_ub, next_depth, build_ctx,
+                    )
+                    pmin_lo, pmin_hi = _meteor_dfs_ub_branch(
+                        off, comp_dep_indices, current_min,
+                        future_min_lb, future_min_ub, next_depth, build_ctx,
+                    )
+                else:
+                    pmax_lo = np.int64(0); pmax_hi = np.int64(0)
+                    pmin_lo = np.int64(0); pmin_hi = np.int64(0)
 
             if w > 0.0:
                 ub_score += w * (pmax_hi * 0.99 + pmin_hi * 0.01)
@@ -657,6 +872,7 @@ def dfs(
             comp_has_min,
             comp_has_max,
             comp_weight,
+            build_ctx,
         )
 
         # Undo
@@ -702,6 +918,7 @@ def _search_meta_batch_k1(
     comp_has_min,
     comp_has_max,
     comp_weight,
+    build_ctx,
 ):
     M = base_min_matrix.shape[0]
     S = base_min_matrix.shape[1]
@@ -750,22 +967,28 @@ def _search_meta_batch_k1(
             for c in range(comp_count):
                 off = comp_dep_offset[c]
                 f = comp_formula[c]
-                a = comp_dep_indices[off]
-                b = comp_dep_indices[off + 1]
                 if f == FORMULA_MUL_DIV_100:
+                    a = comp_dep_indices[off]
+                    b = comp_dep_indices[off + 1]
                     cmax = (np.int64(final_max[a]) * np.int64(final_max[b])) // 100
                     cmin = (np.int64(final_min[a]) * np.int64(final_min[b])) // 100
                 elif f == FORMULA_RAW_TO_PCT:
+                    a = comp_dep_indices[off]
+                    b = comp_dep_indices[off + 1]
                     cmax = _raw_to_pct(final_max[a], final_max[b])
                     cmin = _raw_to_pct(final_min[a], final_min[b])
                 elif f == FORMULA_EHP:
+                    a = comp_dep_indices[off]
+                    b = comp_dep_indices[off + 1]
                     cc = comp_dep_indices[off + 2]
                     cmin, cmax = _ehp_bounds(
                         final_min[a], final_max[a],
                         final_min[b], final_max[b],
                         final_min[cc], final_max[cc],
                     )
-                else:  # FORMULA_EHPR
+                elif f == FORMULA_EHPR:
+                    a = comp_dep_indices[off]
+                    b = comp_dep_indices[off + 1]
                     cc = comp_dep_indices[off + 2]
                     dd = comp_dep_indices[off + 3]
                     cmin, cmax = _ehpr_bounds(
@@ -774,6 +997,15 @@ def _search_meta_batch_k1(
                         final_min[cc], final_max[cc],
                         final_min[dd], final_max[dd],
                     )
+                else:  # spell composite
+                    spell_id = f - FORMULA_SPELL_DAMAGE_BASE
+                    if spell_id == _SPELL_METEOR:
+                        cmin, cmax = _meteor_leaf(
+                            off, comp_dep_indices, final_min, final_max, build_ctx,
+                        )
+                    else:
+                        cmin = np.int64(0)
+                        cmax = np.int64(0)
                 if comp_has_min[c] and cmax < comp_min[c]:
                     feasible = False
                     break
@@ -844,6 +1076,7 @@ def _search_meta_batch_k2(
     comp_has_min,
     comp_has_max,
     comp_weight,
+    build_ctx,
 ):
     M = base_min_matrix.shape[0]
     S = base_min_matrix.shape[1]
@@ -942,51 +1175,96 @@ def _search_meta_batch_k2(
                     continue
                 off = comp_dep_offset[c]
                 f = comp_formula[c]
-                a = comp_dep_indices[off]
-                b = comp_dep_indices[off + 1]
-
-                a_max_lo = after_max_arr[a] + slot1_worst_max[a]
-                a_max_hi = after_max_arr[a] + slot1_best_max[a]
-                b_max_lo = after_max_arr[b] + slot1_worst_max[b]
-                b_max_hi = after_max_arr[b] + slot1_best_max[b]
-                a_min_lo = after_min_arr[a] + slot1_worst_min[a]
-                a_min_hi = after_min_arr[a] + slot1_best_min[a]
-                b_min_lo = after_min_arr[b] + slot1_worst_min[b]
-                b_min_hi = after_min_arr[b] + slot1_best_min[b]
 
                 if f == FORMULA_MUL_DIV_100:
-                    pmax_lo, pmax_hi = _product_bounds_div100(a_max_lo, a_max_hi, b_max_lo, b_max_hi)
-                    pmin_lo, pmin_hi = _product_bounds_div100(a_min_lo, a_min_hi, b_min_lo, b_min_hi)
+                    a = comp_dep_indices[off]
+                    b = comp_dep_indices[off + 1]
+                    pmax_lo, pmax_hi = _product_bounds_div100(
+                        after_max_arr[a] + slot1_worst_max[a],
+                        after_max_arr[a] + slot1_best_max[a],
+                        after_max_arr[b] + slot1_worst_max[b],
+                        after_max_arr[b] + slot1_best_max[b],
+                    )
+                    pmin_lo, pmin_hi = _product_bounds_div100(
+                        after_min_arr[a] + slot1_worst_min[a],
+                        after_min_arr[a] + slot1_best_min[a],
+                        after_min_arr[b] + slot1_worst_min[b],
+                        after_min_arr[b] + slot1_best_min[b],
+                    )
                 elif f == FORMULA_RAW_TO_PCT:
-                    pmax_lo, pmax_hi = _raw_to_pct_bounds(a_max_lo, a_max_hi, b_max_lo, b_max_hi)
-                    pmin_lo, pmin_hi = _raw_to_pct_bounds(a_min_lo, a_min_hi, b_min_lo, b_min_hi)
+                    a = comp_dep_indices[off]
+                    b = comp_dep_indices[off + 1]
+                    pmax_lo, pmax_hi = _raw_to_pct_bounds(
+                        after_max_arr[a] + slot1_worst_max[a],
+                        after_max_arr[a] + slot1_best_max[a],
+                        after_max_arr[b] + slot1_worst_max[b],
+                        after_max_arr[b] + slot1_best_max[b],
+                    )
+                    pmin_lo, pmin_hi = _raw_to_pct_bounds(
+                        after_min_arr[a] + slot1_worst_min[a],
+                        after_min_arr[a] + slot1_best_min[a],
+                        after_min_arr[b] + slot1_worst_min[b],
+                        after_min_arr[b] + slot1_best_min[b],
+                    )
                 elif f == FORMULA_EHP:
+                    a = comp_dep_indices[off]
+                    b = comp_dep_indices[off + 1]
                     cc = comp_dep_indices[off + 2]
-                    c_max_lo = after_max_arr[cc] + slot1_worst_max[cc]
-                    c_max_hi = after_max_arr[cc] + slot1_best_max[cc]
-                    c_min_lo = after_min_arr[cc] + slot1_worst_min[cc]
-                    c_min_hi = after_min_arr[cc] + slot1_best_min[cc]
-                    pmax_lo, pmax_hi = _ehp_bounds(a_max_lo, a_max_hi, b_max_lo, b_max_hi, c_max_lo, c_max_hi)
-                    pmin_lo, pmin_hi = _ehp_bounds(a_min_lo, a_min_hi, b_min_lo, b_min_hi, c_min_lo, c_min_hi)
-                else:  # FORMULA_EHPR
+                    pmax_lo, pmax_hi = _ehp_bounds(
+                        after_max_arr[a] + slot1_worst_max[a],
+                        after_max_arr[a] + slot1_best_max[a],
+                        after_max_arr[b] + slot1_worst_max[b],
+                        after_max_arr[b] + slot1_best_max[b],
+                        after_max_arr[cc] + slot1_worst_max[cc],
+                        after_max_arr[cc] + slot1_best_max[cc],
+                    )
+                    pmin_lo, pmin_hi = _ehp_bounds(
+                        after_min_arr[a] + slot1_worst_min[a],
+                        after_min_arr[a] + slot1_best_min[a],
+                        after_min_arr[b] + slot1_worst_min[b],
+                        after_min_arr[b] + slot1_best_min[b],
+                        after_min_arr[cc] + slot1_worst_min[cc],
+                        after_min_arr[cc] + slot1_best_min[cc],
+                    )
+                elif f == FORMULA_EHPR:
+                    a = comp_dep_indices[off]
+                    b = comp_dep_indices[off + 1]
                     cc = comp_dep_indices[off + 2]
                     dd = comp_dep_indices[off + 3]
-                    c_max_lo = after_max_arr[cc] + slot1_worst_max[cc]
-                    c_max_hi = after_max_arr[cc] + slot1_best_max[cc]
-                    d_max_lo = after_max_arr[dd] + slot1_worst_max[dd]
-                    d_max_hi = after_max_arr[dd] + slot1_best_max[dd]
-                    c_min_lo = after_min_arr[cc] + slot1_worst_min[cc]
-                    c_min_hi = after_min_arr[cc] + slot1_best_min[cc]
-                    d_min_lo = after_min_arr[dd] + slot1_worst_min[dd]
-                    d_min_hi = after_min_arr[dd] + slot1_best_min[dd]
                     pmax_lo, pmax_hi = _ehpr_bounds(
-                        a_max_lo, a_max_hi, b_max_lo, b_max_hi,
-                        c_max_lo, c_max_hi, d_max_lo, d_max_hi,
+                        after_max_arr[a] + slot1_worst_max[a],
+                        after_max_arr[a] + slot1_best_max[a],
+                        after_max_arr[b] + slot1_worst_max[b],
+                        after_max_arr[b] + slot1_best_max[b],
+                        after_max_arr[cc] + slot1_worst_max[cc],
+                        after_max_arr[cc] + slot1_best_max[cc],
+                        after_max_arr[dd] + slot1_worst_max[dd],
+                        after_max_arr[dd] + slot1_best_max[dd],
                     )
                     pmin_lo, pmin_hi = _ehpr_bounds(
-                        a_min_lo, a_min_hi, b_min_lo, b_min_hi,
-                        c_min_lo, c_min_hi, d_min_lo, d_min_hi,
+                        after_min_arr[a] + slot1_worst_min[a],
+                        after_min_arr[a] + slot1_best_min[a],
+                        after_min_arr[b] + slot1_worst_min[b],
+                        after_min_arr[b] + slot1_best_min[b],
+                        after_min_arr[cc] + slot1_worst_min[cc],
+                        after_min_arr[cc] + slot1_best_min[cc],
+                        after_min_arr[dd] + slot1_worst_min[dd],
+                        after_min_arr[dd] + slot1_best_min[dd],
                     )
+                else:  # spell composite
+                    spell_id = f - FORMULA_SPELL_DAMAGE_BASE
+                    if spell_id == _SPELL_METEOR:
+                        pmax_lo, pmax_hi = _meteor_k2_ub_branch(
+                            off, comp_dep_indices, after_max_arr,
+                            slot1_worst_max, slot1_best_max, build_ctx,
+                        )
+                        pmin_lo, pmin_hi = _meteor_k2_ub_branch(
+                            off, comp_dep_indices, after_min_arr,
+                            slot1_worst_min, slot1_best_min, build_ctx,
+                        )
+                    else:
+                        pmax_lo = np.int64(0); pmax_hi = np.int64(0)
+                        pmin_lo = np.int64(0); pmin_hi = np.int64(0)
 
                 if w > 0.0:
                     ub_score += w * (pmax_hi * 0.99 + pmin_hi * 0.01)
@@ -1032,22 +1310,28 @@ def _search_meta_batch_k2(
                 for c in range(comp_count):
                     off = comp_dep_offset[c]
                     f = comp_formula[c]
-                    a = comp_dep_indices[off]
-                    b = comp_dep_indices[off + 1]
                     if f == FORMULA_MUL_DIV_100:
+                        a = comp_dep_indices[off]
+                        b = comp_dep_indices[off + 1]
                         cmax = (np.int64(final_max_arr[a]) * np.int64(final_max_arr[b])) // 100
                         cmin = (np.int64(final_min_arr[a]) * np.int64(final_min_arr[b])) // 100
                     elif f == FORMULA_RAW_TO_PCT:
+                        a = comp_dep_indices[off]
+                        b = comp_dep_indices[off + 1]
                         cmax = _raw_to_pct(final_max_arr[a], final_max_arr[b])
                         cmin = _raw_to_pct(final_min_arr[a], final_min_arr[b])
                     elif f == FORMULA_EHP:
+                        a = comp_dep_indices[off]
+                        b = comp_dep_indices[off + 1]
                         cc = comp_dep_indices[off + 2]
                         cmin, cmax = _ehp_bounds(
                             final_min_arr[a], final_max_arr[a],
                             final_min_arr[b], final_max_arr[b],
                             final_min_arr[cc], final_max_arr[cc],
                         )
-                    else:  # FORMULA_EHPR
+                    elif f == FORMULA_EHPR:
+                        a = comp_dep_indices[off]
+                        b = comp_dep_indices[off + 1]
                         cc = comp_dep_indices[off + 2]
                         dd = comp_dep_indices[off + 3]
                         cmin, cmax = _ehpr_bounds(
@@ -1056,6 +1340,15 @@ def _search_meta_batch_k2(
                             final_min_arr[cc], final_max_arr[cc],
                             final_min_arr[dd], final_max_arr[dd],
                         )
+                    else:  # spell composite
+                        spell_id = f - FORMULA_SPELL_DAMAGE_BASE
+                        if spell_id == _SPELL_METEOR:
+                            cmin, cmax = _meteor_leaf(
+                                off, comp_dep_indices, final_min_arr, final_max_arr, build_ctx,
+                            )
+                        else:
+                            cmin = np.int64(0)
+                            cmax = np.int64(0)
                     if comp_has_min[c] and cmax < comp_min[c]:
                         feasible = False
                         break
@@ -1133,6 +1426,7 @@ def search_meta_batch(
     comp_has_min,
     comp_has_max,
     comp_weight,
+    build_ctx,
 ):
     M = ings_matrix.shape[0]
     k = void_count
@@ -1194,6 +1488,7 @@ def search_meta_batch(
             comp_has_min,
             comp_has_max,
             comp_weight,
+            build_ctx,
         )
 
         best_scores[m] = best_score_ref[0]
@@ -1252,6 +1547,7 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             query.comp_has_min,
             query.comp_has_max,
             query.comp_weight,
+            query.build_ctx,
         )
         total_searched[0] += added
         return score, meta_index, sol
@@ -1281,6 +1577,7 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             query.comp_has_min,
             query.comp_has_max,
             query.comp_weight,
+            query.build_ctx,
         )
         total_searched[0] += added
         return score, meta_index, sol
@@ -1316,6 +1613,7 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
         query.comp_has_min,
         query.comp_has_max,
         query.comp_weight,
+        query.build_ctx,
     )
 
 

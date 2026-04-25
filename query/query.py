@@ -26,6 +26,12 @@ from data.stats import (
     FORMULA_RAW_TO_PCT,
     FORMULA_EHP,
     FORMULA_EHPR,
+    FORMULA_SPELL_DAMAGE_BASE,
+)
+from data.spells import ATK_SPEED_MULT, SPELL_COUNT
+from data.skillpoint_lookup import (
+    SKP_HEADLINE_PCT,
+    SKP_STR, SKP_DEX, SKP_INT, SKP_DEF, SKP_AGI, SKP_MAX,
 )
 
 
@@ -39,13 +45,53 @@ _FORMULA_TAGS = {
 # Arity per formula tag — used by the parser to validate dep counts.
 # Variable-arity formulas (e.g., spell composites) declare their arity
 # dynamically in DERIVED_DEPENDENCIES; the parser checks `len(deps) ==
-# _FORMULA_ARITY[tag]` for fixed-arity formulas.
+# _FORMULA_ARITY[tag]` for fixed-arity formulas, and skips this check for
+# spell composites (their arity is whatever DERIVED_DEPENDENCIES declares).
 _FORMULA_ARITY = {
     FORMULA_MUL_DIV_100: 2,
     FORMULA_RAW_TO_PCT: 2,
     FORMULA_EHP: 3,
     FORMULA_EHPR: 4,
 }
+
+
+# Build context layout (numpy float64 array passed to numba kernels).
+# Indices are stable; the spell evaluator reads via these constants.
+BUILD_CTX_STR_PCT = 0     # skillPointsToPercentage(str) * 1.0
+BUILD_CTX_DEX_PCT = 1     # skillPointsToPercentage(dex) * 1.0
+BUILD_CTX_INT_PCT = 2     # skillPointsToPercentage(int) * final_mult[2] (~0.619)
+BUILD_CTX_DEF_PCT = 3     # ... * 0.867
+BUILD_CTX_AGI_PCT = 4     # ... * 0.951
+BUILD_CTX_ATK_SPD = 5     # baseDamageMultiplier[atk_speed]
+BUILD_CTX_CRIT_PCT = 6    # crit damage % (default 0)
+BUILD_CTX_SIZE = 7
+
+
+def _build_ctx_array(ctx_dict):
+    """
+    Build the float64 build-context array consumed by spell evaluators.
+    `ctx_dict` is the user's `_context` entry, e.g.
+        {"str": 80, "dex": 0, "int": 100, "def": 0, "agi": 40,
+         "atk_speed": "NORMAL", "crit_dam_pct": 0}
+    All keys optional; defaults: skillpoints=0, atk_speed="NORMAL", crit=0.
+    """
+    arr = np.zeros(BUILD_CTX_SIZE, dtype=np.float64)
+    if ctx_dict:
+        for skp_name, skp_idx in (("str", SKP_STR), ("dex", SKP_DEX),
+                                   ("int", SKP_INT), ("def", SKP_DEF),
+                                   ("agi", SKP_AGI)):
+            count = int(ctx_dict.get(skp_name, 0))
+            if count < 0:
+                count = 0
+            elif count > SKP_MAX:
+                count = SKP_MAX
+            arr[skp_idx] = float(SKP_HEADLINE_PCT[skp_idx, count])
+        atk_speed = ctx_dict.get("atk_speed", "NORMAL")
+        arr[BUILD_CTX_ATK_SPD] = float(ATK_SPEED_MULT.get(atk_speed, ATK_SPEED_MULT["NORMAL"]))
+        arr[BUILD_CTX_CRIT_PCT] = float(ctx_dict.get("crit_dam_pct", 0))
+    else:
+        arr[BUILD_CTX_ATK_SPD] = ATK_SPEED_MULT["NORMAL"]
+    return arr
 
 
 class Query(NamedTuple):
@@ -87,6 +133,10 @@ class Query(NamedTuple):
     # Projected-space index of durability (crafted) or duration (consumable).
     # -1 if neither is active — search will abort in that case.
     dura_proj_idx: int
+
+    # Build-context constants (skillpoint percentages, atk_speed mult, crit pct)
+    # passed verbatim to numba kernels. See BUILD_CTX_* indices above.
+    build_ctx: np.ndarray  # float64[BUILD_CTX_SIZE]
 
     # Composite (derived) stats — Struct-of-Arrays for numba passage.
     # All indexed 0..comp_count-1. Dep indices are stored in a flat array,
@@ -148,11 +198,21 @@ def build_query(
     explicit_base_set = np.zeros(STAT_COUNT, dtype=np.bool_)
 
     # ------------------------------------------------------------
+    # Build context (skillpoints, atk speed, crit) — query-level constants
+    # used by spell composites. Pulled out of user_json before stat parsing.
+    # ------------------------------------------------------------
+    build_ctx_dict = user_json.get("_context") if isinstance(user_json, dict) else None
+    build_ctx_arr = _build_ctx_array(build_ctx_dict)
+
+    # ------------------------------------------------------------
     # Pass 1: non-composite (base) stats
     # ------------------------------------------------------------
     composite_entries = []
 
     for stat_name, config in user_json.items():
+
+        if stat_name == "_context":
+            continue  # already consumed
 
         deps = DERIVED_DEPENDENCIES.get(stat_name)
 
@@ -232,15 +292,26 @@ def build_query(
                 )
 
         formula_name = DERIVED_FORMULA.get(stat_name)
-        formula_tag = _FORMULA_TAGS.get(formula_name)
-        if formula_tag is None:
-            continue
-        expected_arity = _FORMULA_ARITY[formula_tag]
-        if len(deps) != expected_arity:
-            raise ValueError(
-                f"Composite '{stat_name}' formula '{formula_name}' expects "
-                f"{expected_arity} deps, got {len(deps)}: {deps}"
-            )
+        # Tuple form (variable-arity formulas, e.g. ("spell", spell_id)).
+        if isinstance(formula_name, tuple) and formula_name and formula_name[0] == "spell":
+            spell_id = int(formula_name[1])
+            if not (0 <= spell_id < SPELL_COUNT):
+                raise ValueError(
+                    f"Composite '{stat_name}': spell_id {spell_id} out of range "
+                    f"(have {SPELL_COUNT} spells defined)."
+                )
+            formula_tag = FORMULA_SPELL_DAMAGE_BASE + spell_id
+            # Spells declare arity via DERIVED_DEPENDENCIES — no further check.
+        else:
+            formula_tag = _FORMULA_TAGS.get(formula_name)
+            if formula_tag is None:
+                continue
+            expected_arity = _FORMULA_ARITY[formula_tag]
+            if len(deps) != expected_arity:
+                raise ValueError(
+                    f"Composite '{stat_name}' formula '{formula_name}' expects "
+                    f"{expected_arity} deps, got {len(deps)}: {deps}"
+                )
 
         # Activate dependency stats + apply DEFAULT_BASE if not overridden.
         for dep in deps:
@@ -399,6 +470,7 @@ def build_query(
         consumable=consumable,
         suggested_max_cull=suggested_max_cull,
         dura_proj_idx=dura_proj_idx,
+        build_ctx=build_ctx_arr,
         comp_count=comp_count,
         comp_formula=comp_formula_arr,
         comp_dep_offset=comp_dep_offset,

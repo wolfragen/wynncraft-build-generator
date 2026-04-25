@@ -98,12 +98,17 @@ DERIVED_STATS = (
     "hpr",
     "ehp",
     "ehpr",
+    "mage_meteor",
 )
 
 DERIVED_DEPENDENCIES = {
     "hpr": ("hprRaw", "hprPct"),
     "ehp": ("hpBonus", "def", "agi"),
     "ehpr": ("hprRaw", "hprPct", "def", "agi"),
+    # Spell composites: dep order is fixed per spell, defined in data/spells.py
+    # (mirrored here so the parser doesn't need to import that module).
+    "mage_meteor": ("nDamRaw", "sdPct", "sdRaw", "damPct",
+                    "eDamPct", "eSdPct", "eSdRaw"),
 }
 
 # Formula tag per derived stat. Mapped to int in query.py for numba passage.
@@ -119,10 +124,15 @@ DERIVED_DEPENDENCIES = {
 #                   def_pct, agi_pct from SKP_HEADLINE_PCT lookup, clamped 0..150.
 #   "ehpr"        (arity 4): rawToPct(hprRaw, hprPct) / (1 - (1 - agi_pct) * def_pct)
 #                   Same simplifications as ehp.
+#   ("spell", N)  (variable arity): per-spell damage formula, where N is the
+#                 spell_id from data.spells.SPELL_INDEX. The formula tag stored
+#                 on the composite is FORMULA_SPELL_DAMAGE_BASE + N. Build-context
+#                 (skillpoints, atk_speed, crit) supplied via _context in query.
 DERIVED_FORMULA = {
     "hpr": "raw_to_pct",
     "ehp": "ehp",
     "ehpr": "ehpr",
+    "mage_meteor": ("spell", 0),
 }
 
 # Stats whose "empty" value is non-zero (i.e. a fresh item already has them).
@@ -135,6 +145,9 @@ FORMULA_MUL_DIV_100 = 0
 FORMULA_RAW_TO_PCT = 1
 FORMULA_EHP = 2
 FORMULA_EHPR = 3
+# Spell formulas: tag = FORMULA_SPELL_DAMAGE_BASE + spell_id. Choose a value
+# well above the fixed-tag range so kernels can branch via `f >= base`.
+FORMULA_SPELL_DAMAGE_BASE = 100
 
 # ============================================================
 # CONSU SKILLS
