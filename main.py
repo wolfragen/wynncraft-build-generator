@@ -29,25 +29,113 @@ def main():
 
     # ---------- Build User Query ----------
     user_query = {
-        # "mr": {"min": 1, "weight": 10000, "ingredient_filter": True},
-        # "ehp":  {"weight": 50, "ingredient_filter": True},
-        "ehpr": {"min": 1, "weight": 100, "ingredient_filter": True},
-        # "str": {"min": 1, "ingredient_filter": True},
-        # "dex": {"min": 1, "ingredient_filter": True},
-        # "int": {"min": 1, "ingredient_filter": True},
-        # "def": {"min": 1, "ingredient_filter": True},
-        # "agi": {"min": 1, "ingredient_filter": True},
+        # ===== Skill Points =====
+        # "str": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "dex": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "int": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "def": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "agi": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== Skill Point Requirements =====
         "strReq": {"max": 100, "ingredient_filter": True},
         "dexReq": {"max": 100, "ingredient_filter": True},
         "intReq": {"max": 100, "ingredient_filter": True},
         "defReq": {"max": 100, "ingredient_filter": True},
         "agiReq": {"max": 100, "ingredient_filter": True},
+
+        # ===== Health / Mana / Regen =====
+        # "hpBonus":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "hprRaw":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "hprPct":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "mr":       {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "ms":       {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "maxMana":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "ls":       {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "healPct":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== Derived (Composite) =====
+        "ehp":  {"min": 0, "weight": 50, "ingredient_filter": True},
+        # "ehpr": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "hpr":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== General Damage =====
+        # "damPct":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "mdPct":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "mdRaw":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "sdPct":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "sdRaw":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "nDamRaw": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "nMdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "atkTier": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== Earth =====
+        # "eDamPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "eMdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "eSdPct":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "eSdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "eDefPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "eSteal":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== Thunder =====
+        # "tDamPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "tDamRaw": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "tMdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "tDefPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== Water =====
+        # "wDamPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "wDamRaw": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "wMdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "wSdPct":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "wSdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "wDefPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== Fire =====
+        # "fDamPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "fDamRaw": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "fMdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "fSdPct":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "fSdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "fDefPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== Air =====
+        # "aDamPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "aDamRaw": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "aDefPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "aSdPct":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== Rainbow =====
+        # "rDamPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "rDefPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== Misc Damage / Defense =====
+        # "poison": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "thorns": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "ref":    {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== Movement =====
+        # "spd":       {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "jh":        {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "sprint":    {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "sprintReg": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== Misc =====
+        # "lb":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "lq":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "xpb":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "gSpd": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "gXp":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "expd": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "kb":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
+        # ===== Special =====
         "durability": {"min": 40, "weight": 1},
-        # "charges": {"min": 3},
+        # "duration": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "charges":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
     }
 
-    skill = "WEAPONSMITHING"
-    item_type = "SPEAR"
+    skill = "WOODWORKING"
+    item_type = "WAND"
     consumable = skill in CONSU_SKILLS
     
     # ---------- Build Query Object ----------
