@@ -51,10 +51,9 @@ _DFS_SIG = types.void(
     types.int32[:, ::1],      # future_min_lb
     types.int64,              # comp_count
     types.int32[::1],         # comp_formula
-    types.int32[::1],         # comp_dep_a_proj
-    types.int32[::1],         # comp_dep_b_proj
-    types.int32[::1],         # comp_dep_c_proj
-    types.int32[::1],         # comp_dep_d_proj
+    types.int32[::1],         # comp_dep_offset
+    types.int32[::1],         # comp_dep_count
+    types.int32[::1],         # comp_dep_indices (flat)
     types.int32[::1],         # comp_min
     types.int32[::1],         # comp_max
     types.Array(types.bool_, 1, "C"),  # comp_has_min
@@ -388,10 +387,9 @@ def dfs(
     future_min_lb,
     comp_count,
     comp_formula,
-    comp_dep_a_proj,
-    comp_dep_b_proj,
-    comp_dep_c_proj,
-    comp_dep_d_proj,
+    comp_dep_offset,
+    comp_dep_count,
+    comp_dep_indices,
     comp_min,
     comp_max,
     comp_has_min,
@@ -422,9 +420,10 @@ def dfs(
         # Composite stats: compute on the finalized build, check constraints,
         # add weighted contribution.
         for c in range(comp_count):
-            a = comp_dep_a_proj[c]
-            b = comp_dep_b_proj[c]
+            off = comp_dep_offset[c]
             f = comp_formula[c]
+            a = comp_dep_indices[off]
+            b = comp_dep_indices[off + 1]
             if f == FORMULA_MUL_DIV_100:
                 cmax = (np.int64(current_max[a]) * np.int64(current_max[b])) // 100
                 cmin = (np.int64(current_min[a]) * np.int64(current_min[b])) // 100
@@ -432,15 +431,15 @@ def dfs(
                 cmax = _raw_to_pct(current_max[a], current_max[b])
                 cmin = _raw_to_pct(current_min[a], current_min[b])
             elif f == FORMULA_EHP:
-                cc = comp_dep_c_proj[c]
+                cc = comp_dep_indices[off + 2]
                 cmin, cmax = _ehp_bounds(
                     current_min[a], current_max[a],
                     current_min[b], current_max[b],
                     current_min[cc], current_max[cc],
                 )
             else:  # FORMULA_EHPR
-                cc = comp_dep_c_proj[c]
-                dd = comp_dep_d_proj[c]
+                cc = comp_dep_indices[off + 2]
+                dd = comp_dep_indices[off + 3]
                 cmin, cmax = _ehpr_bounds(
                     current_min[a], current_max[a],
                     current_min[b], current_max[b],
@@ -544,12 +543,13 @@ def dfs(
         # using the (current_*[s] + future_*_*[next_depth, s]) range for each dep.
         # Loose vs true joint feasible set, but correct.
         for c in range(comp_count):
-            a = comp_dep_a_proj[c]
-            b = comp_dep_b_proj[c]
             w = comp_weight[c]
             if w == 0.0:
                 continue
+            off = comp_dep_offset[c]
             f = comp_formula[c]
+            a = comp_dep_indices[off]
+            b = comp_dep_indices[off + 1]
 
             a_max_lo = current_max[a] + future_max_lb[next_depth, a]
             a_max_hi = current_max[a] + future_max_ub[next_depth, a]
@@ -567,7 +567,7 @@ def dfs(
                 pmax_lo, pmax_hi = _raw_to_pct_bounds(a_max_lo, a_max_hi, b_max_lo, b_max_hi)
                 pmin_lo, pmin_hi = _raw_to_pct_bounds(a_min_lo, a_min_hi, b_min_lo, b_min_hi)
             elif f == FORMULA_EHP:
-                cc = comp_dep_c_proj[c]
+                cc = comp_dep_indices[off + 2]
                 c_max_lo = current_max[cc] + future_max_lb[next_depth, cc]
                 c_max_hi = current_max[cc] + future_max_ub[next_depth, cc]
                 c_min_lo = current_min[cc] + future_min_lb[next_depth, cc]
@@ -575,8 +575,8 @@ def dfs(
                 pmax_lo, pmax_hi = _ehp_bounds(a_max_lo, a_max_hi, b_max_lo, b_max_hi, c_max_lo, c_max_hi)
                 pmin_lo, pmin_hi = _ehp_bounds(a_min_lo, a_min_hi, b_min_lo, b_min_hi, c_min_lo, c_min_hi)
             else:  # FORMULA_EHPR
-                cc = comp_dep_c_proj[c]
-                dd = comp_dep_d_proj[c]
+                cc = comp_dep_indices[off + 2]
+                dd = comp_dep_indices[off + 3]
                 c_max_lo = current_max[cc] + future_max_lb[next_depth, cc]
                 c_max_hi = current_max[cc] + future_max_ub[next_depth, cc]
                 d_max_lo = current_max[dd] + future_max_lb[next_depth, dd]
@@ -649,10 +649,9 @@ def dfs(
             future_min_lb,
             comp_count,
             comp_formula,
-            comp_dep_a_proj,
-            comp_dep_b_proj,
-            comp_dep_c_proj,
-            comp_dep_d_proj,
+            comp_dep_offset,
+            comp_dep_count,
+            comp_dep_indices,
             comp_min,
             comp_max,
             comp_has_min,
@@ -695,10 +694,9 @@ def _search_meta_batch_k1(
     init_best_score,
     comp_count,
     comp_formula,
-    comp_dep_a_proj,
-    comp_dep_b_proj,
-    comp_dep_c_proj,
-    comp_dep_d_proj,
+    comp_dep_offset,
+    comp_dep_count,
+    comp_dep_indices,
     comp_min,
     comp_max,
     comp_has_min,
@@ -750,9 +748,10 @@ def _search_meta_batch_k1(
 
             # Composite constraint + score
             for c in range(comp_count):
-                a = comp_dep_a_proj[c]
-                b = comp_dep_b_proj[c]
+                off = comp_dep_offset[c]
                 f = comp_formula[c]
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
                 if f == FORMULA_MUL_DIV_100:
                     cmax = (np.int64(final_max[a]) * np.int64(final_max[b])) // 100
                     cmin = (np.int64(final_min[a]) * np.int64(final_min[b])) // 100
@@ -760,15 +759,15 @@ def _search_meta_batch_k1(
                     cmax = _raw_to_pct(final_max[a], final_max[b])
                     cmin = _raw_to_pct(final_min[a], final_min[b])
                 elif f == FORMULA_EHP:
-                    cc = comp_dep_c_proj[c]
+                    cc = comp_dep_indices[off + 2]
                     cmin, cmax = _ehp_bounds(
                         final_min[a], final_max[a],
                         final_min[b], final_max[b],
                         final_min[cc], final_max[cc],
                     )
                 else:  # FORMULA_EHPR
-                    cc = comp_dep_c_proj[c]
-                    dd = comp_dep_d_proj[c]
+                    cc = comp_dep_indices[off + 2]
+                    dd = comp_dep_indices[off + 3]
                     cmin, cmax = _ehpr_bounds(
                         final_min[a], final_max[a],
                         final_min[b], final_max[b],
@@ -837,10 +836,9 @@ def _search_meta_batch_k2(
     init_best_score,
     comp_count,
     comp_formula,
-    comp_dep_a_proj,
-    comp_dep_b_proj,
-    comp_dep_c_proj,
-    comp_dep_d_proj,
+    comp_dep_offset,
+    comp_dep_count,
+    comp_dep_indices,
     comp_min,
     comp_max,
     comp_has_min,
@@ -939,12 +937,13 @@ def _search_meta_batch_k2(
 
             # Composite UB: per-formula bound on [after_* + slot1_{worst,best}_*] rectangle.
             for c in range(comp_count):
-                a = comp_dep_a_proj[c]
-                b = comp_dep_b_proj[c]
                 w = comp_weight[c]
                 if w == 0.0:
                     continue
+                off = comp_dep_offset[c]
                 f = comp_formula[c]
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
 
                 a_max_lo = after_max_arr[a] + slot1_worst_max[a]
                 a_max_hi = after_max_arr[a] + slot1_best_max[a]
@@ -962,7 +961,7 @@ def _search_meta_batch_k2(
                     pmax_lo, pmax_hi = _raw_to_pct_bounds(a_max_lo, a_max_hi, b_max_lo, b_max_hi)
                     pmin_lo, pmin_hi = _raw_to_pct_bounds(a_min_lo, a_min_hi, b_min_lo, b_min_hi)
                 elif f == FORMULA_EHP:
-                    cc = comp_dep_c_proj[c]
+                    cc = comp_dep_indices[off + 2]
                     c_max_lo = after_max_arr[cc] + slot1_worst_max[cc]
                     c_max_hi = after_max_arr[cc] + slot1_best_max[cc]
                     c_min_lo = after_min_arr[cc] + slot1_worst_min[cc]
@@ -970,8 +969,8 @@ def _search_meta_batch_k2(
                     pmax_lo, pmax_hi = _ehp_bounds(a_max_lo, a_max_hi, b_max_lo, b_max_hi, c_max_lo, c_max_hi)
                     pmin_lo, pmin_hi = _ehp_bounds(a_min_lo, a_min_hi, b_min_lo, b_min_hi, c_min_lo, c_min_hi)
                 else:  # FORMULA_EHPR
-                    cc = comp_dep_c_proj[c]
-                    dd = comp_dep_d_proj[c]
+                    cc = comp_dep_indices[off + 2]
+                    dd = comp_dep_indices[off + 3]
                     c_max_lo = after_max_arr[cc] + slot1_worst_max[cc]
                     c_max_hi = after_max_arr[cc] + slot1_best_max[cc]
                     d_max_lo = after_max_arr[dd] + slot1_worst_max[dd]
@@ -1031,9 +1030,10 @@ def _search_meta_batch_k2(
 
                 # Composite constraint + score on the finalized k=2 build.
                 for c in range(comp_count):
-                    a = comp_dep_a_proj[c]
-                    b = comp_dep_b_proj[c]
+                    off = comp_dep_offset[c]
                     f = comp_formula[c]
+                    a = comp_dep_indices[off]
+                    b = comp_dep_indices[off + 1]
                     if f == FORMULA_MUL_DIV_100:
                         cmax = (np.int64(final_max_arr[a]) * np.int64(final_max_arr[b])) // 100
                         cmin = (np.int64(final_min_arr[a]) * np.int64(final_min_arr[b])) // 100
@@ -1041,15 +1041,15 @@ def _search_meta_batch_k2(
                         cmax = _raw_to_pct(final_max_arr[a], final_max_arr[b])
                         cmin = _raw_to_pct(final_min_arr[a], final_min_arr[b])
                     elif f == FORMULA_EHP:
-                        cc = comp_dep_c_proj[c]
+                        cc = comp_dep_indices[off + 2]
                         cmin, cmax = _ehp_bounds(
                             final_min_arr[a], final_max_arr[a],
                             final_min_arr[b], final_max_arr[b],
                             final_min_arr[cc], final_max_arr[cc],
                         )
                     else:  # FORMULA_EHPR
-                        cc = comp_dep_c_proj[c]
-                        dd = comp_dep_d_proj[c]
+                        cc = comp_dep_indices[off + 2]
+                        dd = comp_dep_indices[off + 3]
                         cmin, cmax = _ehpr_bounds(
                             final_min_arr[a], final_max_arr[a],
                             final_min_arr[b], final_max_arr[b],
@@ -1125,10 +1125,9 @@ def search_meta_batch(
     init_best_score,
     comp_count,
     comp_formula,
-    comp_dep_a_proj,
-    comp_dep_b_proj,
-    comp_dep_c_proj,
-    comp_dep_d_proj,
+    comp_dep_offset,
+    comp_dep_count,
+    comp_dep_indices,
     comp_min,
     comp_max,
     comp_has_min,
@@ -1187,10 +1186,9 @@ def search_meta_batch(
             future_min_lb,
             comp_count,
             comp_formula,
-            comp_dep_a_proj,
-            comp_dep_b_proj,
-            comp_dep_c_proj,
-            comp_dep_d_proj,
+            comp_dep_offset,
+            comp_dep_count,
+            comp_dep_indices,
             comp_min,
             comp_max,
             comp_has_min,
@@ -1246,10 +1244,9 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             best_score,
             query.comp_count,
             query.comp_formula,
-            query.comp_dep_a_proj,
-            query.comp_dep_b_proj,
-            query.comp_dep_c_proj,
-            query.comp_dep_d_proj,
+            query.comp_dep_offset,
+            query.comp_dep_count,
+            query.comp_dep_indices,
             query.comp_min,
             query.comp_max,
             query.comp_has_min,
@@ -1276,10 +1273,9 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             best_score,
             query.comp_count,
             query.comp_formula,
-            query.comp_dep_a_proj,
-            query.comp_dep_b_proj,
-            query.comp_dep_c_proj,
-            query.comp_dep_d_proj,
+            query.comp_dep_offset,
+            query.comp_dep_count,
+            query.comp_dep_indices,
             query.comp_min,
             query.comp_max,
             query.comp_has_min,
@@ -1312,10 +1308,9 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
         best_score,
         query.comp_count,
         query.comp_formula,
-        query.comp_dep_a_proj,
-        query.comp_dep_b_proj,
-        query.comp_dep_c_proj,
-        query.comp_dep_d_proj,
+        query.comp_dep_offset,
+        query.comp_dep_count,
+        query.comp_dep_indices,
         query.comp_min,
         query.comp_max,
         query.comp_has_min,

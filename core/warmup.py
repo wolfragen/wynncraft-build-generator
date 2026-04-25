@@ -75,13 +75,12 @@ def _warm_search_engine():
     total_searched = np.zeros(1, dtype=np.int64)
 
     # One composite per warmup pass; positive weight ensures w>0 UB branches
-    # compile. The dep_c/d arrays point at valid stat indices for every formula
-    # so even arity-2 formulas don't OOB-read these slots.
+    # compile. Flat dep_indices contains 4 entries [0,1,2,3] so any formula
+    # arity (2/3/4) can read its slots without OOB.
     comp_count = 1
-    comp_dep_a = np.array([0], dtype=np.int32)
-    comp_dep_b = np.array([1], dtype=np.int32)
-    comp_dep_c = np.array([2], dtype=np.int32)
-    comp_dep_d = np.array([3], dtype=np.int32)
+    comp_dep_indices = np.array([0, 1, 2, 3], dtype=np.int32)
+    comp_dep_offset = np.array([0], dtype=np.int32)
+    comp_dep_count = np.array([4], dtype=np.int32)  # max arity, individual formulas read fewer
     comp_min = np.zeros(1, dtype=np.int32)
     comp_max = np.zeros(1, dtype=np.int32)
     comp_has_min = np.zeros(1, dtype=np.bool_)
@@ -101,7 +100,7 @@ def _warm_search_engine():
             min_vals, max_vals, weights, total_searched,
             -1e18,
             comp_count, comp_formula,
-            comp_dep_a, comp_dep_b, comp_dep_c, comp_dep_d,
+            comp_dep_offset, comp_dep_count, comp_dep_indices,
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
         )
 
@@ -111,7 +110,7 @@ def _warm_search_engine():
             has_min_mask, has_max_mask, min_vals, max_vals, weights,
             -1e18,
             comp_count, comp_formula,
-            comp_dep_a, comp_dep_b, comp_dep_c, comp_dep_d,
+            comp_dep_offset, comp_dep_count, comp_dep_indices,
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
         )
 
@@ -121,6 +120,6 @@ def _warm_search_engine():
             has_min_mask, has_max_mask, min_vals, max_vals, weights,
             -1e18,
             comp_count, comp_formula,
-            comp_dep_a, comp_dep_b, comp_dep_c, comp_dep_d,
+            comp_dep_offset, comp_dep_count, comp_dep_indices,
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
         )
