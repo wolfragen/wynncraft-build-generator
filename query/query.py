@@ -68,7 +68,21 @@ BUILD_CTX_BASE_DEF = 3
 BUILD_CTX_BASE_AGI = 4
 BUILD_CTX_ATK_SPD  = 5    # baseDamageMultiplier[atk_speed]
 BUILD_CTX_CRIT_PCT = 6    # crit damage % (default 0)
-BUILD_CTX_SIZE = 7
+# Weapon's intrinsic per-element damage (post-powder, pre-roll). Set by the
+# search pipeline from the recipe's healthOrDamage (when crafting a weapon)
+# or from a fixed loaded weapon (when filling around an existing build, see
+# `main_build_temp.py`). The spell kernel uses these for the m_n / m_e
+# conversions; deps[0..5] (xDamRaw stat values) are treated as gear ID raws
+# and added at step 5.2 only if the corresponding element is "present".
+# Element order matches `damage_elements = ['n'].concat(skp_elements)` in
+# wynnbuilder, i.e. N, E, T, W, F, A.
+BUILD_CTX_WD_N = 7
+BUILD_CTX_WD_E = 8
+BUILD_CTX_WD_T = 9
+BUILD_CTX_WD_W = 10
+BUILD_CTX_WD_F = 11
+BUILD_CTX_WD_A = 12
+BUILD_CTX_SIZE = 13
 
 
 def _build_ctx_array(ctx_dict):
@@ -97,6 +111,15 @@ def _build_ctx_array(ctx_dict):
         atk_speed = ctx_dict.get("atk_speed", "NORMAL")
         arr[BUILD_CTX_ATK_SPD] = float(ATK_SPEED_MULT.get(atk_speed, ATK_SPEED_MULT["NORMAL"]))
         arr[BUILD_CTX_CRIT_PCT] = float(ctx_dict.get("crit_dam_pct", 0))
+        # weapon_dam: optional 6-tuple (n, e, t, w, f, a) for builds with a
+        # fixed already-equipped weapon. Default 0 — search_pipelined will
+        # overlay recipe.weapon_dam_neutral when crafting a weapon directly.
+        weapon_dam = ctx_dict.get("weapon_dam")
+        if weapon_dam:
+            for i, slot in enumerate((BUILD_CTX_WD_N, BUILD_CTX_WD_E, BUILD_CTX_WD_T,
+                                       BUILD_CTX_WD_W, BUILD_CTX_WD_F, BUILD_CTX_WD_A)):
+                if i < len(weapon_dam):
+                    arr[slot] = float(weapon_dam[i])
     else:
         arr[BUILD_CTX_ATK_SPD] = ATK_SPEED_MULT["NORMAL"]
     return arr

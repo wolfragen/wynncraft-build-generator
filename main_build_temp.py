@@ -54,11 +54,29 @@ ITEM_ID_BITLEN = 13
 CUSTOM_STR_LENGTH_BITLEN = 12
 
 POWDERABLE_INDICES = {0, 1, 2, 3, 8}
-POWDER_ID_BITLEN = 5
+# v23 (= 2.1.6.0) uses 5 elements × 6 tiers = 30 powders → 5 bits per id.
+# Wynnbuilder-beta versions (v >= 24) ship with 7 tiers → 6 bits per id.
+# Resolved per-URL via `_powder_consts(data_version)` below.
 POWDER_REPEAT_OP_BITLEN = 1
 POWDER_REPEAT_TIER_OP_BITLEN = 1
 POWDER_CHANGE_OP_BITLEN = 1
 POWDER_WRAPPER_BITLEN = 2
+
+# Threshold at which the beta switches to 7 tiers / 6-bit ids.
+_BETA_POWDER_VERSION = 24
+
+
+def _powder_consts(data_version):
+    """Return (id_bitlen, num_tiers) for the given build URL data version."""
+    if data_version is not None and data_version >= _BETA_POWDER_VERSION:
+        return 6, 7
+    return 5, 6
+
+
+# Default tier count used when no per-slot value is available (e.g., the
+# user injected a slot dict by hand). Equals the length of `_POWDER_STATS`
+# per element; ids beyond this are mapped via `_powder_stats_lookup`.
+_KNOWN_POWDER_TIERS = 6
 
 # Crafted (encodeCraft v2)
 CRAFTED_VERSION_BITLEN = 7
@@ -95,26 +113,46 @@ class BitCursor:
         self.pos += n
 
 
-def _decode_powders(cursor):
-    """Walks the powder encoding, returning the powder count (we don't need
-    the actual powder ids — just the right number of bits consumed)."""
-    cursor.read(POWDER_ID_BITLEN)  # first powder
+POWDER_ELEMENTS = ("e", "t", "w", "f", "a")  # mirrors skp_elements in build_utils.js
+NUM_POWDER_ELEMENTS = len(POWDER_ELEMENTS)
+
+
+def _decode_powders(cursor, id_bitlen, num_tiers):
+    """
+    Walks the wynnbuilder powder encoding (mirrors `decodePowders` in
+    `build_encode_decode.js`) and returns the decoded list of powder ids.
+
+    `id_bitlen` and `num_tiers` are version-dependent (see `_powder_consts`).
+    Returned ids encode both element (id // num_tiers) and tier index
+    (id % num_tiers).
+    """
+    powders = [cursor.read(id_bitlen)]  # first powder
+    prev = powders[0]
     while True:
         op = cursor.read(POWDER_REPEAT_OP_BITLEN)
         if op == 0:  # REPEAT
+            powders.append(prev)
             continue
         # NO_REPEAT
         op2 = cursor.read(POWDER_REPEAT_TIER_OP_BITLEN)
-        if op2 == 0:  # REPEAT_TIER
-            cursor.read(POWDER_WRAPPER_BITLEN)
+        if op2 == 0:  # REPEAT_TIER — element shifts forward by `wrap+1`
+            wrap = cursor.read(POWDER_WRAPPER_BITLEN)
+            prev_elem = prev // num_tiers
+            prev_tier = prev % num_tiers
+            new_elem = (prev_elem + wrap + 1) % NUM_POWDER_ELEMENTS
+            powder = new_elem * num_tiers + prev_tier
+            powders.append(powder)
+            prev = powder
             continue
         # CHANGE_POWDER
         op3 = cursor.read(POWDER_CHANGE_OP_BITLEN)
         if op3 == 0:  # NEW_POWDER
-            cursor.read(POWDER_ID_BITLEN)
+            powder = cursor.read(id_bitlen)
+            powders.append(powder)
+            prev = powder
             continue
         # NEW_ITEM
-        return
+        return powders
 
 
 def _decode_crafted(cursor):
@@ -210,7 +248,18 @@ def decode_build_url(url, recipes_by_id):
         if i in POWDERABLE_INDICES:
             has_powders = cur.read(1)
             if has_powders:
-                _decode_powders(cur)
+                pwd_id_bits, pwd_tiers = _powder_consts(data_version)
+                powders = _decode_powders(cur, pwd_id_bits, pwd_tiers)
+                # User asked to take weapon powders into account during load.
+                # Other slots' powders (helmet/chestplate/leggings/boots) are
+                # decoded but not stored — adding their elemental defenses is
+                # out of scope for this generator.
+                if i == 8 and slots[-1] is not None:
+                    slots[-1]["powders"] = powders
+                    # Stash the tier system used so later code can interpret
+                    # the ids consistently (powder id 12 means W1 in 6-tier,
+                    # T6 in 7-tier — identical bytes, different semantics).
+                    slots[-1]["powder_tiers"] = pwd_tiers
 
     return data_version, slots
 
@@ -290,15 +339,47 @@ def crafted_to_url(crafted, recipes_by_id,
     return f"{base}{sep}{w.to_b64()}"
 
 
+def _emit_powders(writer, powders, id_bitlen, num_tiers):
+    """
+    Encode a list of powder ids using the same compact run/element scheme as
+    `encodePowders` in build_encode_decode.js. Inverse of `_decode_powders`.
+    `id_bitlen` and `num_tiers` must match the values the URL was decoded with.
+    """
+    writer.emit(1, 1)  # HAS_POWDERS
+    writer.emit(powders[0], id_bitlen)
+    prev = powders[0]
+    for p in powders[1:]:
+        if p == prev:
+            writer.emit(0, POWDER_REPEAT_OP_BITLEN)  # REPEAT
+            continue
+        writer.emit(1, POWDER_REPEAT_OP_BITLEN)  # NO_REPEAT
+        if p % num_tiers == prev % num_tiers:
+            writer.emit(0, POWDER_REPEAT_TIER_OP_BITLEN)  # REPEAT_TIER
+            prev_elem = prev // num_tiers
+            new_elem = p // num_tiers
+            wrap = (new_elem - prev_elem) % NUM_POWDER_ELEMENTS - 1
+            writer.emit(wrap, POWDER_WRAPPER_BITLEN)
+        else:
+            writer.emit(1, POWDER_REPEAT_TIER_OP_BITLEN)  # CHANGE_POWDER
+            writer.emit(0, POWDER_CHANGE_OP_BITLEN)       # NEW_POWDER
+            writer.emit(p, id_bitlen)
+        prev = p
+    # Terminate: NO_REPEAT + CHANGE_POWDER + NEW_ITEM
+    writer.emit(1, POWDER_REPEAT_OP_BITLEN)
+    writer.emit(1, POWDER_REPEAT_TIER_OP_BITLEN)
+    writer.emit(1, POWDER_CHANGE_OP_BITLEN)
+
+
 def encode_build_url(data_version, slots, recipes_by_id,
                      base="https://wynnbuilder-beta.github.io/builder/"):
     """
     Re-encode the 9 equipment slots into a complete wynnbuilder builder URL.
 
     Tomes/SP/level/aspects/atree are written as their "default" sentinels
-    (NO_TOMES, AUTOMATIC SP, MAX level, NO_ASPECTS, empty atree). Powders
-    on powderable slots are written as NO_POWDERS — the original URL's
-    powder data is discarded by `decode_build_url` and we don't reconstruct it.
+    (NO_TOMES, AUTOMATIC SP, MAX level, NO_ASPECTS, empty atree). For
+    powderable slots, weapon powders (slot 8) are preserved if `decode_build_url`
+    captured them; other slots are written as NO_POWDERS since we don't track
+    them.
     """
     w = _BitWriter()
     w.emit(0xC, HEADER_FLAG_BITLEN)            # VECTOR_FLAG
@@ -323,7 +404,14 @@ def encode_build_url(data_version, slots, recipes_by_id,
             raise ValueError(f"Unknown slot kind: {slot.get('kind')!r}")
 
         if i in POWDERABLE_INDICES:
-            w.emit(0, 1)  # NO_POWDERS
+            powders = (slot or {}).get("powders") if slot else None
+            # Only weapon powders (slot 8) are decoded/preserved; for armor
+            # slots we discarded powders during decode → emit NO_POWDERS.
+            if i == 8 and powders:
+                pwd_id_bits, pwd_tiers = _powder_consts(data_version)
+                _emit_powders(w, powders, pwd_id_bits, pwd_tiers)
+            else:
+                w.emit(0, 1)  # NO_POWDERS
 
     # Trailing minimal envelope: tomes / sp / level / aspects / atree.
     w.emit(_TOMES_FLAG_NO,   1)
@@ -409,9 +497,35 @@ def _normal_item_stat_range(item, stat_name):
     return _id_round(raw * 1.3), _id_round(raw * 0.7)
 
 
-def _accumulate_normal_item(item, base_min, base_max):
+def _parse_dam_range(s):
+    """Parse a 'min-max' wynnbuilder damage string. Returns (0, 0) for empty."""
+    if not s:
+        return 0, 0
+    try:
+        lo, hi = s.split("-", 1)
+        return int(lo), int(hi)
+    except (ValueError, AttributeError):
+        return 0, 0
+
+
+_WEAPON_DAM_FIELDS = (
+    ("nDam", "nDamRaw"),
+    ("eDam", "eDamRaw"),
+    ("tDam", "tDamRaw"),
+    ("wDam", "wDamRaw"),
+    ("fDam", "fDamRaw"),
+    ("aDam", "aDamRaw"),
+)
+
+
+def _accumulate_normal_item(item, base_min, base_max, powders=None,
+                            powder_tiers=_KNOWN_POWDER_TIERS):
     """Add a normal item's stat contributions into base_min / base_max
-    (length-STAT_COUNT int arrays)."""
+    (length-STAT_COUNT int arrays). For weapons, the weapon's intrinsic
+    damage ranges (nDam / eDam / ...) are folded into the corresponding
+    *DamRaw stats so the spell formula sees them. Optional `powders` then
+    shifts part of the neutral pool into elemental damages — `powder_tiers`
+    is the tier count used by the URL's data version."""
     if item is None:
         return
     for stat_name, idx in STAT_INDEX.items():
@@ -420,6 +534,34 @@ def _accumulate_normal_item(item, base_min, base_max):
         lo, hi = _normal_item_stat_range(item, stat_name)
         base_min[idx] += lo
         base_max[idx] += hi
+
+    # Weapon intrinsic damage → fold into *DamRaw so it participates in spell
+    # formulas. Mirrors what `_accumulate_crafted_item` does with
+    # healthOrDamage * matmult * atk-speed-ratio for crafted weapons.
+    if item.get("category") == "weapon":
+        n_lo, n_hi = 0, 0
+        for dam_field, stat_name in _WEAPON_DAM_FIELDS:
+            lo, hi = _parse_dam_range(item.get(dam_field))
+            if lo == 0 and hi == 0:
+                continue
+            if dam_field == "nDam":
+                # Defer adding neutral damage until after powder conversion
+                # consumes part of it.
+                n_lo, n_hi = lo, hi
+            else:
+                idx = STAT_INDEX[stat_name]
+                base_min[idx] += lo
+                base_max[idx] += hi
+
+        # Apply powders to the weapon's neutral pool (conversion + raw bonus).
+        n_lo, n_hi = _apply_weapon_powders(
+            powders or [], n_lo, n_hi, base_min, base_max,
+            num_tiers=powder_tiers,
+        )
+        if n_lo or n_hi:
+            idx = STAT_INDEX["nDamRaw"]
+            base_min[idx] += n_lo
+            base_max[idx] += n_hi
 
 
 # ============================================================
@@ -473,6 +615,105 @@ def _compute_effectiveness(ingreds_pos_mods):
                         eff[k][l] += not_touching
 
     return [eff[0][0], eff[0][1], eff[1][0], eff[1][1], eff[2][0], eff[2][1]]
+
+
+# Mirrors `powderStats` in js/powders.js (E,T,W,F,A × tiers 1..6).
+# Tuple = (min_dmg, max_dmg, convert_pct, def_plus, def_minus). We only use
+# (min_dmg, max_dmg, convert_pct) for weapon application.
+_POWDER_STATS = [
+    # E (idx 0..5)
+    (3,6,17,2,1), (5,8,21,4,2), (6,10,25,8,3), (7,10,31,14,5), (9,11,38,22,9), (11,13,46,30,13),
+    # T (idx 6..11)
+    (1,8,9,3,1), (1,12,11,5,1), (2,15,13,9,2), (3,15,17,14,4), (4,17,22,20,7), (5,20,28,28,10),
+    # W (idx 12..17)
+    (3,4,13,3,1), (4,6,15,6,1), (5,8,17,11,2), (6,8,21,18,4), (7,10,26,28,7), (9,11,32,40,10),
+    # F (idx 18..23)
+    (2,5,14,3,1), (4,8,16,5,2), (5,9,19,9,3), (6,9,24,16,5), (8,10,30,25,9), (10,12,37,36,13),
+    # A (idx 24..29)
+    (2,6,11,3,1), (3,10,14,6,2), (4,11,17,10,3), (5,11,22,16,5), (7,12,28,24,9), (8,14,35,34,13),
+]
+_ELEMENT_DAMRAW_STAT = ("eDamRaw", "tDamRaw", "wDamRaw", "fDamRaw", "aDamRaw")
+
+
+def _powder_stats_lookup(pid, num_tiers):
+    """
+    Translate a powder id from its native `num_tiers` numbering to
+    (element_idx, stat_tuple) using my 6-tier `_POWDER_STATS` table.
+
+    For tiers we don't have stats for (e.g. T7 in beta, tier_idx >= 6),
+    return None so the caller can skip them with a warning.
+    """
+    elem = pid // num_tiers
+    tier_idx = pid % num_tiers
+    if tier_idx >= _KNOWN_POWDER_TIERS:
+        return elem, None
+    canonical = elem * _KNOWN_POWDER_TIERS + tier_idx
+    if canonical >= len(_POWDER_STATS):
+        return elem, None
+    return elem, _POWDER_STATS[canonical]
+
+
+def _apply_weapon_powders(powders, n_lo, n_hi, base_min, base_max,
+                          num_tiers=_KNOWN_POWDER_TIERS, do_conversion=True):
+    """
+    Apply weapon powders to a weapon's intrinsic neutral damage range,
+    mirroring `calc_weapon_powder` in js/powders.js.
+
+    Logic:
+      - Group powders by element; for each element, sum their raw min/max
+        damage and conversion%.
+      - If `do_conversion`, convert min(remaining_neutral, conv*remaining)
+        from the neutral pool into that element's damage. (Disable for
+        normal weapons since we don't carry their intrinsic nDam in nDamRaw —
+        a fake conversion would underflow.)
+      - Add the element's summed raw min/max on top.
+
+    `num_tiers` is the powder-tier count used by the URL's data version
+    (6 for v23 / mainline, 7 for wynnbuilder-beta).
+
+    Mutates `base_min` / `base_max` for elemental DamRaw stats; returns the
+    leftover (n_lo, n_hi) that should still be added to nDamRaw.
+    """
+    if not powders:
+        return n_lo, n_hi
+
+    # Aggregate per element while preserving first-seen order.
+    apply_order = []
+    apply_map = {}  # element_idx → {"conv": float, "min": int, "max": int}
+    for pid in powders:
+        elem, stats = _powder_stats_lookup(pid, num_tiers)
+        if stats is None:
+            print(f"  [warn] no powder stats for id={pid} ({num_tiers}-tier system); skipping")
+            continue
+        pmin, pmax, pconv, _dp, _dm = stats
+        info = apply_map.get(elem)
+        if info is None:
+            info = {"conv": 0.0, "min": 0, "max": 0}
+            apply_map[elem] = info
+            apply_order.append(elem)
+        info["conv"] += pconv / 100.0
+        info["min"] += pmin
+        info["max"] += pmax
+
+    rem_lo = n_lo
+    rem_hi = n_hi
+    for elem in apply_order:
+        info = apply_map[elem]
+        if do_conversion:
+            conv = info["conv"]
+            # min(remaining, conv*remaining) — when conv ≤ 1 → conv*remaining;
+            # when conv > 1 → remaining (full conversion). Matches the JS branch.
+            diff_lo = min(rem_lo, int(conv * rem_lo))
+            diff_hi = min(rem_hi, int(conv * rem_hi))
+            rem_lo -= diff_lo
+            rem_hi -= diff_hi
+        else:
+            diff_lo = diff_hi = 0
+        stat_idx = STAT_INDEX[_ELEMENT_DAMRAW_STAT[elem]]
+        base_min[stat_idx] += diff_lo + info["min"]
+        base_max[stat_idx] += diff_hi + info["max"]
+
+    return rem_lo, rem_hi
 
 
 def _accumulate_crafted_item(crafted, ings_by_id, base_min, base_max):
@@ -604,6 +845,13 @@ def _accumulate_crafted_item(crafted, ings_by_id, base_min, base_max):
                 ratio /= 2.5
             n_lo = int(lo * ratio)
             n_hi = int(hi * ratio)
+            # Apply weapon powders (if any) — moves part of neutral damage to
+            # elemental and adds powder raw min/max. Returns leftover neutral.
+            powders = crafted.get("powders") or []
+            num_tiers = crafted.get("powder_tiers", _KNOWN_POWDER_TIERS)
+            n_lo, n_hi = _apply_weapon_powders(
+                powders, n_lo, n_hi, base_min, base_max, num_tiers=num_tiers,
+            )
             idx = STAT_INDEX["nDamRaw"]
             base_min[idx] += n_lo
             base_max[idx] += n_hi
@@ -631,7 +879,11 @@ def aggregate_equipped_stats(slots, items_by_id, ings_by_id):
             if item is None:
                 print(f"  [warn] unknown wynnbuilder item id {slot['id']}, skipping")
                 continue
-            _accumulate_normal_item(item, base_min, base_max)
+            _accumulate_normal_item(
+                item, base_min, base_max,
+                powders=slot.get("powders"),
+                powder_tiers=slot.get("powder_tiers", _KNOWN_POWDER_TIERS),
+            )
         elif kind == "crafted":
             _accumulate_crafted_item(slot, ings_by_id, base_min, base_max)
         elif kind == "custom":
@@ -702,6 +954,439 @@ def _add_equipped_to_recipe_base(query, recipe, equipped_min, equipped_max):
         recipe.base_max_stats_proj[p] += int(equipped_max[idx_full])
 
 
+# ============================================================
+# WB-faithful spell damage evaluator
+# ============================================================
+# Reproduces wynnbuilder's `calculateSpellDamage` (js/damage_calc.js) — the
+# search-engine kernel collapses weapon damage and per-element DamRaw IDs
+# into a single dep slot for speed (and B&B monotonicity), which is correct
+# for *finding* the optimal craft but reports inflated damage for elements
+# the spell doesn't actually hit. This evaluator keeps weapon damage and
+# gear raws separate so the reported number matches wynnbuilder's display.
+
+# Element order used by WB: N, E, T, W, F, A.
+_WB_ELEM_NAMES = ("n", "e", "t", "w", "f", "a")
+
+
+def _crafted_weapon_damage(slot, ings_by_id):
+    """
+    Compute a crafted weapon's post-powder per-element damage range.
+    Returns: (damages, present)
+      - damages: [(lo_low, lo_high), ...] for each of N,E,T,W,F,A — these
+        are the [floor(base*0.9), floor(base*1.1)] ranges that WB shows.
+      - present: bool[6] — wynnbuilder treats elements with non-zero max
+        as "present" (qualifies them for raw-ID bonuses).
+
+    Mirrors craft.js initCraftStats + apply_weapon_powders for crafted weapons.
+    """
+    recipe = slot.get("recipe")
+    if recipe is None or "healthOrDamage" not in recipe:
+        return [(0, 0)] * 6, [False] * 6
+
+    # 1) Base unrolled neutral damage.
+    mat_tiers = slot["mat_tiers"]
+    amounts = [m["amount"] for m in recipe["materials"]]
+    matmult = (TIER_MULT[mat_tiers[0]] * amounts[0]
+               + TIER_MULT[mat_tiers[1]] * amounts[1]) / (amounts[0] + amounts[1])
+    hod = recipe["healthOrDamage"]
+    n_base_low  = int(hod["minimum"] * matmult)
+    n_base_high = int(hod["maximum"] * matmult)
+
+    # 2) Atk-speed ratio (matches craft.js lines 327-336).
+    atk = (slot.get("atk_speed") or "NORMAL").upper()
+    ratio = 2.05
+    if atk == "SLOW":   ratio /= 1.5
+    elif atk == "NORMAL": ratio = 1.0
+    elif atk == "FAST": ratio /= 2.5
+    n_base_low  = int(n_base_low  * ratio)
+    n_base_high = int(n_base_high * ratio)
+
+    # 3) Apply powders to BOTH the low_call and high_call neutral pools — JS
+    #    runs `calc_weapon_powder` twice, once on each base. Each pool starts
+    #    at [floor(b*0.9), floor(b*1.1)] then powder conversion mutates it.
+    powders = slot.get("powders") or []
+    num_tiers = slot.get("powder_tiers", _KNOWN_POWDER_TIERS)
+    low_call  = _wb_calc_weapon_powder(n_base_low,  powders, num_tiers)
+    high_call = _wb_calc_weapon_powder(n_base_high, powders, num_tiers)
+
+    # 4) Final 6-element damage ranges: low_call → low pair, high_call → high pair.
+    #    But WB uses (low_call → low_low ranges) for nDamLow and high_call for nDam.
+    #    For our purposes, average together: damages[i] = (low_call[i][0], high_call[i][1]).
+    damages = []
+    present = []
+    for i in range(6):
+        lo = low_call[i][0]
+        hi = high_call[i][1]
+        damages.append((lo, hi))
+        present.append(hi > 0 or (i == 0 and lo > 0))
+    return damages, present
+
+
+def _wb_calc_weapon_powder(n_base, powders, num_tiers):
+    """
+    JS calc_weapon_powder, called per base value (low or high). Returns a
+    6-element list of [min, max] floats: [neutral, e, t, w, f, a].
+
+    Starts with neutral pool = [floor(n_base*0.9), floor(n_base*1.1)] and
+    elemental pools = [0, 0]. Powders convert from neutral and add raw.
+    """
+    damages = [
+        [int(n_base * 0.9), int(n_base * 1.1)],
+        [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0],
+    ]
+    if not powders:
+        return damages
+
+    # Aggregate per element while preserving first-seen order.
+    apply_order = []
+    apply_map = {}
+    for pid in powders:
+        elem, stats = _powder_stats_lookup(pid, num_tiers)
+        if stats is None:
+            continue
+        pmin, pmax, pconv, _dp, _dm = stats
+        info = apply_map.get(elem)
+        if info is None:
+            info = {"conv": 0.0, "min": 0, "max": 0}
+            apply_map[elem] = info
+            apply_order.append(elem)
+        info["conv"] += pconv / 100.0
+        info["min"] += pmin
+        info["max"] += pmax
+
+    rem_lo, rem_hi = damages[0][0], damages[0][1]
+    for elem in apply_order:
+        info = apply_map[elem]
+        diff_lo = min(rem_lo, info["conv"] * rem_lo)
+        diff_hi = min(rem_hi, info["conv"] * rem_hi)
+        rem_lo -= diff_lo
+        rem_hi -= diff_hi
+        damages[elem + 1][0] += diff_lo + info["min"]
+        damages[elem + 1][1] += diff_hi + info["max"]
+    damages[0] = [rem_lo, rem_hi]
+    return damages
+
+
+def _normal_weapon_damage(item):
+    """Per-element [(lo, hi), ...] range and present[6] for a normal weapon."""
+    fields = ("nDam", "eDam", "tDam", "wDam", "fDam", "aDam")
+    damages, present = [], []
+    for f in fields:
+        lo, hi = _parse_dam_range(item.get(f))
+        damages.append((lo, hi))
+        present.append(hi > 0)
+    # Powders: WB applies conversion at calc_weapon_powder time. We don't
+    # currently parse powders for normal weapons in this code path; treat as
+    # bare. If powders are provided, the caller should run _wb_calc_weapon_powder
+    # on the neutral pool before calling this.
+    return damages, present
+
+
+def _aggregate_gear_ids_only(slots, items_by_id, ings_by_id):
+    """
+    Aggregate gear stats across ALL slots, EXCLUDING the weapon's intrinsic
+    damage (healthOrDamage + powder conversion) — those are returned separately
+    by `_crafted_weapon_damage` / `_normal_weapon_damage`. The result is a
+    "pure ID rolls" stat vector usable as `stats` in WB's calculateSpellDamage.
+    """
+    base_min = np.zeros(STAT_COUNT, dtype=np.int64)
+    base_max = np.zeros(STAT_COUNT, dtype=np.int64)
+    for i, slot in enumerate(slots):
+        if slot is None:
+            continue
+        kind = slot.get("kind")
+        if kind == "normal":
+            item = items_by_id.get(slot["id"])
+            if item is None:
+                continue
+            # For normal weapons: just skip the weapon-intrinsic-damage path
+            # by passing `powders=None` and not adding nDam/eDam/etc fields.
+            for stat_name, idx in STAT_INDEX.items():
+                if stat_name in ("durability", "duration", "charges"):
+                    continue
+                lo, hi = _normal_item_stat_range(item, stat_name)
+                base_min[idx] += lo
+                base_max[idx] += hi
+        elif kind == "crafted":
+            _accumulate_crafted_id_rolls_only(slot, ings_by_id, base_min, base_max)
+    return base_min, base_max
+
+
+def _accumulate_crafted_id_rolls_only(crafted, ings_by_id, base_min, base_max):
+    """Like `_accumulate_crafted_item` but skips the recipe's healthOrDamage
+    injection AND the weapon-powder conversion — only ingredient rolls get
+    added. Used by the WB-faithful evaluator."""
+    recipe = crafted.get("recipe")
+    if recipe is None:
+        return
+    mat_tiers = crafted["mat_tiers"]
+    amounts = [m["amount"] for m in recipe["materials"]]
+    matmult = (TIER_MULT[mat_tiers[0]] * amounts[0]
+               + TIER_MULT[mat_tiers[1]] * amounts[1]) / (amounts[0] + amounts[1])
+    rtype = recipe["type"].lower()
+    is_consumable = rtype in ("potion", "scroll", "food")
+
+    ing_objs = [ings_by_id.get(iid) for iid in crafted["ing_ids"]]
+    pos_mods = []
+    for ing in ing_objs:
+        if ing is None:
+            pos_mods.append([0] * 6)
+        else:
+            raw_pm = ing.get("posMods", {})
+            pos_mods.append([raw_pm.get(k, 0) for k in POSMOD_ORDER])
+    eff_flat = _compute_effectiveness(pos_mods)
+
+    for n, ing in enumerate(ing_objs):
+        if ing is None:
+            continue
+        eff_mult = eff_flat[n] / 100.0
+        is_powder = ing.get("isPowder", False)
+        for key, value in ing.get("itemIDs", {}).items():
+            if key == "dura" or is_consumable:
+                continue
+            idx = STAT_INDEX.get(key)
+            if idx is None:
+                continue
+            v = value if is_powder else round(value * eff_mult)
+            base_min[idx] += v
+            base_max[idx] += v
+        for key, range_obj in ing.get("ids", {}).items():
+            stat_idx = STAT_INDEX.get(key if key != "dura" else "durability")
+            if stat_idx is None:
+                continue
+            if isinstance(range_obj, dict):
+                lo = range_obj.get("min", range_obj.get("minimum", 0))
+                hi = range_obj.get("max", range_obj.get("maximum", 0))
+            else:
+                lo = hi = range_obj
+            r0, r1 = int(lo * eff_mult), int(hi * eff_mult)
+            if r0 > r1:
+                r0, r1 = r1, r0
+            base_min[stat_idx] += r0
+            base_max[stat_idx] += r1
+
+
+def eval_meteor_wb(slots, items_by_id, ings_by_id, build_ctx, spell_name="mage_meteor"):
+    """
+    Wynnbuilder-faithful spell damage evaluator.
+
+    Returns dict with min/avg/max for non-crit, crit, and total (crit-weighted)
+    damage. Mirrors `calculateSpellDamage` step-by-step on the build defined
+    by `slots`. Use this for displaying expected damage to users — it matches
+    the wynnbuilder UI numbers, unlike the search engine's
+    `_eval_spell_corner_spell` which is intentionally simplified for B&B.
+    """
+    from data.spells import SPELLS, SPELL_INDEX, ATK_SPEED_MULT
+    from data.skillpoint_lookup import SKP_PCT_BASE, SKP_DAMAGE_MULT, SKP_MAX
+
+    spell = SPELLS[SPELL_INDEX[spell_name]]
+    mults = spell["mults"]   # (m_n, m_e, m_t, m_w, m_f, m_a) percent values
+    use_spell = spell["use_spell"]
+    ignore_speed = spell["ignore_speed"]
+    spec = "Sd" if use_spell else "Md"   # "Sd" or "Md" prefix for stat names
+
+    # ---- 1. Weapon damage (post-powder) ----
+    weapon = slots[8]
+    if weapon is None:
+        return None
+    if weapon["kind"] == "crafted":
+        wd, present = _crafted_weapon_damage(weapon, ings_by_id)
+        atk_speed = (weapon.get("atk_speed") or "NORMAL").upper()
+    elif weapon["kind"] == "normal":
+        item = items_by_id.get(weapon["id"])
+        if item is None:
+            return None
+        wd, present = _normal_weapon_damage(item)
+        atk_speed = item.get("atkSpd", "NORMAL")
+    else:
+        return None
+
+    # damages[i] = [min, max] (mutable). Initially = wd[i].
+    damages = [[float(lo), float(hi)] for (lo, hi) in wd]
+
+    # ---- 2. Conversions ----
+    # 2.1 neutral conversion scales every weapon element. weapon_min/max sum.
+    weapon_min = sum(d[0] for d in damages)
+    weapon_max = sum(d[1] for d in damages)
+    m_n = mults[0] / 100.0
+    if m_n == 0:
+        present = [False] * 6
+    for i in range(6):
+        damages[i][0] *= m_n
+        damages[i][1] *= m_n
+
+    # 2.2 elemental conversions (m_e..m_a). Each routes weapon-total to that
+    #     element and marks it present.
+    total_convert = m_n
+    for i in range(1, 6):
+        m_i = mults[i] / 100.0
+        if m_i > 0:
+            damages[i][0] += m_i * weapon_min
+            damages[i][1] += m_i * weapon_max
+            present[i] = True
+            total_convert += m_i
+
+    # ---- 3. Attack speed ----
+    if not ignore_speed:
+        atk_mult = ATK_SPEED_MULT.get(atk_speed, ATK_SPEED_MULT["NORMAL"])
+        for i in range(6):
+            damages[i][0] *= atk_mult
+            damages[i][1] *= atk_mult
+
+    # ---- 4. (DamAddMin/Max — not in our IDS_STATS, skip) ----
+
+    # ---- 5. ID bonus ----
+    # Aggregate gear IDs (rolls only — NOT including weapon intrinsic damage).
+    g_min, g_max = _aggregate_gear_ids_only(slots, items_by_id, ings_by_id)
+    g_mid = (g_min.astype(np.float64) + g_max.astype(np.float64)) / 2.0
+
+    def gs(name):
+        idx = STAT_INDEX.get(name)
+        return float(g_mid[idx]) if idx is not None else 0.0
+
+    # 5.1 % boost — per element (1 + skp_dam_mult * skpPct + static + (specPct + DamPct)/100)
+    # Skill points: gear str/dex/etc. + user-assigned (here from build_ctx).
+    skp_str = int(g_mid[STAT_INDEX["str"]] + build_ctx[0])
+    skp_dex = int(g_mid[STAT_INDEX["dex"]] + build_ctx[1])
+    skp_int = int(g_mid[STAT_INDEX["int"]] + build_ctx[2])
+    skp_def = int(g_mid[STAT_INDEX["def"]] + build_ctx[3])
+    skp_agi = int(g_mid[STAT_INDEX["agi"]] + build_ctx[4])
+    skps = [skp_str, skp_dex, skp_int, skp_def, skp_agi]
+    skps = [max(0, min(SKP_MAX, s)) for s in skps]
+    # skill_boost[0] = 0 (neutral), [1..5] = element bonus from skp[i]
+    skill_boost = [0.0]
+    for i in range(5):
+        skill_boost.append(SKP_PCT_BASE[skps[i]] * SKP_DAMAGE_MULT[i])
+
+    static_boost = (gs(spec.lower() + "Pct") + gs("damPct")) / 100.0
+    rainbow_boost_pct = (gs("r" + spec + "Pct") + gs("rDamPct")) / 100.0
+    save_prop = []
+    total_min = 0.0
+    total_max = 0.0
+    for i in range(6):
+        save_prop.append(damages[i][:])
+        total_min += damages[i][0]
+        total_max += damages[i][1]
+        elem = _WB_ELEM_NAMES[i]
+        boost = 1 + skill_boost[i] + static_boost \
+              + (gs(elem + spec + "Pct") + gs(elem + "DamPct")) / 100.0
+        if i > 0:
+            boost += rainbow_boost_pct
+        damages[i][0] *= boost
+        damages[i][1] *= boost
+
+    total_elem_min = total_min - save_prop[0][0]
+    total_elem_max = total_max - save_prop[0][1]
+
+    # 5.2 Raw application — per element raw_boost (gated by present[i]),
+    # plus prop_raw distributed proportionally.
+    prop_raw    = gs(spec.lower() + "Raw") + gs("damRaw")
+    rainbow_raw = gs("r" + spec + "Raw") + gs("rDamRaw")
+    for i in range(6):
+        elem = _WB_ELEM_NAMES[i]
+        raw_boost = 0.0
+        if present[i]:
+            raw_boost = gs(elem + spec + "Raw") + gs(elem + "DamRaw")
+        min_boost = raw_boost
+        max_boost = raw_boost
+        if total_max > 0:
+            min_share = save_prop[i][0] / total_min if total_min else save_prop[i][1] / total_max
+            min_boost += min_share * prop_raw
+            max_boost += (save_prop[i][1] / total_max) * prop_raw
+        if i != 0 and total_elem_max > 0:
+            min_share_e = save_prop[i][0] / total_elem_min if total_elem_min else save_prop[i][1] / total_elem_max
+            min_boost += min_share_e * rainbow_raw
+            max_boost += (save_prop[i][1] / total_elem_max) * rainbow_raw
+        damages[i][0] += min_boost * total_convert
+        damages[i][1] += max_boost * total_convert
+
+    # ---- 6. Strength + crit ----
+    str_boost = 1 + SKP_PCT_BASE[skps[0]]
+    crit_chance = SKP_PCT_BASE[skps[1]]
+    crit_dam_pct = float(build_ctx[6])
+    crit_mult = 1 + crit_dam_pct / 100.0
+
+    norm_min = norm_max = crit_min = crit_max = 0.0
+    per_elem_norm = []
+    per_elem_crit = []
+    for i in range(6):
+        d0 = max(0.0, damages[i][0])
+        d1 = max(0.0, damages[i][1])
+        nmin = d0 * str_boost
+        nmax = d1 * str_boost
+        cmin = d0 * (str_boost + crit_mult)
+        cmax = d1 * (str_boost + crit_mult)
+        per_elem_norm.append((nmin, nmax))
+        per_elem_crit.append((cmin, cmax))
+        norm_min += nmin; norm_max += nmax
+        crit_min += cmin; crit_max += cmax
+
+    norm_avg = (norm_min + norm_max) / 2.0
+    crit_avg = (crit_min + crit_max) / 2.0
+    total_avg = (1 - crit_chance) * norm_avg + crit_chance * crit_avg
+
+    return {
+        "non_crit": (norm_min, norm_avg, norm_max),
+        "crit":     (crit_min, crit_avg, crit_max),
+        "total_avg": total_avg,
+        "crit_chance": crit_chance,
+        "per_elem_non_crit": per_elem_norm,
+        "per_elem_crit": per_elem_crit,
+        "elem_names": _WB_ELEM_NAMES,
+        "present": present,
+    }
+
+
+def _build_ctx_array_from_query(user_query):
+    """Build the float64 build_ctx array from the user's `_context` (or
+    defaults if absent) — same logic as `query.query._build_ctx_array`,
+    re-exported here so the end-of-run report doesn't need to call
+    `build_query` just to grab the ctx."""
+    from query.query import _build_ctx_array
+    return _build_ctx_array(user_query.get("_context") if isinstance(user_query, dict) else None)
+
+
+def _eval_spell_for_build(spell_name, equipped_min, equipped_max, build_ctx):
+    """
+    Evaluate a spell composite (e.g. "mage_meteor") on the fully-aggregated
+    equipped stats. Reuses the same numba kernel the search engine uses for
+    B&B corner bounds.
+
+    Returns (lo, mid, hi) triple — damage at min rolls, midpoint, and max rolls.
+    Note: spells aren't strictly monotone in skp, so lo/hi aren't a strict
+    bound — they're "what you get if every gear stat lands at its min/max
+    independently". Midpoint is the most representative single number.
+    """
+    from data.spells import SPELL_SPELL_DEPS, SPELL_MELEE_DEPS, SPELL_INDEX, SPELLS
+    from core.search_engine import (
+        _eval_spell_corner_spell, _eval_spell_corner_melee,
+    )
+
+    spell_id = SPELL_INDEX[spell_name]
+    use_spell = SPELLS[spell_id]["use_spell"]
+    deps_layout = SPELL_SPELL_DEPS if use_spell else SPELL_MELEE_DEPS
+    eval_fn = _eval_spell_corner_spell if use_spell else _eval_spell_corner_melee
+
+    deps_lo = np.zeros(len(deps_layout), dtype=np.float64)
+    deps_hi = np.zeros(len(deps_layout), dtype=np.float64)
+    for i, name in enumerate(deps_layout):
+        sidx = STAT_INDEX[name]
+        deps_lo[i] = float(equipped_min[sidx])
+        deps_hi[i] = float(equipped_max[sidx])
+    deps_mid = (deps_lo + deps_hi) / 2.0
+
+    return (eval_fn(deps_lo, spell_id, build_ctx),
+            eval_fn(deps_mid, spell_id, build_ctx),
+            eval_fn(deps_hi, spell_id, build_ctx))
+
+
+def _powder_label(pid, num_tiers=_KNOWN_POWDER_TIERS):
+    """Human label like 'E3' for powder id (element + tier)."""
+    elem = pid // num_tiers
+    tier = pid % num_tiers + 1
+    return f"{POWDER_ELEMENTS[elem].upper()}{tier}"
+
+
 def _print_slot_summary(slots, items_by_id):
     print("Decoded equipment:")
     for name, slot in zip(SLOT_NAMES, slots):
@@ -715,6 +1400,11 @@ def _print_slot_summary(slots, items_by_id):
             tag = f"CRAFTED({r.get('type','?')} {r.get('skill','?')} lvl {r.get('lvl', {}).get('minimum','?')}-{r.get('lvl', {}).get('maximum','?')})"
         else:
             tag = f"<{slot['kind']}>"
+        powders = (slot or {}).get("powders") if slot else None
+        if powders and name == "weapon":
+            num_tiers = slot.get("powder_tiers", _KNOWN_POWDER_TIERS)
+            labels = ", ".join(_powder_label(p, num_tiers) for p in powders)
+            tag += f"  powders=[{labels}]"
         print(f"  {name:<10s} : {tag}")
 
 
@@ -773,7 +1463,33 @@ def main():
     _print_slot_summary(slots, items_by_id)
 
     # ---------- Aggregate equipped stats ----------
+    # Two views of the equipped stats:
+    #   - `gear_min/max`: pure ID rolls (no weapon intrinsic damage, no
+    #     powder conversion). Fed into the search engine via base_min/max
+    #     so deps[0..5] inside the spell kernel = gear xDamRaw IDs only.
+    #   - `equipped_min/max`: full aggregation including weapon intrinsic
+    #     damage (post-powder). Used for the WB-faithful eval display only.
+    gear_min, gear_max = _aggregate_gear_ids_only(slots, items_by_id, ings_by_id)
     equipped_min, equipped_max = aggregate_equipped_stats(slots, items_by_id, ings_by_id)
+
+    # Compute weapon's per-element damage (post-powder) from slot 8. Used by
+    # the search kernel via ctx.weapon_dam (see search_engine `_BCTX_WD_*`).
+    weapon = slots[8]
+    if weapon is None:
+        wdam = (0.0,) * 6
+    elif weapon["kind"] == "crafted":
+        wd_pairs, _ = _crafted_weapon_damage(weapon, ings_by_id)
+        # Use midpoint per element — gives consistent search bounds.
+        wdam = tuple((lo + hi) / 2.0 for (lo, hi) in wd_pairs)
+    elif weapon["kind"] == "normal":
+        item = items_by_id.get(weapon["id"])
+        if item is None:
+            wdam = (0.0,) * 6
+        else:
+            wd_pairs, _ = _normal_weapon_damage(item)
+            wdam = tuple((lo + hi) / 2.0 for (lo, hi) in wd_pairs)
+    else:
+        wdam = (0.0,) * 6
 
     # ---------- Project python-side ingredients/recipes (used for searches) ----------
     py_ingredients_raw = load_ingredients("data/ingreds_compress.json")
@@ -803,11 +1519,23 @@ def main():
             consumable=consumable,
         )
 
+        # Inject the loaded weapon's per-element damage into ctx so the spell
+        # kernel scales it by m_n / m_e correctly (instead of leaving the
+        # ctx slots at 0 and underestimating spell damage).
+        from query.query import (BUILD_CTX_WD_N, BUILD_CTX_WD_E, BUILD_CTX_WD_T,
+                                  BUILD_CTX_WD_W, BUILD_CTX_WD_F, BUILD_CTX_WD_A)
+        for slot_idx, val in zip(
+            (BUILD_CTX_WD_N, BUILD_CTX_WD_E, BUILD_CTX_WD_T,
+             BUILD_CTX_WD_W, BUILD_CTX_WD_F, BUILD_CTX_WD_A), wdam):
+            query.build_ctx[slot_idx] = float(val)
+
         recipe_raw = _find_recipe(py_recipes_raw, item_type, skill, lvl_min, lvl_max)
         recipe = build_recipe(recipe_raw, query, tier=tier)
 
-        # Stack equipped stats on top of recipe's base — see helper docstring.
-        _add_equipped_to_recipe_base(query, recipe, equipped_min, equipped_max)
+        # Stack gear ID rolls (NOT weapon intrinsic damage) on top of recipe's
+        # base. The weapon damage is exposed separately via ctx weapon_dam, so
+        # mixing it into base would double-count it inside the spell kernel.
+        _add_equipped_to_recipe_base(query, recipe, gear_min, gear_max)
 
         filtered_raw = filter_raw_ingredients(py_ingredients_raw, query, recipe)
         db = IngredientDB(filtered_raw, query)
@@ -838,12 +1566,14 @@ def main():
         url = crafted_to_url(chosen_crafted, recipes_by_id)
         print(f"  Crafter URL: {url}")
 
-        # Add this freshly-crafted piece into the equipped-stats running totals
-        # so subsequent slots account for it. Show the delta so it's clear the
-        # base used for the next slot's search reflects this generation.
+        # Add this freshly-crafted piece into the running totals so subsequent
+        # slots account for it. Update both views: `gear_min/max` (ID rolls
+        # only, fed to the search) and `equipped_min/max` (full, used for the
+        # final WB-faithful eval). Show the delta on `equipped` for clarity.
         prev_min = equipped_min.copy()
         prev_max = equipped_max.copy()
         _accumulate_crafted_item(chosen_crafted, ings_by_id, equipped_min, equipped_max)
+        _accumulate_crafted_id_rolls_only(chosen_crafted, ings_by_id, gear_min, gear_max)
         slots[idx] = chosen_crafted
 
         delta_lines = []
@@ -881,6 +1611,39 @@ def main():
 
     final_url = encode_build_url(data_version, slots, recipes_by_id)
     print(f"\nFinal wynnbuilder URL:\n  {final_url}")
+
+    # ---------- Spell damage estimate for the assembled build ----------
+    # WB-faithful evaluator (mirrors js/damage_calc.js calculateSpellDamage).
+    # Reports per-element non-crit ranges + total weighted average, matching
+    # what wynnbuilder displays. Skip if no spell composite in user query.
+    from data.stats import DERIVED_DEPENDENCIES
+    spell_names = [n for n in USER_QUERY if n in DERIVED_DEPENDENCIES
+                   and n.startswith(("mage_", "warrior_", "archer_",
+                                     "assassin_", "shaman_"))]
+    if spell_names:
+        build_ctx = _build_ctx_array_from_query(USER_QUERY)
+        ctx = USER_QUERY.get("_context")
+        skp_note = ""
+        if not ctx or not any(k in (ctx or {}) for k in ("str","dex","int","def","agi")):
+            skp_note = "  [no _context skp set — using gear-only SP; wynnbuilder " \
+                       "AUTOMATIC SP would allocate ~level points more]"
+        print(f"\nSpell damage estimates (final build, current query):{skp_note}")
+        for sn in spell_names:
+            try:
+                res = eval_meteor_wb(slots, items_by_id, ings_by_id, build_ctx, sn)
+                if res is None:
+                    print(f"  {sn:<22s} [no weapon equipped]")
+                    continue
+                nc = res["non_crit"]; cr = res["crit"]
+                print(f"  {sn:<22s} non-crit avg={nc[1]:>10,.0f}  crit avg={cr[1]:>10,.0f}  "
+                      f"total avg={res['total_avg']:>10,.0f}  crit%={res['crit_chance']*100:.1f}")
+                for n, (lo, hi), pres in zip(res["elem_names"],
+                                              res["per_elem_non_crit"],
+                                              res["present"]):
+                    if pres:
+                        print(f"    {n}: {lo:>10,.0f} - {hi:>10,.0f}")
+            except Exception as e:
+                print(f"  {sn:<22s} [eval failed: {e}]")
 
 
 if __name__ == "__main__":

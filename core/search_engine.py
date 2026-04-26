@@ -49,6 +49,16 @@ _BCTX_BASE_DEF = 3
 _BCTX_BASE_AGI = 4
 _BCTX_ATK_SPD  = 5
 _BCTX_CRIT_PCT = 6
+# Weapon's intrinsic per-element damage (post-powder, pre-roll). The spell
+# kernel uses these for the m_n / m_e conversions; deps[0..5] (xDamRaw stat
+# values) are treated as gear ID raws and added at step 5.2 only if the
+# corresponding element is "present". Mirrors BUILD_CTX_WD_* in query.py.
+_BCTX_WD_N = 7
+_BCTX_WD_E = 8
+_BCTX_WD_T = 9
+_BCTX_WD_W = 10
+_BCTX_WD_F = 11
+_BCTX_WD_A = 12
 
 
 # Explicit signature so the recursive dfs can be persisted to disk with
@@ -350,13 +360,29 @@ def _eval_spell_corner_spell(deps, spell_id, ctx):
     Evaluate average spell damage at one corner for a SPELL-mode spell
     (use_spell=True). `deps` is a length-31 float64 vector laid out per
     SPELL_SPELL_DEPS in data/spells.py.
+
+    Weapon damage layout
+    --------------------
+    The weapon's intrinsic per-element damage (post-powder, pre-roll) lives
+    in `ctx[_BCTX_WD_*]` — those are the values that get scaled by the spell
+    multipliers (m_n, m_e, ...). `deps[0..5]` (xDamRaw stat values) are
+    treated as **gear ID raws** and added at step 5.2 only when the
+    corresponding element is "present" — exactly matching wynnbuilder's
+    `calculateSpellDamage` (js/damage_calc.js). This separation keeps the
+    spell formula faithful: ring/bracelet xDamRaw IDs no longer get
+    incorrectly scaled by m_n + boost_t (which was a ~6× over-valuation
+    of per-element raws relative to wynnbuilder).
     """
     mults = _SPELL_MULTS[spell_id]
     ignore_speed = _SPELL_IGNORE_SPEED[spell_id]
     total_convert = _SPELL_TOTAL_CONVERT[spell_id]
 
-    # --- Read deps (NETWFA, indices 0=neutral) ---
-    w_n = deps[0]; w_e = deps[1]; w_t = deps[2]; w_w = deps[3]; w_f = deps[4]; w_a = deps[5]
+    # --- Weapon damage from ctx (intrinsic, post-powder) ---
+    w_n = ctx[_BCTX_WD_N]; w_e = ctx[_BCTX_WD_E]; w_t = ctx[_BCTX_WD_T]
+    w_w = ctx[_BCTX_WD_W]; w_f = ctx[_BCTX_WD_F]; w_a = ctx[_BCTX_WD_A]
+
+    # --- Per-element xDamRaw IDs from gear (rings/etc) ---
+    gx_n = deps[0]; gx_e = deps[1]; gx_t = deps[2]; gx_w = deps[3]; gx_f = deps[4]; gx_a = deps[5]
     p_n = deps[6]; p_e = deps[7]; p_t = deps[8]; p_w = deps[9]; p_f = deps[10]; p_a = deps[11]
     # Per-element SdPct (n,t omitted from registry -> treated as 0)
     sp_e = deps[12]; sp_w = deps[13]; sp_f = deps[14]; sp_a = deps[15]
@@ -426,13 +452,16 @@ def _eval_spell_corner_spell(deps, spell_id, ctx):
                + init_w * boost_w + init_f * boost_f + init_a * boost_a)
 
     # --- Step 4: raw additions (gated by per-element presence) ---
-    # present[i] = (weapon[i] > 0) or (mults[i] > 0). nSdRaw absent -> no neutral term.
+    # present[i] = (weapon[i] > 0) or (mults[i] > 0). Per-element raws are
+    # eSdRaw + eDamRaw etc. (gx_*); n has no nSdRaw in the registry but does
+    # have nDamRaw via gx_n.
     raw_sum = 0.0
-    if (w_e > 0.0) or (m_e > 0.0): raw_sum += sr_e
-    if (w_t > 0.0) or (m_t > 0.0): raw_sum += sr_t
-    if (w_w > 0.0) or (m_w > 0.0): raw_sum += sr_w
-    if (w_f > 0.0) or (m_f > 0.0): raw_sum += sr_f
-    if (w_a > 0.0) or (m_a > 0.0): raw_sum += sr_a
+    if (m_n > 0.0) and (w_n > 0.0): raw_sum += gx_n
+    if (w_e > 0.0) or (m_e > 0.0): raw_sum += sr_e + gx_e
+    if (w_t > 0.0) or (m_t > 0.0): raw_sum += sr_t + gx_t
+    if (w_w > 0.0) or (m_w > 0.0): raw_sum += sr_w + gx_w
+    if (w_f > 0.0) or (m_f > 0.0): raw_sum += sr_f + gx_f
+    if (w_a > 0.0) or (m_a > 0.0): raw_sum += sr_a + gx_a
     raw_sum += g_sd_raw      # global (sdRaw + damRaw -> damRaw absent)
     sum_dmg += raw_sum * total_convert
 
@@ -448,12 +477,23 @@ def _eval_spell_corner_melee(deps, spell_id, ctx):
     """
     Same as `_eval_spell_corner_spell` but for MELEE-mode spells (use_spell=False).
     `deps` length 27, layout per SPELL_MELEE_DEPS in data/spells.py.
+
+    Like the spell-mode kernel, weapon damage comes from `ctx[_BCTX_WD_*]`
+    (set by search pipeline from recipe.weapon_dam_neutral or by an external
+    caller that knows the equipped weapon). `deps[0..5]` (xDamRaw stat values)
+    are gear ID raws added at step 5.2 only when the corresponding element
+    is "present".
     """
     mults = _SPELL_MULTS[spell_id]
     ignore_speed = _SPELL_IGNORE_SPEED[spell_id]
     total_convert = _SPELL_TOTAL_CONVERT[spell_id]
 
-    w_n = deps[0]; w_e = deps[1]; w_t = deps[2]; w_w = deps[3]; w_f = deps[4]; w_a = deps[5]
+    # Weapon damage from ctx (intrinsic, post-powder).
+    w_n = ctx[_BCTX_WD_N]; w_e = ctx[_BCTX_WD_E]; w_t = ctx[_BCTX_WD_T]
+    w_w = ctx[_BCTX_WD_W]; w_f = ctx[_BCTX_WD_F]; w_a = ctx[_BCTX_WD_A]
+
+    # Per-element xDamRaw IDs from gear (rings/etc).
+    gx_n = deps[0]; gx_e = deps[1]; gx_t = deps[2]; gx_w = deps[3]; gx_f = deps[4]; gx_a = deps[5]
     p_n = deps[6]; p_e = deps[7]; p_t = deps[8]; p_w = deps[9]; p_f = deps[10]; p_a = deps[11]
     # Per-element MdRaw — all 6 in registry
     mr_n = deps[12]; mr_e = deps[13]; mr_t = deps[14]; mr_w = deps[15]; mr_f = deps[16]; mr_a = deps[17]
@@ -516,13 +556,16 @@ def _eval_spell_corner_melee(deps, spell_id, ctx):
     sum_dmg = (init_n * boost_n + init_e * boost_e + init_t * boost_t
                + init_w * boost_w + init_f * boost_f + init_a * boost_a)
 
+    # Per-element raws: mdRaw (mr_*) + xDamRaw IDs (gx_*), gated by present.
+    # Neutral is gated by m_n>0 AND w_n>0 (matches WB's `present=[false]*6`
+    # short-circuit when neutral_convert == 0).
     raw_sum = 0.0
-    if (w_n > 0.0) or (m_n > 0.0): raw_sum += mr_n
-    if (w_e > 0.0) or (m_e > 0.0): raw_sum += mr_e
-    if (w_t > 0.0) or (m_t > 0.0): raw_sum += mr_t
-    if (w_w > 0.0) or (m_w > 0.0): raw_sum += mr_w
-    if (w_f > 0.0) or (m_f > 0.0): raw_sum += mr_f
-    if (w_a > 0.0) or (m_a > 0.0): raw_sum += mr_a
+    if (m_n > 0.0) and (w_n > 0.0): raw_sum += mr_n + gx_n
+    if (w_e > 0.0) or (m_e > 0.0): raw_sum += mr_e + gx_e
+    if (w_t > 0.0) or (m_t > 0.0): raw_sum += mr_t + gx_t
+    if (w_w > 0.0) or (m_w > 0.0): raw_sum += mr_w + gx_w
+    if (w_f > 0.0) or (m_f > 0.0): raw_sum += mr_f + gx_f
+    if (w_a > 0.0) or (m_a > 0.0): raw_sum += mr_a + gx_a
     raw_sum += g_md_raw
     sum_dmg += raw_sum * total_convert
 
@@ -1865,16 +1908,46 @@ def search_pipelined(
     max_cull=5,
     culling=True,
     base_path="data/precalc/generic_cull",
+    semi_cull_budget_s=0.0,
+    semi_cull_max_n=5,
 ):
     """
     Overlap meta-set loading with searching. A background thread loads and
     refines each META_n file in priority order, pushing ready batches onto a
     queue; the main thread searches them as they arrive. Wall-clock = max(load
     time, search time) instead of their sum.
+
+    Cull policy per META_n:
+      - n <= max_cull        : full Pareto cull (no time limit).
+      - max_cull < n <= semi_cull_max_n : semi-cull with `semi_cull_budget_s`
+        wall-clock budget — the block-parallel cull stops after the budget
+        and keeps unprocessed rows (Pareto SUPERSET, no optimum lost).
+      - n > semi_cull_max_n  : skipped, all rows passed through.
+
+    `semi_cull_budget_s` defaults to 0 (DISABLED). Empirically:
+      - On medium META (~1-2M rows) it removes 4-5% of rows in ~1s and is
+        a small net win.
+      - On huge META (5M+ rows) the budget exhausts before meaningful kills
+        and the parallel cull steals cores from the concurrent parallel
+        search, costing more wall-clock than it saves. Tested on Armouring
+        meteor (META_5=5.5M): semi-cull added +17s vs disabled.
+      Enable per-call (e.g. `semi_cull_budget_s=1.0`) for queries where
+      META sizes are known to be moderate.
     """
     # Local import avoids a module-level cycle (meta_set_loader imports nothing
     # from search_engine, but search_engine doesn't want the refiner eagerly).
     from data.meta_set_loader import _load_cached_arrays, _refine_batch
+
+    # When crafting a weapon directly, overlay recipe.weapon_dam_neutral onto
+    # `ctx[BUILD_CTX_WD_N]` so the spell kernel can scale it by m_n / m_e
+    # (instead of treating ingredient nDamRaw rolls as weapon damage). For
+    # non-weapon recipes this is (0, 0) and we leave the ctx untouched —
+    # main_build_temp.py-style flows pre-populate all 6 weapon-dam slots
+    # from a fixed loaded weapon before calling search_pipelined.
+    if recipe.weapon_dam_neutral and (recipe.weapon_dam_neutral[0]
+                                      or recipe.weapon_dam_neutral[1]):
+        query.build_ctx[_BCTX_WD_N] = (recipe.weapon_dam_neutral[0]
+                                       + recipe.weapon_dam_neutral[1]) / 2.0
 
     dura_idx = query.dura_proj_idx
     if dura_idx == -1:
@@ -1918,7 +1991,19 @@ def search_pipelined(
                         query, recipe, culling=False,
                     )
                 else:
-                    use_culling = culling and n <= max_cull
+                    # Decide cull mode for this META_n.
+                    cull_budget = None
+                    if not culling:
+                        use_culling = False
+                    elif n <= max_cull:
+                        use_culling = True  # full cull
+                    elif (semi_cull_budget_s and semi_cull_budget_s > 0
+                          and n <= semi_cull_max_n):
+                        use_culling = True  # semi-cull with budget
+                        cull_budget = float(semi_cull_budget_s)
+                    else:
+                        use_culling = False
+
                     t_read = time()
                     ings, eff, stat_names, stat_min, stat_max = \
                         _load_cached_arrays(skill, n, base_path)
@@ -1928,6 +2013,7 @@ def search_pipelined(
                     batch = _refine_batch(
                         ings, eff, stat_names, stat_min, stat_max,
                         query, recipe, culling=use_culling,
+                        cull_budget_s=cull_budget,
                         timings=timings,
                     )
                     breakdown["read"] += read_dt

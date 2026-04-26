@@ -12,9 +12,16 @@ class Recipe(NamedTuple):
 
     base_min_stats_proj: np.ndarray
     base_max_stats_proj: np.ndarray
-    
+
     scaled_dura_min: int
     scaled_dura_max: int
+
+    # Crafted weapon's intrinsic neutral damage range (post-mat-mult,
+    # pre-powder, pre-roll). For non-weapons this is None. The search
+    # pipeline overlays this onto `query.build_ctx[BUILD_CTX_WD_N]` so the
+    # spell kernel scales it by m_n / m_e (instead of treating the raw
+    # number as a gear ID raw, which was the previous over-counting bug).
+    weapon_dam_neutral: tuple = (0, 0)
 
 
 def build_recipe(raw_recipe: dict, query, tier: int) -> Recipe:
@@ -77,17 +84,23 @@ def build_recipe(raw_recipe: dict, query, tier: int) -> Recipe:
     
         inject_stat(IDX_CHARGES, charges_min, charges_max)
         
+    weapon_dam_neutral = (0, 0)
     if not query.consumable and "healthOrDamage" in recipe_data:
 
         hod_min = recipe_data["healthOrDamage"]["minimum"]
         hod_max = recipe_data["healthOrDamage"]["maximum"]
-    
+
         if query.skill in ("TAILORING", "ARMOURING"):
-            stat_idx = STAT_INDEX["hpBonus"]
+            # Armor: healthOrDamage maps to hpBonus (stat used for ehp etc.).
+            inject_stat(STAT_INDEX["hpBonus"], hod_min, hod_max)
         else:
-            stat_idx = STAT_INDEX["nDamRaw"]
-    
-        inject_stat(stat_idx, hod_min, hod_max)
+            # Weapons: don't inject into nDamRaw — the spell kernel reads
+            # weapon damage from ctx.weapon_dam (set by search_pipelined
+            # from this `weapon_dam_neutral` field). Folding hod into
+            # nDamRaw caused ingredient nDamRaw rolls to be incorrectly
+            # treated as weapon damage (multiplied by m_n + boost_t),
+            # ~6× over-valuing per-element raws vs wynnbuilder.
+            weapon_dam_neutral = (int(hod_min), int(hod_max))
 
     # ------------------------------------------------------------
 
@@ -96,6 +109,7 @@ def build_recipe(raw_recipe: dict, query, tier: int) -> Recipe:
         base_max_stats_proj=base_max_stats_proj,
         scaled_dura_min=scaled_dura_min,
         scaled_dura_max=scaled_dura_max,
+        weapon_dam_neutral=weapon_dam_neutral,
     )
 
 
