@@ -13,39 +13,42 @@ from data.stats import (
     FORMULA_MUL_DIV_100, FORMULA_RAW_TO_PCT, FORMULA_EHP, FORMULA_EHPR,
     FORMULA_SPELL_DAMAGE_BASE,
 )
-from data.skillpoint_lookup import SKP_HEADLINE_PCT, SKP_DEF, SKP_AGI, SKP_MAX
+from data.skillpoint_lookup import (
+    SKP_HEADLINE_PCT, SKP_ELEMENT_PCT, SKP_PCT_BASE,
+    SKP_DEF, SKP_AGI, SKP_MAX,
+)
+from data.spells import SPELL_MULTS, SPELL_USE_SPELL, SPELL_IGNORE_SPEED, SPELL_TOTAL_CONVERT
 
 # Numba captures module-level numpy arrays as constants (read-only refs); the
 # table is precomputed once at import time and never mutated, so this is safe
 # even with cache=True.
 _SKP_DEF_ROW = SKP_HEADLINE_PCT[SKP_DEF].copy()  # shape (151,) float64
 _SKP_AGI_ROW = SKP_HEADLINE_PCT[SKP_AGI].copy()
+# Per-element damage multiplier curves for spell formula. Shape (5, 151).
+# Row order: str→earth, dex→thunder, int→water, def→fire, agi→air.
+_SKP_ELEM_PCT = SKP_ELEMENT_PCT.copy()
+# Base curve (no element multiplier). Shape (151,). Used for crit chance
+# (skillPointsToPercentage(dex)) and str_boost (1 + skillPointsToPercentage(str)).
+_SKP_PCT_BASE = SKP_PCT_BASE.copy()
 
-# Spell IDs — must match the order in data/spells.py SPELLS list.
-_SPELL_METEOR = 0
-_SPELL_ICE_SNAKE = 1
-_SPELL_BASH = 2
-_SPELL_UPPERCUT = 3
-_SPELL_WAR_SCREAM = 4
-_SPELL_ARROW_STORM = 5
-_SPELL_ARROW_BOMB = 6
-_SPELL_SPIN_ATTACK = 7
-_SPELL_MULTIHIT = 8
-_SPELL_SMOKE_BOMB = 9
-_SPELL_TOTEM = 10
-_SPELL_AURA = 11
-_SPELL_UPROOT = 12
+# Spell metadata, captured as module-level numpy constants for numba access.
+_SPELL_MULTS         = SPELL_MULTS.copy()          # int32 (N_SPELLS, 6)
+_SPELL_USE_SPELL     = SPELL_USE_SPELL.copy()      # bool (N_SPELLS,)
+_SPELL_IGNORE_SPEED  = SPELL_IGNORE_SPEED.copy()   # bool (N_SPELLS,)
+_SPELL_TOTAL_CONVERT = SPELL_TOTAL_CONVERT.copy()  # float64 (N_SPELLS,)
 
-# Build-context indices for each element's skillpoint boost
-_BCTX_DEX_PCT = 1   # thunder element boost
-_BCTX_INT_PCT = 2   # water element boost
-_BCTX_DEF_PCT = 3   # fire element boost
-_BCTX_AGI_PCT = 4   # air element boost
-# (str = _BCTX_STR_PCT = 0, already defined; used for global str_boost AND earth)
-
-# Build-context indices (must match BUILD_CTX_* in query/query.py)
-_BCTX_STR_PCT = 0
-_BCTX_ATK_SPD = 5
+# Build-context layout (must match BUILD_CTX_* in query/query.py).
+# Stores BASE skill point counts (from non-crafted gear, supplied via _context).
+# The build's crafted-ingredient skill point contribution is in the deps array
+# itself; the kernel sums (base + crafted), clamps to [0, 150], then looks up
+# the percentage curve.
+_BCTX_BASE_STR = 0
+_BCTX_BASE_DEX = 1
+_BCTX_BASE_INT = 2
+_BCTX_BASE_DEF = 3
+_BCTX_BASE_AGI = 4
+_BCTX_ATK_SPD  = 5
+_BCTX_CRIT_PCT = 6
 
 
 # Explicit signature so the recursive dfs can be persisted to disk with
@@ -305,980 +308,317 @@ def _ehpr_bounds(raw_lo, raw_hi, pct_lo, pct_hi, def_lo, def_hi, agi_lo, agi_hi)
 
 
 # ============================================================
-# Spell damage formulas (per-spell, dispatched by spell_id)
+# Spell damage formulas (generic — one evaluator for all 13 spells)
 # ============================================================
-# Wynnbuilder formula (simplified):
-#   For each element e where spell_mult[e] > 0:
-#     base[e]   = weapon_dam[e] * spell_mult[e]/100 * atk_speed_mult
-#     boost[e]  = 1 + (sdPct + damPct + elem_pct) / 100 + skp_boost[e]
-#     dmg[e]    = base[e] * boost[e] + raw_bonus[e]
-#     dmg[e]    = dmg[e] * (1 + str_pct)        # global strBoost
-#   total = sum_e dmg[e]
-# Simplifications across all spells:
-#   - Conversions assumed default: 100% neutral (no item conversion stats yet)
-#   - No critical hit damage (use normal only)
-#   - Global raw bonuses (sdRaw/damRaw) attributed entirely to neutral element
-#     (wynnbuilder distributes proportionally — for default conversion this is
-#     equivalent up to per-element splitting, which the bound logic ignores)
+# Wynnbuilder formula (`damage_calc.js::calculateSpellDamage`):
+#
+#   1. Conversions (per spell, mults = (m_n, m_e, m_t, m_w, m_f, m_a)):
+#        damages[i]   = weapon_dam[i] * m_n/100             # neutral conv keeps element
+#        damages[i>0] += m_i/100 * sum(weapon_dam)          # elem conv routes total -> i
+#   2. Attack speed:    damages[i] *= atk_spd_mult          (skipped if ignore_speed)
+#   3. % boost per element i:
+#        boost[i] = 1 + skp[i]
+#                     + (sdPct + damPct) / 100              # static_boost (mdPct for melee)
+#                     + (eltDamPct + eltSdPct) / 100        # per-element % (mdPct variant absent here)
+#                     + (i>0) * (rDamPct + rSdPct) / 100    # rainbow (rDamPct only for melee)
+#        damages[i] *= boost[i]
+#      where skp[i] = SKP_DAMAGE_MULT[i-1] * skillPointsToPercentage(skp_total[i-1])
+#      i in {1..5} maps to {str->e, dex->t, int->w, def->f, agi->a}; skp[0] = 0.
+#   4. Raw additions x total_convert (= sum(mults)/100):
+#        For each element present[i] (weapon[i]>0 or m_i>0):
+#          per_elem_raw[i] = eltSdRaw  (or eltMdRaw for melee)
+#                            (eltDamRaw is the weapon damage in our model — NOT re-added)
+#        global_raw = sdRaw (no damRaw in registry)
+#        rainbow_raw = 0 (rSdRaw, rDamRaw not in registry — never present)
+#        total_raw = (sum_present per_elem_raw[i]) + global_raw + rainbow_raw
+#        sum_dmg += total_raw * total_convert
+#   5. Per-element clamp at 0 (rare; we clamp the total instead — conservative for monotonicity).
+#   6. Average damage (`optimize.js`):
+#        critChance = skillPointsToPercentage(dex_total)            # 0..0.808
+#        crit_mult  = 1 + critDamPct/100
+#        avg_dmg    = sum_dmg * (str_boost + critChance * crit_mult)
+#      where str_boost = 1 + skillPointsToPercentage(str_total).
+#
+# Monotonicity: every dep contributes monotone-increasingly to avg_dmg in
+# practice (positive weapon damage, non-negative skp, sane boost ranges). We
+# rely on this for B&B bounds: LB = formula(lo_corner), UB = formula(hi_corner).
 
 
 @njit(cache=True)
-def _meteor_bounds(
-    nr_lo, nr_hi, sp_lo, sp_hi, sr_lo, sr_hi,
-    dp_lo, dp_hi,
-    ep_lo, ep_hi, esp_lo, esp_hi, esr_lo, esr_hi,
-    build_ctx,
-):
+def _eval_spell_corner_spell(deps, spell_id, ctx):
     """
-    Bounds on Mage Meteor damage over the rectangle of all 7 dep ranges:
-      (nDamRaw, sdPct, sdRaw, damPct, eDamPct, eSdPct, eSdRaw).
-
-    Multipliers: (330, 70, 0, 0, 0, 0). use_spell_damage=True, ignore_speed=False.
-    Earth weapon contribution is 0 (no eDamRaw stat in our registry); earth
-    damage comes from eSdRaw raw bonus only, scaled by global str multiplier.
-    Neutral component is bilinear in (nDamRaw, sdPct+damPct) — 4-corner bound.
-    Linear additions for raw terms. Global damRaw is treated as 0 (not in our
-    stat registry).
+    Evaluate average spell damage at one corner for a SPELL-mode spell
+    (use_spell=True). `deps` is a length-31 float64 vector laid out per
+    SPELL_SPELL_DEPS in data/spells.py.
     """
-    str_pct = build_ctx[_BCTX_STR_PCT]
-    atk_spd = build_ctx[_BCTX_ATK_SPD]
-    str_boost = 1.0 + str_pct
-    n_mult = 3.30   # 330% neutral
+    mults = _SPELL_MULTS[spell_id]
+    ignore_speed = _SPELL_IGNORE_SPEED[spell_id]
+    total_convert = _SPELL_TOTAL_CONVERT[spell_id]
 
-    # ---- Neutral component ----
-    # n_weapon = nDamRaw * n_mult * atk_spd * (1 + (sdPct + damPct)/100)
-    # bilinear in (nDamRaw, sdPct+damPct); 4-corner over the (nr × sd_sum) rect.
-    sd_sum_lo = sp_lo + dp_lo
-    sd_sum_hi = sp_hi + dp_hi
-    pct_lo_factor = 1.0 + sd_sum_lo / 100.0
-    pct_hi_factor = 1.0 + sd_sum_hi / 100.0
-    c1 = nr_lo * pct_lo_factor
-    c2 = nr_lo * pct_hi_factor
-    c3 = nr_hi * pct_lo_factor
-    c4 = nr_hi * pct_hi_factor
-    n_weapon_min = c1
-    if c2 < n_weapon_min: n_weapon_min = c2
-    if c3 < n_weapon_min: n_weapon_min = c3
-    if c4 < n_weapon_min: n_weapon_min = c4
-    n_weapon_max = c1
-    if c2 > n_weapon_max: n_weapon_max = c2
-    if c3 > n_weapon_max: n_weapon_max = c3
-    if c4 > n_weapon_max: n_weapon_max = c4
-    n_weapon_min *= n_mult * atk_spd
-    n_weapon_max *= n_mult * atk_spd
+    # --- Read deps (NETWFA, indices 0=neutral) ---
+    w_n = deps[0]; w_e = deps[1]; w_t = deps[2]; w_w = deps[3]; w_f = deps[4]; w_a = deps[5]
+    p_n = deps[6]; p_e = deps[7]; p_t = deps[8]; p_w = deps[9]; p_f = deps[10]; p_a = deps[11]
+    # Per-element SdPct (n,t omitted from registry -> treated as 0)
+    sp_e = deps[12]; sp_w = deps[13]; sp_f = deps[14]; sp_a = deps[15]
+    # Per-element SdRaw (n omitted; e,t,w,f,a in registry)
+    sr_e = deps[16]; sr_t = deps[17]; sr_w = deps[18]; sr_f = deps[19]; sr_a = deps[20]
+    # Globals + rainbow
+    g_sd_pct = deps[21]; g_dam_pct = deps[22]; g_sd_raw = deps[23]
+    r_dam_pct = deps[24]; r_sd_pct = deps[25]
+    # Skill points (additive over user's base in ctx; clamped 0..150)
+    s_str = int(deps[26] + ctx[_BCTX_BASE_STR])
+    s_dex = int(deps[27] + ctx[_BCTX_BASE_DEX])
+    s_int = int(deps[28] + ctx[_BCTX_BASE_INT])
+    s_def = int(deps[29] + ctx[_BCTX_BASE_DEF])
+    s_agi = int(deps[30] + ctx[_BCTX_BASE_AGI])
+    if s_str < 0: s_str = 0
+    elif s_str > SKP_MAX: s_str = SKP_MAX
+    if s_dex < 0: s_dex = 0
+    elif s_dex > SKP_MAX: s_dex = SKP_MAX
+    if s_int < 0: s_int = 0
+    elif s_int > SKP_MAX: s_int = SKP_MAX
+    if s_def < 0: s_def = 0
+    elif s_def > SKP_MAX: s_def = SKP_MAX
+    if s_agi < 0: s_agi = 0
+    elif s_agi > SKP_MAX: s_agi = SKP_MAX
 
-    # n_raw = sdRaw  (no damRaw in our registry → treated as 0)
-    n_raw_min = sr_lo
-    n_raw_max = sr_hi
+    skp_e = _SKP_ELEM_PCT[0, s_str]   # earth from str
+    skp_t = _SKP_ELEM_PCT[1, s_dex]   # thunder from dex
+    skp_w = _SKP_ELEM_PCT[2, s_int]   # water from int
+    skp_f = _SKP_ELEM_PCT[3, s_def]   # fire from def
+    skp_a = _SKP_ELEM_PCT[4, s_agi]   # air from agi
+    crit_chance = _SKP_PCT_BASE[s_dex]
+    str_boost = 1.0 + _SKP_PCT_BASE[s_str]
 
-    # n_dmg = (n_weapon + n_raw) * str_boost  [str_boost > 0]
-    n_dmg_min = (n_weapon_min + n_raw_min) * str_boost
-    n_dmg_max = (n_weapon_max + n_raw_max) * str_boost
+    # --- Step 1+2: conversions x atk_spd ---
+    m_n = mults[0] / 100.0
+    m_e = mults[1] / 100.0
+    m_t = mults[2] / 100.0
+    m_w = mults[3] / 100.0
+    m_f = mults[4] / 100.0
+    m_a = mults[5] / 100.0
+    total_w = w_n + w_e + w_t + w_w + w_f + w_a
 
-    # ---- Earth component ----
-    # e_weapon = 0 (no eDamRaw stat)
-    # e_raw = eSdRaw, scaled only by str_boost
-    e_dmg_min = esr_lo * str_boost
-    e_dmg_max = esr_hi * str_boost
+    init_n = w_n * m_n
+    init_e = w_e * m_n + (m_e * total_w if m_e > 0 else 0.0)
+    init_t = w_t * m_n + (m_t * total_w if m_t > 0 else 0.0)
+    init_w = w_w * m_n + (m_w * total_w if m_w > 0 else 0.0)
+    init_f = w_f * m_n + (m_f * total_w if m_f > 0 else 0.0)
+    init_a = w_a * m_n + (m_a * total_w if m_a > 0 else 0.0)
 
-    return np.int64(n_dmg_min + e_dmg_min), np.int64(n_dmg_max + e_dmg_max)
+    atk_spd = 1.0 if ignore_speed else ctx[_BCTX_ATK_SPD]
+    init_n *= atk_spd; init_e *= atk_spd; init_t *= atk_spd
+    init_w *= atk_spd; init_f *= atk_spd; init_a *= atk_spd
 
+    # --- Step 3: % boost per element ---
+    static_boost = (g_sd_pct + g_dam_pct) / 100.0
+    rainbow_boost = (r_dam_pct + r_sd_pct) / 100.0   # applied to non-neutral
 
-# --- Meteor — leaf and UB-range adapters ---
-# Each adapter reads the 8 Meteor deps from the appropriate (lo, hi) source
-# arrays via comp_dep_indices[off+0..7] and returns (cmin, cmax) via _meteor_bounds.
+    # Neutral: no skp, no rainbow, n SdPct absent -> 0
+    boost_n = 1.0 + static_boost + p_n / 100.0
+    boost_e = 1.0 + skp_e + static_boost + (p_e + sp_e) / 100.0 + rainbow_boost
+    boost_t = 1.0 + skp_t + static_boost + (p_t + 0.0) / 100.0 + rainbow_boost   # tSdPct absent
+    boost_w = 1.0 + skp_w + static_boost + (p_w + sp_w) / 100.0 + rainbow_boost
+    boost_f = 1.0 + skp_f + static_boost + (p_f + sp_f) / 100.0 + rainbow_boost
+    boost_a = 1.0 + skp_a + static_boost + (p_a + sp_a) / 100.0 + rainbow_boost
 
-@njit(cache=True)
-def _meteor_leaf(off, dep_indices, mins, maxs, build_ctx):
-    """Bounds at the leaf — `mins`/`maxs` are the build's roll min/max arrays."""
-    return _meteor_bounds(
-        mins[dep_indices[off + 0]], maxs[dep_indices[off + 0]],
-        mins[dep_indices[off + 1]], maxs[dep_indices[off + 1]],
-        mins[dep_indices[off + 2]], maxs[dep_indices[off + 2]],
-        mins[dep_indices[off + 3]], maxs[dep_indices[off + 3]],
-        mins[dep_indices[off + 4]], maxs[dep_indices[off + 4]],
-        mins[dep_indices[off + 5]], maxs[dep_indices[off + 5]],
-        mins[dep_indices[off + 6]], maxs[dep_indices[off + 6]],
-        build_ctx,
-    )
+    sum_dmg = (init_n * boost_n + init_e * boost_e + init_t * boost_t
+               + init_w * boost_w + init_f * boost_f + init_a * boost_a)
 
+    # --- Step 4: raw additions (gated by per-element presence) ---
+    # present[i] = (weapon[i] > 0) or (mults[i] > 0). nSdRaw absent -> no neutral term.
+    raw_sum = 0.0
+    if (w_e > 0.0) or (m_e > 0.0): raw_sum += sr_e
+    if (w_t > 0.0) or (m_t > 0.0): raw_sum += sr_t
+    if (w_w > 0.0) or (m_w > 0.0): raw_sum += sr_w
+    if (w_f > 0.0) or (m_f > 0.0): raw_sum += sr_f
+    if (w_a > 0.0) or (m_a > 0.0): raw_sum += sr_a
+    raw_sum += g_sd_raw      # global (sdRaw + damRaw -> damRaw absent)
+    sum_dmg += raw_sum * total_convert
 
-@njit(cache=True)
-def _meteor_dfs_ub_branch(off, dep_indices, current, future_lb, future_ub, next_depth, build_ctx):
-    """Bounds at the dfs UB site for one branch (max-range or min-range)."""
-    return _meteor_bounds(
-        current[dep_indices[off + 0]] + future_lb[next_depth, dep_indices[off + 0]],
-        current[dep_indices[off + 0]] + future_ub[next_depth, dep_indices[off + 0]],
-        current[dep_indices[off + 1]] + future_lb[next_depth, dep_indices[off + 1]],
-        current[dep_indices[off + 1]] + future_ub[next_depth, dep_indices[off + 1]],
-        current[dep_indices[off + 2]] + future_lb[next_depth, dep_indices[off + 2]],
-        current[dep_indices[off + 2]] + future_ub[next_depth, dep_indices[off + 2]],
-        current[dep_indices[off + 3]] + future_lb[next_depth, dep_indices[off + 3]],
-        current[dep_indices[off + 3]] + future_ub[next_depth, dep_indices[off + 3]],
-        current[dep_indices[off + 4]] + future_lb[next_depth, dep_indices[off + 4]],
-        current[dep_indices[off + 4]] + future_ub[next_depth, dep_indices[off + 4]],
-        current[dep_indices[off + 5]] + future_lb[next_depth, dep_indices[off + 5]],
-        current[dep_indices[off + 5]] + future_ub[next_depth, dep_indices[off + 5]],
-        current[dep_indices[off + 6]] + future_lb[next_depth, dep_indices[off + 6]],
-        current[dep_indices[off + 6]] + future_ub[next_depth, dep_indices[off + 6]],
-        build_ctx,
-    )
-
-
-@njit(cache=True)
-def _meteor_k2_ub_branch(off, dep_indices, after, slot1_worst, slot1_best, build_ctx):
-    """Bounds at the k=2 UB site for one branch (max-range or min-range)."""
-    return _meteor_bounds(
-        after[dep_indices[off + 0]] + slot1_worst[dep_indices[off + 0]],
-        after[dep_indices[off + 0]] + slot1_best[dep_indices[off + 0]],
-        after[dep_indices[off + 1]] + slot1_worst[dep_indices[off + 1]],
-        after[dep_indices[off + 1]] + slot1_best[dep_indices[off + 1]],
-        after[dep_indices[off + 2]] + slot1_worst[dep_indices[off + 2]],
-        after[dep_indices[off + 2]] + slot1_best[dep_indices[off + 2]],
-        after[dep_indices[off + 3]] + slot1_worst[dep_indices[off + 3]],
-        after[dep_indices[off + 3]] + slot1_best[dep_indices[off + 3]],
-        after[dep_indices[off + 4]] + slot1_worst[dep_indices[off + 4]],
-        after[dep_indices[off + 4]] + slot1_best[dep_indices[off + 4]],
-        after[dep_indices[off + 5]] + slot1_worst[dep_indices[off + 5]],
-        after[dep_indices[off + 5]] + slot1_best[dep_indices[off + 5]],
-        after[dep_indices[off + 6]] + slot1_worst[dep_indices[off + 6]],
-        after[dep_indices[off + 6]] + slot1_best[dep_indices[off + 6]],
-        build_ctx,
-    )
-
-
-# --- Warrior Bash — melee, neutral + earth ---
-# Multipliers (170, 30, 0, 0, 0, 0). use_spell=False (uses mdPct/mdRaw).
-# Earth weapon damage = 0 (no eDamRaw); earth contribution comes from eMdRaw
-# raw bonus only. Per-element % on earth multiplied by 0 weapon → not in deps.
-# Deps: (nDamRaw, mdPct, mdRaw, damPct, nMdRaw, eMdRaw).
-
-@njit(cache=True)
-def _bash_bounds(
-    nr_lo, nr_hi, mp_lo, mp_hi, mr_lo, mr_hi,
-    dp_lo, dp_hi, nmr_lo, nmr_hi, emr_lo, emr_hi,
-    build_ctx,
-):
-    str_pct = build_ctx[_BCTX_STR_PCT]
-    atk_spd = build_ctx[_BCTX_ATK_SPD]
-    str_boost = 1.0 + str_pct
-    n_mult = 1.70   # 170% neutral
-
-    # Neutral weapon contribution — bilinear in (nDamRaw, mdPct + damPct).
-    md_dam_lo = mp_lo + dp_lo
-    md_dam_hi = mp_hi + dp_hi
-    pct_lo_factor = 1.0 + md_dam_lo / 100.0
-    pct_hi_factor = 1.0 + md_dam_hi / 100.0
-    c1 = nr_lo * pct_lo_factor
-    c2 = nr_lo * pct_hi_factor
-    c3 = nr_hi * pct_lo_factor
-    c4 = nr_hi * pct_hi_factor
-    n_weapon_min = c1
-    if c2 < n_weapon_min: n_weapon_min = c2
-    if c3 < n_weapon_min: n_weapon_min = c3
-    if c4 < n_weapon_min: n_weapon_min = c4
-    n_weapon_max = c1
-    if c2 > n_weapon_max: n_weapon_max = c2
-    if c3 > n_weapon_max: n_weapon_max = c3
-    if c4 > n_weapon_max: n_weapon_max = c4
-    n_weapon_min *= n_mult * atk_spd
-    n_weapon_max *= n_mult * atk_spd
-
-    # Total raw bonuses — mdRaw goes to neutral (default conversion);
-    # nMdRaw to neutral, eMdRaw to earth. Earth weapon = 0 so e_dmg = eMdRaw.
-    # All raw added then scaled by global str_boost.
-    raw_min = mr_lo + nmr_lo + emr_lo
-    raw_max = mr_hi + nmr_hi + emr_hi
-
-    total_min = (n_weapon_min + raw_min) * str_boost
-    total_max = (n_weapon_max + raw_max) * str_boost
-    return np.int64(total_min), np.int64(total_max)
+    # --- Step 5: clamp + Step 6: average factor ---
+    if sum_dmg < 0.0:
+        sum_dmg = 0.0
+    crit_mult = 1.0 + ctx[_BCTX_CRIT_PCT] / 100.0
+    return sum_dmg * (str_boost + crit_chance * crit_mult)
 
 
 @njit(cache=True)
-def _bash_leaf(off, dep_indices, mins, maxs, build_ctx):
-    return _bash_bounds(
-        mins[dep_indices[off + 0]], maxs[dep_indices[off + 0]],
-        mins[dep_indices[off + 1]], maxs[dep_indices[off + 1]],
-        mins[dep_indices[off + 2]], maxs[dep_indices[off + 2]],
-        mins[dep_indices[off + 3]], maxs[dep_indices[off + 3]],
-        mins[dep_indices[off + 4]], maxs[dep_indices[off + 4]],
-        mins[dep_indices[off + 5]], maxs[dep_indices[off + 5]],
-        build_ctx,
-    )
-
-
-@njit(cache=True)
-def _bash_dfs_ub_branch(off, dep_indices, current, future_lb, future_ub, next_depth, build_ctx):
-    return _bash_bounds(
-        current[dep_indices[off + 0]] + future_lb[next_depth, dep_indices[off + 0]],
-        current[dep_indices[off + 0]] + future_ub[next_depth, dep_indices[off + 0]],
-        current[dep_indices[off + 1]] + future_lb[next_depth, dep_indices[off + 1]],
-        current[dep_indices[off + 1]] + future_ub[next_depth, dep_indices[off + 1]],
-        current[dep_indices[off + 2]] + future_lb[next_depth, dep_indices[off + 2]],
-        current[dep_indices[off + 2]] + future_ub[next_depth, dep_indices[off + 2]],
-        current[dep_indices[off + 3]] + future_lb[next_depth, dep_indices[off + 3]],
-        current[dep_indices[off + 3]] + future_ub[next_depth, dep_indices[off + 3]],
-        current[dep_indices[off + 4]] + future_lb[next_depth, dep_indices[off + 4]],
-        current[dep_indices[off + 4]] + future_ub[next_depth, dep_indices[off + 4]],
-        current[dep_indices[off + 5]] + future_lb[next_depth, dep_indices[off + 5]],
-        current[dep_indices[off + 5]] + future_ub[next_depth, dep_indices[off + 5]],
-        build_ctx,
-    )
-
-
-@njit(cache=True)
-def _bash_k2_ub_branch(off, dep_indices, after, slot1_worst, slot1_best, build_ctx):
-    return _bash_bounds(
-        after[dep_indices[off + 0]] + slot1_worst[dep_indices[off + 0]],
-        after[dep_indices[off + 0]] + slot1_best[dep_indices[off + 0]],
-        after[dep_indices[off + 1]] + slot1_worst[dep_indices[off + 1]],
-        after[dep_indices[off + 1]] + slot1_best[dep_indices[off + 1]],
-        after[dep_indices[off + 2]] + slot1_worst[dep_indices[off + 2]],
-        after[dep_indices[off + 2]] + slot1_best[dep_indices[off + 2]],
-        after[dep_indices[off + 3]] + slot1_worst[dep_indices[off + 3]],
-        after[dep_indices[off + 3]] + slot1_best[dep_indices[off + 3]],
-        after[dep_indices[off + 4]] + slot1_worst[dep_indices[off + 4]],
-        after[dep_indices[off + 4]] + slot1_best[dep_indices[off + 4]],
-        after[dep_indices[off + 5]] + slot1_worst[dep_indices[off + 5]],
-        after[dep_indices[off + 5]] + slot1_best[dep_indices[off + 5]],
-        build_ctx,
-    )
-
-
-# ============================================================
-# Generic spell bound formulas (used by Ice Snake and all spells added
-# in commit "all spells"). Element 1 is always neutral and receives the
-# global raw bonus. Per-element contributions are bilinear in
-# (weapon, total_pct), bounded by 4 corners; raw additions are linear.
-# str_boost (global multiplier 1+str_pct) applied at the end.
-# ============================================================
-
-
-@njit(cache=True)
-def _bilinear_4corner(wl, wh, fl, fh):
-    """4-corner bound on w * f over [wl,wh] x [fl,fh]."""
-    c1 = wl * fl; c2 = wl * fh; c3 = wh * fl; c4 = wh * fh
-    lo = c1
-    if c2 < lo: lo = c2
-    if c3 < lo: lo = c3
-    if c4 < lo: lo = c4
-    hi = c1
-    if c2 > hi: hi = c2
-    if c3 > hi: hi = c3
-    if c4 > hi: hi = c4
-    return lo, hi
-
-
-@njit(cache=True)
-def _spell_2elem_bounds(
-    w1l, w1h, p1l, p1h, r1l, r1h,    # element 1 (neutral): weapon, elem_pct, elem_raw
-    w2l, w2h, p2l, p2h, r2l, r2h,    # element 2: weapon, elem_pct, elem_raw
-    gpl, gph, grl, grh,                # globals: pct, raw
-    m1, m2, skp1, skp2,                # spell constants per element
-    atk_spd_mult, str_pct,             # build context
-):
+def _eval_spell_corner_melee(deps, spell_id, ctx):
     """
-    Bound for a 2-element spell. Element 1 gets the global raw (default
-    conversion is 100% neutral). Each element contribution:
-      base = w_i * m_i/100 * atk_spd * (1 + (g_pct + p_i)/100 + skp_i)
-      raw  = r_i + (g_r if i == 1 else 0)
-      dmg  = base + raw
-    total = (dmg1 + dmg2) * (1 + str_pct)
+    Same as `_eval_spell_corner_spell` but for MELEE-mode spells (use_spell=False).
+    `deps` length 27, layout per SPELL_MELEE_DEPS in data/spells.py.
     """
-    str_boost = 1.0 + str_pct
+    mults = _SPELL_MULTS[spell_id]
+    ignore_speed = _SPELL_IGNORE_SPEED[spell_id]
+    total_convert = _SPELL_TOTAL_CONVERT[spell_id]
 
-    f1lo = 1.0 + (gpl + p1l) / 100.0 + skp1
-    f1hi = 1.0 + (gph + p1h) / 100.0 + skp1
-    e1_lo, e1_hi = _bilinear_4corner(w1l, w1h, f1lo, f1hi)
-    e1_lo *= m1 * atk_spd_mult / 100.0
-    e1_hi *= m1 * atk_spd_mult / 100.0
-    e1_lo += r1l + grl
-    e1_hi += r1h + grh
+    w_n = deps[0]; w_e = deps[1]; w_t = deps[2]; w_w = deps[3]; w_f = deps[4]; w_a = deps[5]
+    p_n = deps[6]; p_e = deps[7]; p_t = deps[8]; p_w = deps[9]; p_f = deps[10]; p_a = deps[11]
+    # Per-element MdRaw — all 6 in registry
+    mr_n = deps[12]; mr_e = deps[13]; mr_t = deps[14]; mr_w = deps[15]; mr_f = deps[16]; mr_a = deps[17]
+    g_md_pct = deps[18]; g_dam_pct = deps[19]; g_md_raw = deps[20]
+    r_dam_pct = deps[21]   # rMdPct absent -> no rainbow Md %
 
-    f2lo = 1.0 + (gpl + p2l) / 100.0 + skp2
-    f2hi = 1.0 + (gph + p2h) / 100.0 + skp2
-    e2_lo, e2_hi = _bilinear_4corner(w2l, w2h, f2lo, f2hi)
-    e2_lo *= m2 * atk_spd_mult / 100.0
-    e2_hi *= m2 * atk_spd_mult / 100.0
-    e2_lo += r2l
-    e2_hi += r2h
+    s_str = int(deps[22] + ctx[_BCTX_BASE_STR])
+    s_dex = int(deps[23] + ctx[_BCTX_BASE_DEX])
+    s_int = int(deps[24] + ctx[_BCTX_BASE_INT])
+    s_def = int(deps[25] + ctx[_BCTX_BASE_DEF])
+    s_agi = int(deps[26] + ctx[_BCTX_BASE_AGI])
+    if s_str < 0: s_str = 0
+    elif s_str > SKP_MAX: s_str = SKP_MAX
+    if s_dex < 0: s_dex = 0
+    elif s_dex > SKP_MAX: s_dex = SKP_MAX
+    if s_int < 0: s_int = 0
+    elif s_int > SKP_MAX: s_int = SKP_MAX
+    if s_def < 0: s_def = 0
+    elif s_def > SKP_MAX: s_def = SKP_MAX
+    if s_agi < 0: s_agi = 0
+    elif s_agi > SKP_MAX: s_agi = SKP_MAX
 
-    return np.int64((e1_lo + e2_lo) * str_boost), np.int64((e1_hi + e2_hi) * str_boost)
+    skp_e = _SKP_ELEM_PCT[0, s_str]
+    skp_t = _SKP_ELEM_PCT[1, s_dex]
+    skp_w = _SKP_ELEM_PCT[2, s_int]
+    skp_f = _SKP_ELEM_PCT[3, s_def]
+    skp_a = _SKP_ELEM_PCT[4, s_agi]
+    crit_chance = _SKP_PCT_BASE[s_dex]
+    str_boost = 1.0 + _SKP_PCT_BASE[s_str]
 
+    m_n = mults[0] / 100.0
+    m_e = mults[1] / 100.0
+    m_t = mults[2] / 100.0
+    m_w = mults[3] / 100.0
+    m_f = mults[4] / 100.0
+    m_a = mults[5] / 100.0
+    total_w = w_n + w_e + w_t + w_w + w_f + w_a
 
-@njit(cache=True)
-def _spell_3elem_bounds(
-    w1l, w1h, p1l, p1h, r1l, r1h,
-    w2l, w2h, p2l, p2h, r2l, r2h,
-    w3l, w3h, p3l, p3h, r3l, r3h,
-    gpl, gph, grl, grh,
-    m1, m2, m3, skp1, skp2, skp3,
-    atk_spd_mult, str_pct,
-):
-    """3-element variant of _spell_2elem_bounds. Element 1 carries global raws."""
-    str_boost = 1.0 + str_pct
+    init_n = w_n * m_n
+    init_e = w_e * m_n + (m_e * total_w if m_e > 0 else 0.0)
+    init_t = w_t * m_n + (m_t * total_w if m_t > 0 else 0.0)
+    init_w = w_w * m_n + (m_w * total_w if m_w > 0 else 0.0)
+    init_f = w_f * m_n + (m_f * total_w if m_f > 0 else 0.0)
+    init_a = w_a * m_n + (m_a * total_w if m_a > 0 else 0.0)
 
-    f1lo = 1.0 + (gpl + p1l) / 100.0 + skp1
-    f1hi = 1.0 + (gph + p1h) / 100.0 + skp1
-    e1_lo, e1_hi = _bilinear_4corner(w1l, w1h, f1lo, f1hi)
-    e1_lo *= m1 * atk_spd_mult / 100.0
-    e1_hi *= m1 * atk_spd_mult / 100.0
-    e1_lo += r1l + grl
-    e1_hi += r1h + grh
+    atk_spd = 1.0 if ignore_speed else ctx[_BCTX_ATK_SPD]
+    init_n *= atk_spd; init_e *= atk_spd; init_t *= atk_spd
+    init_w *= atk_spd; init_f *= atk_spd; init_a *= atk_spd
 
-    f2lo = 1.0 + (gpl + p2l) / 100.0 + skp2
-    f2hi = 1.0 + (gph + p2h) / 100.0 + skp2
-    e2_lo, e2_hi = _bilinear_4corner(w2l, w2h, f2lo, f2hi)
-    e2_lo *= m2 * atk_spd_mult / 100.0
-    e2_hi *= m2 * atk_spd_mult / 100.0
-    e2_lo += r2l
-    e2_hi += r2h
+    static_boost = (g_md_pct + g_dam_pct) / 100.0
+    rainbow_boost = r_dam_pct / 100.0
 
-    f3lo = 1.0 + (gpl + p3l) / 100.0 + skp3
-    f3hi = 1.0 + (gph + p3h) / 100.0 + skp3
-    e3_lo, e3_hi = _bilinear_4corner(w3l, w3h, f3lo, f3hi)
-    e3_lo *= m3 * atk_spd_mult / 100.0
-    e3_hi *= m3 * atk_spd_mult / 100.0
-    e3_lo += r3l
-    e3_hi += r3h
+    boost_n = 1.0 + static_boost + p_n / 100.0   # nMdPct absent -> 0
+    boost_e = 1.0 + skp_e + static_boost + p_e / 100.0 + rainbow_boost   # eMdPct absent
+    boost_t = 1.0 + skp_t + static_boost + p_t / 100.0 + rainbow_boost
+    boost_w = 1.0 + skp_w + static_boost + p_w / 100.0 + rainbow_boost
+    boost_f = 1.0 + skp_f + static_boost + p_f / 100.0 + rainbow_boost
+    boost_a = 1.0 + skp_a + static_boost + p_a / 100.0 + rainbow_boost
 
-    return (
-        np.int64((e1_lo + e2_lo + e3_lo) * str_boost),
-        np.int64((e1_hi + e2_hi + e3_hi) * str_boost),
-    )
+    sum_dmg = (init_n * boost_n + init_e * boost_e + init_t * boost_t
+               + init_w * boost_w + init_f * boost_f + init_a * boost_a)
+
+    raw_sum = 0.0
+    if (w_n > 0.0) or (m_n > 0.0): raw_sum += mr_n
+    if (w_e > 0.0) or (m_e > 0.0): raw_sum += mr_e
+    if (w_t > 0.0) or (m_t > 0.0): raw_sum += mr_t
+    if (w_w > 0.0) or (m_w > 0.0): raw_sum += mr_w
+    if (w_f > 0.0) or (m_f > 0.0): raw_sum += mr_f
+    if (w_a > 0.0) or (m_a > 0.0): raw_sum += mr_a
+    raw_sum += g_md_raw
+    sum_dmg += raw_sum * total_convert
+
+    if sum_dmg < 0.0:
+        sum_dmg = 0.0
+    crit_mult = 1.0 + ctx[_BCTX_CRIT_PCT] / 100.0
+    return sum_dmg * (str_boost + crit_chance * crit_mult)
 
 
 # ============================================================
-# Per-spell adapters — each spell gets a leaf + dfs-ub + k2-ub adapter that
-# reads its specific dep ordering from comp_dep_indices and calls the
-# matching generic bound function with spell-specific multipliers and
-# skillpoint pcts. The dep ordering for each spell is documented inline and
-# must match the entry in data/spells.py.
-# ============================================================
-
-
-# ---- mage_ice_snake (n + w, spell, mults 120/55) ----
-# Deps: (nDamRaw, sdPct, sdRaw, damPct, wDamRaw, wDamPct, wSdPct, wSdRaw)
-
-@njit(cache=True)
-def _ice_snake_leaf(off, di, mins, maxs, ctx):
-    return _spell_2elem_bounds(
-        mins[di[off+0]], maxs[di[off+0]], 0.0, 0.0, 0.0, 0.0,
-        mins[di[off+4]], maxs[di[off+4]],
-        mins[di[off+5]] + mins[di[off+6]], maxs[di[off+5]] + maxs[di[off+6]],
-        mins[di[off+7]], maxs[di[off+7]],
-        mins[di[off+1]] + mins[di[off+3]], maxs[di[off+1]] + maxs[di[off+3]],
-        mins[di[off+2]], maxs[di[off+2]],
-        120, 55, 0.0, ctx[_BCTX_INT_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _ice_snake_dfs_ub(off, di, cur, flb, fub, nd, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_2elem_bounds(
-        cur[s0]+flb[nd,s0], cur[s0]+fub[nd,s0], 0.0, 0.0, 0.0, 0.0,
-        cur[s4]+flb[nd,s4], cur[s4]+fub[nd,s4],
-        cur[s5]+flb[nd,s5] + cur[s6]+flb[nd,s6], cur[s5]+fub[nd,s5] + cur[s6]+fub[nd,s6],
-        cur[s7]+flb[nd,s7], cur[s7]+fub[nd,s7],
-        cur[s1]+flb[nd,s1] + cur[s3]+flb[nd,s3], cur[s1]+fub[nd,s1] + cur[s3]+fub[nd,s3],
-        cur[s2]+flb[nd,s2], cur[s2]+fub[nd,s2],
-        120, 55, 0.0, ctx[_BCTX_INT_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _ice_snake_k2_ub(off, di, after, sw, sb, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_2elem_bounds(
-        after[s0]+sw[s0], after[s0]+sb[s0], 0.0, 0.0, 0.0, 0.0,
-        after[s4]+sw[s4], after[s4]+sb[s4],
-        after[s5]+sw[s5] + after[s6]+sw[s6], after[s5]+sb[s5] + after[s6]+sb[s6],
-        after[s7]+sw[s7], after[s7]+sb[s7],
-        after[s1]+sw[s1] + after[s3]+sw[s3], after[s1]+sb[s1] + after[s3]+sb[s3],
-        after[s2]+sw[s2], after[s2]+sb[s2],
-        120, 55, 0.0, ctx[_BCTX_INT_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-# ---- warrior_uppercut (n + e + t, melee, mults 260/40/40) ----
-# Deps: (nDamRaw, mdPct, mdRaw, damPct, nMdRaw, eMdRaw, tDamRaw, tDamPct, tMdRaw)
-
-@njit(cache=True)
-def _uppercut_leaf(off, di, mins, maxs, ctx):
-    return _spell_3elem_bounds(
-        mins[di[off+0]], maxs[di[off+0]], 0.0, 0.0,
-        mins[di[off+4]], maxs[di[off+4]],
-        0.0, 0.0, 0.0, 0.0, mins[di[off+5]], maxs[di[off+5]],
-        mins[di[off+6]], maxs[di[off+6]],
-        mins[di[off+7]], maxs[di[off+7]],
-        mins[di[off+8]], maxs[di[off+8]],
-        mins[di[off+1]] + mins[di[off+3]], maxs[di[off+1]] + maxs[di[off+3]],
-        mins[di[off+2]], maxs[di[off+2]],
-        260, 40, 40, 0.0, ctx[_BCTX_STR_PCT], ctx[_BCTX_DEX_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _uppercut_dfs_ub(off, di, cur, flb, fub, nd, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7, s8 = di[off+4], di[off+5], di[off+6], di[off+7], di[off+8]
-    return _spell_3elem_bounds(
-        cur[s0]+flb[nd,s0], cur[s0]+fub[nd,s0], 0.0, 0.0,
-        cur[s4]+flb[nd,s4], cur[s4]+fub[nd,s4],
-        0.0, 0.0, 0.0, 0.0, cur[s5]+flb[nd,s5], cur[s5]+fub[nd,s5],
-        cur[s6]+flb[nd,s6], cur[s6]+fub[nd,s6],
-        cur[s7]+flb[nd,s7], cur[s7]+fub[nd,s7],
-        cur[s8]+flb[nd,s8], cur[s8]+fub[nd,s8],
-        cur[s1]+flb[nd,s1] + cur[s3]+flb[nd,s3], cur[s1]+fub[nd,s1] + cur[s3]+fub[nd,s3],
-        cur[s2]+flb[nd,s2], cur[s2]+fub[nd,s2],
-        260, 40, 40, 0.0, ctx[_BCTX_STR_PCT], ctx[_BCTX_DEX_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _uppercut_k2_ub(off, di, after, sw, sb, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7, s8 = di[off+4], di[off+5], di[off+6], di[off+7], di[off+8]
-    return _spell_3elem_bounds(
-        after[s0]+sw[s0], after[s0]+sb[s0], 0.0, 0.0,
-        after[s4]+sw[s4], after[s4]+sb[s4],
-        0.0, 0.0, 0.0, 0.0, after[s5]+sw[s5], after[s5]+sb[s5],
-        after[s6]+sw[s6], after[s6]+sb[s6],
-        after[s7]+sw[s7], after[s7]+sb[s7],
-        after[s8]+sw[s8], after[s8]+sb[s8],
-        after[s1]+sw[s1] + after[s3]+sw[s3], after[s1]+sb[s1] + after[s3]+sb[s3],
-        after[s2]+sw[s2], after[s2]+sb[s2],
-        260, 40, 40, 0.0, ctx[_BCTX_STR_PCT], ctx[_BCTX_DEX_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-# ---- warrior_war_scream (n + f, melee, mults 75/25) ----
-# Deps: (nDamRaw, mdPct, mdRaw, damPct, nMdRaw, fDamRaw, fDamPct, fMdRaw)
-
-@njit(cache=True)
-def _war_scream_leaf(off, di, mins, maxs, ctx):
-    return _spell_2elem_bounds(
-        mins[di[off+0]], maxs[di[off+0]], 0.0, 0.0,
-        mins[di[off+4]], maxs[di[off+4]],
-        mins[di[off+5]], maxs[di[off+5]],
-        mins[di[off+6]], maxs[di[off+6]],
-        mins[di[off+7]], maxs[di[off+7]],
-        mins[di[off+1]] + mins[di[off+3]], maxs[di[off+1]] + maxs[di[off+3]],
-        mins[di[off+2]], maxs[di[off+2]],
-        75, 25, 0.0, ctx[_BCTX_DEF_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _war_scream_dfs_ub(off, di, cur, flb, fub, nd, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_2elem_bounds(
-        cur[s0]+flb[nd,s0], cur[s0]+fub[nd,s0], 0.0, 0.0,
-        cur[s4]+flb[nd,s4], cur[s4]+fub[nd,s4],
-        cur[s5]+flb[nd,s5], cur[s5]+fub[nd,s5],
-        cur[s6]+flb[nd,s6], cur[s6]+fub[nd,s6],
-        cur[s7]+flb[nd,s7], cur[s7]+fub[nd,s7],
-        cur[s1]+flb[nd,s1] + cur[s3]+flb[nd,s3], cur[s1]+fub[nd,s1] + cur[s3]+fub[nd,s3],
-        cur[s2]+flb[nd,s2], cur[s2]+fub[nd,s2],
-        75, 25, 0.0, ctx[_BCTX_DEF_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _war_scream_k2_ub(off, di, after, sw, sb, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_2elem_bounds(
-        after[s0]+sw[s0], after[s0]+sb[s0], 0.0, 0.0,
-        after[s4]+sw[s4], after[s4]+sb[s4],
-        after[s5]+sw[s5], after[s5]+sb[s5],
-        after[s6]+sw[s6], after[s6]+sb[s6],
-        after[s7]+sw[s7], after[s7]+sb[s7],
-        after[s1]+sw[s1] + after[s3]+sw[s3], after[s1]+sb[s1] + after[s3]+sb[s3],
-        after[s2]+sw[s2], after[s2]+sb[s2],
-        75, 25, 0.0, ctx[_BCTX_DEF_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-# ---- archer_arrow_storm (n + t, spell, mults 30/10) ----
-# Deps: (nDamRaw, sdPct, sdRaw, damPct, tDamRaw, tDamPct)
-
-@njit(cache=True)
-def _arrow_storm_leaf(off, di, mins, maxs, ctx):
-    return _spell_2elem_bounds(
-        mins[di[off+0]], maxs[di[off+0]], 0.0, 0.0, 0.0, 0.0,
-        mins[di[off+4]], maxs[di[off+4]],
-        mins[di[off+5]], maxs[di[off+5]],
-        0.0, 0.0,
-        mins[di[off+1]] + mins[di[off+3]], maxs[di[off+1]] + maxs[di[off+3]],
-        mins[di[off+2]], maxs[di[off+2]],
-        30, 10, 0.0, ctx[_BCTX_DEX_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _arrow_storm_dfs_ub(off, di, cur, flb, fub, nd, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5 = di[off+4], di[off+5]
-    return _spell_2elem_bounds(
-        cur[s0]+flb[nd,s0], cur[s0]+fub[nd,s0], 0.0, 0.0, 0.0, 0.0,
-        cur[s4]+flb[nd,s4], cur[s4]+fub[nd,s4],
-        cur[s5]+flb[nd,s5], cur[s5]+fub[nd,s5],
-        0.0, 0.0,
-        cur[s1]+flb[nd,s1] + cur[s3]+flb[nd,s3], cur[s1]+fub[nd,s1] + cur[s3]+fub[nd,s3],
-        cur[s2]+flb[nd,s2], cur[s2]+fub[nd,s2],
-        30, 10, 0.0, ctx[_BCTX_DEX_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _arrow_storm_k2_ub(off, di, after, sw, sb, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5 = di[off+4], di[off+5]
-    return _spell_2elem_bounds(
-        after[s0]+sw[s0], after[s0]+sb[s0], 0.0, 0.0, 0.0, 0.0,
-        after[s4]+sw[s4], after[s4]+sb[s4],
-        after[s5]+sw[s5], after[s5]+sb[s5],
-        0.0, 0.0,
-        after[s1]+sw[s1] + after[s3]+sw[s3], after[s1]+sb[s1] + after[s3]+sb[s3],
-        after[s2]+sw[s2], after[s2]+sb[s2],
-        30, 10, 0.0, ctx[_BCTX_DEX_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-# ---- archer_arrow_bomb (n + f, spell, mults 140/20) ----
-# Deps: (nDamRaw, sdPct, sdRaw, damPct, fDamRaw, fDamPct, fSdPct, fSdRaw)
-
-@njit(cache=True)
-def _arrow_bomb_leaf(off, di, mins, maxs, ctx):
-    return _spell_2elem_bounds(
-        mins[di[off+0]], maxs[di[off+0]], 0.0, 0.0, 0.0, 0.0,
-        mins[di[off+4]], maxs[di[off+4]],
-        mins[di[off+5]] + mins[di[off+6]], maxs[di[off+5]] + maxs[di[off+6]],
-        mins[di[off+7]], maxs[di[off+7]],
-        mins[di[off+1]] + mins[di[off+3]], maxs[di[off+1]] + maxs[di[off+3]],
-        mins[di[off+2]], maxs[di[off+2]],
-        140, 20, 0.0, ctx[_BCTX_DEF_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _arrow_bomb_dfs_ub(off, di, cur, flb, fub, nd, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_2elem_bounds(
-        cur[s0]+flb[nd,s0], cur[s0]+fub[nd,s0], 0.0, 0.0, 0.0, 0.0,
-        cur[s4]+flb[nd,s4], cur[s4]+fub[nd,s4],
-        cur[s5]+flb[nd,s5] + cur[s6]+flb[nd,s6], cur[s5]+fub[nd,s5] + cur[s6]+fub[nd,s6],
-        cur[s7]+flb[nd,s7], cur[s7]+fub[nd,s7],
-        cur[s1]+flb[nd,s1] + cur[s3]+flb[nd,s3], cur[s1]+fub[nd,s1] + cur[s3]+fub[nd,s3],
-        cur[s2]+flb[nd,s2], cur[s2]+fub[nd,s2],
-        140, 20, 0.0, ctx[_BCTX_DEF_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _arrow_bomb_k2_ub(off, di, after, sw, sb, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_2elem_bounds(
-        after[s0]+sw[s0], after[s0]+sb[s0], 0.0, 0.0, 0.0, 0.0,
-        after[s4]+sw[s4], after[s4]+sb[s4],
-        after[s5]+sw[s5] + after[s6]+sw[s6], after[s5]+sb[s5] + after[s6]+sb[s6],
-        after[s7]+sw[s7], after[s7]+sb[s7],
-        after[s1]+sw[s1] + after[s3]+sw[s3], after[s1]+sb[s1] + after[s3]+sb[s3],
-        after[s2]+sw[s2], after[s2]+sb[s2],
-        140, 20, 0.0, ctx[_BCTX_DEF_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-# ---- assassin_spin_attack (n + t, melee, mults 120/30) ----
-# Deps: (nDamRaw, mdPct, mdRaw, damPct, nMdRaw, tDamRaw, tDamPct, tMdRaw)
-
-@njit(cache=True)
-def _spin_attack_leaf(off, di, mins, maxs, ctx):
-    return _spell_2elem_bounds(
-        mins[di[off+0]], maxs[di[off+0]], 0.0, 0.0,
-        mins[di[off+4]], maxs[di[off+4]],
-        mins[di[off+5]], maxs[di[off+5]],
-        mins[di[off+6]], maxs[di[off+6]],
-        mins[di[off+7]], maxs[di[off+7]],
-        mins[di[off+1]] + mins[di[off+3]], maxs[di[off+1]] + maxs[di[off+3]],
-        mins[di[off+2]], maxs[di[off+2]],
-        120, 30, 0.0, ctx[_BCTX_DEX_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _spin_attack_dfs_ub(off, di, cur, flb, fub, nd, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_2elem_bounds(
-        cur[s0]+flb[nd,s0], cur[s0]+fub[nd,s0], 0.0, 0.0,
-        cur[s4]+flb[nd,s4], cur[s4]+fub[nd,s4],
-        cur[s5]+flb[nd,s5], cur[s5]+fub[nd,s5],
-        cur[s6]+flb[nd,s6], cur[s6]+fub[nd,s6],
-        cur[s7]+flb[nd,s7], cur[s7]+fub[nd,s7],
-        cur[s1]+flb[nd,s1] + cur[s3]+flb[nd,s3], cur[s1]+fub[nd,s1] + cur[s3]+fub[nd,s3],
-        cur[s2]+flb[nd,s2], cur[s2]+fub[nd,s2],
-        120, 30, 0.0, ctx[_BCTX_DEX_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _spin_attack_k2_ub(off, di, after, sw, sb, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_2elem_bounds(
-        after[s0]+sw[s0], after[s0]+sb[s0], 0.0, 0.0,
-        after[s4]+sw[s4], after[s4]+sb[s4],
-        after[s5]+sw[s5], after[s5]+sb[s5],
-        after[s6]+sw[s6], after[s6]+sb[s6],
-        after[s7]+sw[s7], after[s7]+sb[s7],
-        after[s1]+sw[s1] + after[s3]+sw[s3], after[s1]+sb[s1] + after[s3]+sb[s3],
-        after[s2]+sw[s2], after[s2]+sb[s2],
-        120, 30, 0.0, ctx[_BCTX_DEX_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-# ---- assassin_multihit (n + w, melee, mults 30/10) ----
-# Deps: (nDamRaw, mdPct, mdRaw, damPct, nMdRaw, wDamRaw, wDamPct, wMdRaw)
-
-@njit(cache=True)
-def _multihit_leaf(off, di, mins, maxs, ctx):
-    return _spell_2elem_bounds(
-        mins[di[off+0]], maxs[di[off+0]], 0.0, 0.0,
-        mins[di[off+4]], maxs[di[off+4]],
-        mins[di[off+5]], maxs[di[off+5]],
-        mins[di[off+6]], maxs[di[off+6]],
-        mins[di[off+7]], maxs[di[off+7]],
-        mins[di[off+1]] + mins[di[off+3]], maxs[di[off+1]] + maxs[di[off+3]],
-        mins[di[off+2]], maxs[di[off+2]],
-        30, 10, 0.0, ctx[_BCTX_INT_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _multihit_dfs_ub(off, di, cur, flb, fub, nd, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_2elem_bounds(
-        cur[s0]+flb[nd,s0], cur[s0]+fub[nd,s0], 0.0, 0.0,
-        cur[s4]+flb[nd,s4], cur[s4]+fub[nd,s4],
-        cur[s5]+flb[nd,s5], cur[s5]+fub[nd,s5],
-        cur[s6]+flb[nd,s6], cur[s6]+fub[nd,s6],
-        cur[s7]+flb[nd,s7], cur[s7]+fub[nd,s7],
-        cur[s1]+flb[nd,s1] + cur[s3]+flb[nd,s3], cur[s1]+fub[nd,s1] + cur[s3]+fub[nd,s3],
-        cur[s2]+flb[nd,s2], cur[s2]+fub[nd,s2],
-        30, 10, 0.0, ctx[_BCTX_INT_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _multihit_k2_ub(off, di, after, sw, sb, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_2elem_bounds(
-        after[s0]+sw[s0], after[s0]+sb[s0], 0.0, 0.0,
-        after[s4]+sw[s4], after[s4]+sb[s4],
-        after[s5]+sw[s5], after[s5]+sb[s5],
-        after[s6]+sw[s6], after[s6]+sb[s6],
-        after[s7]+sw[s7], after[s7]+sb[s7],
-        after[s1]+sw[s1] + after[s3]+sw[s3], after[s1]+sb[s1] + after[s3]+sb[s3],
-        after[s2]+sw[s2], after[s2]+sb[s2],
-        30, 10, 0.0, ctx[_BCTX_INT_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-# ---- assassin_smoke_bomb (n + e + a, spell, mults 25/5/5, ignore_speed=True DoT) ----
-# Deps: (nDamRaw, sdPct, sdRaw, damPct, eSdRaw, aDamRaw, aDamPct, aSdPct)
-
-@njit(cache=True)
-def _smoke_bomb_leaf(off, di, mins, maxs, ctx):
-    return _spell_3elem_bounds(
-        mins[di[off+0]], maxs[di[off+0]], 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, mins[di[off+4]], maxs[di[off+4]],
-        mins[di[off+5]], maxs[di[off+5]],
-        mins[di[off+6]] + mins[di[off+7]], maxs[di[off+6]] + maxs[di[off+7]],
-        0.0, 0.0,
-        mins[di[off+1]] + mins[di[off+3]], maxs[di[off+1]] + maxs[di[off+3]],
-        mins[di[off+2]], maxs[di[off+2]],
-        25, 5, 5, 0.0, ctx[_BCTX_STR_PCT], ctx[_BCTX_AGI_PCT],
-        1.0, ctx[_BCTX_STR_PCT],  # DoT: ignore_speed=True → atk_spd_mult=1.0
-    )
-
-
-@njit(cache=True)
-def _smoke_bomb_dfs_ub(off, di, cur, flb, fub, nd, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_3elem_bounds(
-        cur[s0]+flb[nd,s0], cur[s0]+fub[nd,s0], 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, cur[s4]+flb[nd,s4], cur[s4]+fub[nd,s4],
-        cur[s5]+flb[nd,s5], cur[s5]+fub[nd,s5],
-        cur[s6]+flb[nd,s6] + cur[s7]+flb[nd,s7], cur[s6]+fub[nd,s6] + cur[s7]+fub[nd,s7],
-        0.0, 0.0,
-        cur[s1]+flb[nd,s1] + cur[s3]+flb[nd,s3], cur[s1]+fub[nd,s1] + cur[s3]+fub[nd,s3],
-        cur[s2]+flb[nd,s2], cur[s2]+fub[nd,s2],
-        25, 5, 5, 0.0, ctx[_BCTX_STR_PCT], ctx[_BCTX_AGI_PCT],
-        1.0, ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _smoke_bomb_k2_ub(off, di, after, sw, sb, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_3elem_bounds(
-        after[s0]+sw[s0], after[s0]+sb[s0], 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, after[s4]+sw[s4], after[s4]+sb[s4],
-        after[s5]+sw[s5], after[s5]+sb[s5],
-        after[s6]+sw[s6] + after[s7]+sw[s7], after[s6]+sb[s6] + after[s7]+sb[s7],
-        0.0, 0.0,
-        after[s1]+sw[s1] + after[s3]+sw[s3], after[s1]+sb[s1] + after[s3]+sb[s3],
-        after[s2]+sw[s2], after[s2]+sb[s2],
-        25, 5, 5, 0.0, ctx[_BCTX_STR_PCT], ctx[_BCTX_AGI_PCT],
-        1.0, ctx[_BCTX_STR_PCT],
-    )
-
-
-# ---- shaman_totem (n + a, spell, mults 6/6, ignore_speed=True DoT) ----
-# Deps: (nDamRaw, sdPct, sdRaw, damPct, aDamRaw, aDamPct, aSdPct)
-
-@njit(cache=True)
-def _totem_leaf(off, di, mins, maxs, ctx):
-    return _spell_2elem_bounds(
-        mins[di[off+0]], maxs[di[off+0]], 0.0, 0.0, 0.0, 0.0,
-        mins[di[off+4]], maxs[di[off+4]],
-        mins[di[off+5]] + mins[di[off+6]], maxs[di[off+5]] + maxs[di[off+6]],
-        0.0, 0.0,
-        mins[di[off+1]] + mins[di[off+3]], maxs[di[off+1]] + maxs[di[off+3]],
-        mins[di[off+2]], maxs[di[off+2]],
-        6, 6, 0.0, ctx[_BCTX_AGI_PCT],
-        1.0, ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _totem_dfs_ub(off, di, cur, flb, fub, nd, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6 = di[off+4], di[off+5], di[off+6]
-    return _spell_2elem_bounds(
-        cur[s0]+flb[nd,s0], cur[s0]+fub[nd,s0], 0.0, 0.0, 0.0, 0.0,
-        cur[s4]+flb[nd,s4], cur[s4]+fub[nd,s4],
-        cur[s5]+flb[nd,s5] + cur[s6]+flb[nd,s6], cur[s5]+fub[nd,s5] + cur[s6]+fub[nd,s6],
-        0.0, 0.0,
-        cur[s1]+flb[nd,s1] + cur[s3]+flb[nd,s3], cur[s1]+fub[nd,s1] + cur[s3]+fub[nd,s3],
-        cur[s2]+flb[nd,s2], cur[s2]+fub[nd,s2],
-        6, 6, 0.0, ctx[_BCTX_AGI_PCT],
-        1.0, ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _totem_k2_ub(off, di, after, sw, sb, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6 = di[off+4], di[off+5], di[off+6]
-    return _spell_2elem_bounds(
-        after[s0]+sw[s0], after[s0]+sb[s0], 0.0, 0.0, 0.0, 0.0,
-        after[s4]+sw[s4], after[s4]+sb[s4],
-        after[s5]+sw[s5] + after[s6]+sw[s6], after[s5]+sb[s5] + after[s6]+sb[s6],
-        0.0, 0.0,
-        after[s1]+sw[s1] + after[s3]+sw[s3], after[s1]+sb[s1] + after[s3]+sb[s3],
-        after[s2]+sw[s2], after[s2]+sb[s2],
-        6, 6, 0.0, ctx[_BCTX_AGI_PCT],
-        1.0, ctx[_BCTX_STR_PCT],
-    )
-
-
-# ---- shaman_aura (n + w, spell, mults 150/30) ----
-# Deps: (nDamRaw, sdPct, sdRaw, damPct, wDamRaw, wDamPct, wSdPct, wSdRaw)
-# Same dep layout as Ice Snake — different multipliers only.
-
-@njit(cache=True)
-def _aura_leaf(off, di, mins, maxs, ctx):
-    return _spell_2elem_bounds(
-        mins[di[off+0]], maxs[di[off+0]], 0.0, 0.0, 0.0, 0.0,
-        mins[di[off+4]], maxs[di[off+4]],
-        mins[di[off+5]] + mins[di[off+6]], maxs[di[off+5]] + maxs[di[off+6]],
-        mins[di[off+7]], maxs[di[off+7]],
-        mins[di[off+1]] + mins[di[off+3]], maxs[di[off+1]] + maxs[di[off+3]],
-        mins[di[off+2]], maxs[di[off+2]],
-        150, 30, 0.0, ctx[_BCTX_INT_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _aura_dfs_ub(off, di, cur, flb, fub, nd, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_2elem_bounds(
-        cur[s0]+flb[nd,s0], cur[s0]+fub[nd,s0], 0.0, 0.0, 0.0, 0.0,
-        cur[s4]+flb[nd,s4], cur[s4]+fub[nd,s4],
-        cur[s5]+flb[nd,s5] + cur[s6]+flb[nd,s6], cur[s5]+fub[nd,s5] + cur[s6]+fub[nd,s6],
-        cur[s7]+flb[nd,s7], cur[s7]+fub[nd,s7],
-        cur[s1]+flb[nd,s1] + cur[s3]+flb[nd,s3], cur[s1]+fub[nd,s1] + cur[s3]+fub[nd,s3],
-        cur[s2]+flb[nd,s2], cur[s2]+fub[nd,s2],
-        150, 30, 0.0, ctx[_BCTX_INT_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _aura_k2_ub(off, di, after, sw, sb, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7 = di[off+4], di[off+5], di[off+6], di[off+7]
-    return _spell_2elem_bounds(
-        after[s0]+sw[s0], after[s0]+sb[s0], 0.0, 0.0, 0.0, 0.0,
-        after[s4]+sw[s4], after[s4]+sb[s4],
-        after[s5]+sw[s5] + after[s6]+sw[s6], after[s5]+sb[s5] + after[s6]+sb[s6],
-        after[s7]+sw[s7], after[s7]+sb[s7],
-        after[s1]+sw[s1] + after[s3]+sw[s3], after[s1]+sb[s1] + after[s3]+sb[s3],
-        after[s2]+sw[s2], after[s2]+sb[s2],
-        150, 30, 0.0, ctx[_BCTX_INT_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-# ---- shaman_uproot (n + e + t, melee, mults 80/30/20) ----
-# Deps: same as warrior_uppercut — different multipliers.
-
-@njit(cache=True)
-def _uproot_leaf(off, di, mins, maxs, ctx):
-    return _spell_3elem_bounds(
-        mins[di[off+0]], maxs[di[off+0]], 0.0, 0.0,
-        mins[di[off+4]], maxs[di[off+4]],
-        0.0, 0.0, 0.0, 0.0, mins[di[off+5]], maxs[di[off+5]],
-        mins[di[off+6]], maxs[di[off+6]],
-        mins[di[off+7]], maxs[di[off+7]],
-        mins[di[off+8]], maxs[di[off+8]],
-        mins[di[off+1]] + mins[di[off+3]], maxs[di[off+1]] + maxs[di[off+3]],
-        mins[di[off+2]], maxs[di[off+2]],
-        80, 30, 20, 0.0, ctx[_BCTX_STR_PCT], ctx[_BCTX_DEX_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _uproot_dfs_ub(off, di, cur, flb, fub, nd, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7, s8 = di[off+4], di[off+5], di[off+6], di[off+7], di[off+8]
-    return _spell_3elem_bounds(
-        cur[s0]+flb[nd,s0], cur[s0]+fub[nd,s0], 0.0, 0.0,
-        cur[s4]+flb[nd,s4], cur[s4]+fub[nd,s4],
-        0.0, 0.0, 0.0, 0.0, cur[s5]+flb[nd,s5], cur[s5]+fub[nd,s5],
-        cur[s6]+flb[nd,s6], cur[s6]+fub[nd,s6],
-        cur[s7]+flb[nd,s7], cur[s7]+fub[nd,s7],
-        cur[s8]+flb[nd,s8], cur[s8]+fub[nd,s8],
-        cur[s1]+flb[nd,s1] + cur[s3]+flb[nd,s3], cur[s1]+fub[nd,s1] + cur[s3]+fub[nd,s3],
-        cur[s2]+flb[nd,s2], cur[s2]+fub[nd,s2],
-        80, 30, 20, 0.0, ctx[_BCTX_STR_PCT], ctx[_BCTX_DEX_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-@njit(cache=True)
-def _uproot_k2_ub(off, di, after, sw, sb, ctx):
-    s0, s1, s2, s3 = di[off+0], di[off+1], di[off+2], di[off+3]
-    s4, s5, s6, s7, s8 = di[off+4], di[off+5], di[off+6], di[off+7], di[off+8]
-    return _spell_3elem_bounds(
-        after[s0]+sw[s0], after[s0]+sb[s0], 0.0, 0.0,
-        after[s4]+sw[s4], after[s4]+sb[s4],
-        0.0, 0.0, 0.0, 0.0, after[s5]+sw[s5], after[s5]+sb[s5],
-        after[s6]+sw[s6], after[s6]+sb[s6],
-        after[s7]+sw[s7], after[s7]+sb[s7],
-        after[s8]+sw[s8], after[s8]+sb[s8],
-        after[s1]+sw[s1] + after[s3]+sw[s3], after[s1]+sb[s1] + after[s3]+sb[s3],
-        after[s2]+sw[s2], after[s2]+sb[s2],
-        80, 30, 20, 0.0, ctx[_BCTX_STR_PCT], ctx[_BCTX_DEX_PCT],
-        ctx[_BCTX_ATK_SPD], ctx[_BCTX_STR_PCT],
-    )
-
-
-# ============================================================
-# Spell dispatchers — switch over spell_id and call the right adapter.
-# Replaces a 13-way elif chain at each of 5 dispatch sites in the kernels.
+# Adapters — read deps from the appropriate per-call-site source(s)
+# and dispatch to the right corner evaluator. Each adapter returns the
+# (LB, UB) integer pair the search engine consumes.
 # ============================================================
 
 @njit(cache=True)
 def _spell_leaf(spell_id, off, di, mins, maxs, ctx):
-    if spell_id == _SPELL_METEOR:       return _meteor_leaf(off, di, mins, maxs, ctx)
-    if spell_id == _SPELL_ICE_SNAKE:    return _ice_snake_leaf(off, di, mins, maxs, ctx)
-    if spell_id == _SPELL_BASH:         return _bash_leaf(off, di, mins, maxs, ctx)
-    if spell_id == _SPELL_UPPERCUT:     return _uppercut_leaf(off, di, mins, maxs, ctx)
-    if spell_id == _SPELL_WAR_SCREAM:   return _war_scream_leaf(off, di, mins, maxs, ctx)
-    if spell_id == _SPELL_ARROW_STORM:  return _arrow_storm_leaf(off, di, mins, maxs, ctx)
-    if spell_id == _SPELL_ARROW_BOMB:   return _arrow_bomb_leaf(off, di, mins, maxs, ctx)
-    if spell_id == _SPELL_SPIN_ATTACK:  return _spin_attack_leaf(off, di, mins, maxs, ctx)
-    if spell_id == _SPELL_MULTIHIT:     return _multihit_leaf(off, di, mins, maxs, ctx)
-    if spell_id == _SPELL_SMOKE_BOMB:   return _smoke_bomb_leaf(off, di, mins, maxs, ctx)
-    if spell_id == _SPELL_TOTEM:        return _totem_leaf(off, di, mins, maxs, ctx)
-    if spell_id == _SPELL_AURA:         return _aura_leaf(off, di, mins, maxs, ctx)
-    if spell_id == _SPELL_UPROOT:       return _uproot_leaf(off, di, mins, maxs, ctx)
-    return np.int64(0), np.int64(0)
+    """Bounds at the leaf — read deps from the build's roll min/max arrays."""
+    if _SPELL_USE_SPELL[spell_id]:
+        deps_lo = np.empty(31, dtype=np.float64)
+        deps_hi = np.empty(31, dtype=np.float64)
+        for i in range(31):
+            idx = di[off + i]
+            deps_lo[i] = mins[idx]
+            deps_hi[i] = maxs[idx]
+        lb = _eval_spell_corner_spell(deps_lo, spell_id, ctx)
+        ub = _eval_spell_corner_spell(deps_hi, spell_id, ctx)
+    else:
+        deps_lo = np.empty(27, dtype=np.float64)
+        deps_hi = np.empty(27, dtype=np.float64)
+        for i in range(27):
+            idx = di[off + i]
+            deps_lo[i] = mins[idx]
+            deps_hi[i] = maxs[idx]
+        lb = _eval_spell_corner_melee(deps_lo, spell_id, ctx)
+        ub = _eval_spell_corner_melee(deps_hi, spell_id, ctx)
+    return np.int64(lb), np.int64(ub)
 
 
 @njit(cache=True)
 def _spell_dfs_ub(spell_id, off, di, cur, flb, fub, nd, ctx):
-    if spell_id == _SPELL_METEOR:       return _meteor_dfs_ub_branch(off, di, cur, flb, fub, nd, ctx)
-    if spell_id == _SPELL_ICE_SNAKE:    return _ice_snake_dfs_ub(off, di, cur, flb, fub, nd, ctx)
-    if spell_id == _SPELL_BASH:         return _bash_dfs_ub_branch(off, di, cur, flb, fub, nd, ctx)
-    if spell_id == _SPELL_UPPERCUT:     return _uppercut_dfs_ub(off, di, cur, flb, fub, nd, ctx)
-    if spell_id == _SPELL_WAR_SCREAM:   return _war_scream_dfs_ub(off, di, cur, flb, fub, nd, ctx)
-    if spell_id == _SPELL_ARROW_STORM:  return _arrow_storm_dfs_ub(off, di, cur, flb, fub, nd, ctx)
-    if spell_id == _SPELL_ARROW_BOMB:   return _arrow_bomb_dfs_ub(off, di, cur, flb, fub, nd, ctx)
-    if spell_id == _SPELL_SPIN_ATTACK:  return _spin_attack_dfs_ub(off, di, cur, flb, fub, nd, ctx)
-    if spell_id == _SPELL_MULTIHIT:     return _multihit_dfs_ub(off, di, cur, flb, fub, nd, ctx)
-    if spell_id == _SPELL_SMOKE_BOMB:   return _smoke_bomb_dfs_ub(off, di, cur, flb, fub, nd, ctx)
-    if spell_id == _SPELL_TOTEM:        return _totem_dfs_ub(off, di, cur, flb, fub, nd, ctx)
-    if spell_id == _SPELL_AURA:         return _aura_dfs_ub(off, di, cur, flb, fub, nd, ctx)
-    if spell_id == _SPELL_UPROOT:       return _uproot_dfs_ub(off, di, cur, flb, fub, nd, ctx)
-    return np.int64(0), np.int64(0)
+    """
+    Bounds at the dfs UB site — each dep value is `cur[idx] + future_lb` (for
+    LB) or `cur[idx] + future_ub` (for UB). `nd` is the next-depth index into
+    the future arrays.
+    """
+    if _SPELL_USE_SPELL[spell_id]:
+        deps_lo = np.empty(31, dtype=np.float64)
+        deps_hi = np.empty(31, dtype=np.float64)
+        for i in range(31):
+            idx = di[off + i]
+            base = cur[idx]
+            deps_lo[i] = base + flb[nd, idx]
+            deps_hi[i] = base + fub[nd, idx]
+        lb = _eval_spell_corner_spell(deps_lo, spell_id, ctx)
+        ub = _eval_spell_corner_spell(deps_hi, spell_id, ctx)
+    else:
+        deps_lo = np.empty(27, dtype=np.float64)
+        deps_hi = np.empty(27, dtype=np.float64)
+        for i in range(27):
+            idx = di[off + i]
+            base = cur[idx]
+            deps_lo[i] = base + flb[nd, idx]
+            deps_hi[i] = base + fub[nd, idx]
+        lb = _eval_spell_corner_melee(deps_lo, spell_id, ctx)
+        ub = _eval_spell_corner_melee(deps_hi, spell_id, ctx)
+    return np.int64(lb), np.int64(ub)
 
 
 @njit(cache=True)
 def _spell_k2_ub(spell_id, off, di, after, sw, sb, ctx):
-    if spell_id == _SPELL_METEOR:       return _meteor_k2_ub_branch(off, di, after, sw, sb, ctx)
-    if spell_id == _SPELL_ICE_SNAKE:    return _ice_snake_k2_ub(off, di, after, sw, sb, ctx)
-    if spell_id == _SPELL_BASH:         return _bash_k2_ub_branch(off, di, after, sw, sb, ctx)
-    if spell_id == _SPELL_UPPERCUT:     return _uppercut_k2_ub(off, di, after, sw, sb, ctx)
-    if spell_id == _SPELL_WAR_SCREAM:   return _war_scream_k2_ub(off, di, after, sw, sb, ctx)
-    if spell_id == _SPELL_ARROW_STORM:  return _arrow_storm_k2_ub(off, di, after, sw, sb, ctx)
-    if spell_id == _SPELL_ARROW_BOMB:   return _arrow_bomb_k2_ub(off, di, after, sw, sb, ctx)
-    if spell_id == _SPELL_SPIN_ATTACK:  return _spin_attack_k2_ub(off, di, after, sw, sb, ctx)
-    if spell_id == _SPELL_MULTIHIT:     return _multihit_k2_ub(off, di, after, sw, sb, ctx)
-    if spell_id == _SPELL_SMOKE_BOMB:   return _smoke_bomb_k2_ub(off, di, after, sw, sb, ctx)
-    if spell_id == _SPELL_TOTEM:        return _totem_k2_ub(off, di, after, sw, sb, ctx)
-    if spell_id == _SPELL_AURA:         return _aura_k2_ub(off, di, after, sw, sb, ctx)
-    if spell_id == _SPELL_UPROOT:       return _uproot_k2_ub(off, di, after, sw, sb, ctx)
-    return np.int64(0), np.int64(0)
+    """
+    Bounds at the k=2 UB site — each dep value is `after[idx] + slot1_worst`
+    (LB) or `after[idx] + slot1_best` (UB).
+    """
+    if _SPELL_USE_SPELL[spell_id]:
+        deps_lo = np.empty(31, dtype=np.float64)
+        deps_hi = np.empty(31, dtype=np.float64)
+        for i in range(31):
+            idx = di[off + i]
+            base = after[idx]
+            deps_lo[i] = base + sw[idx]
+            deps_hi[i] = base + sb[idx]
+        lb = _eval_spell_corner_spell(deps_lo, spell_id, ctx)
+        ub = _eval_spell_corner_spell(deps_hi, spell_id, ctx)
+    else:
+        deps_lo = np.empty(27, dtype=np.float64)
+        deps_hi = np.empty(27, dtype=np.float64)
+        for i in range(27):
+            idx = di[off + i]
+            base = after[idx]
+            deps_lo[i] = base + sw[idx]
+            deps_hi[i] = base + sb[idx]
+        lb = _eval_spell_corner_melee(deps_lo, spell_id, ctx)
+        ub = _eval_spell_corner_melee(deps_hi, spell_id, ctx)
+    return np.int64(lb), np.int64(ub)
 
 
 # ============================================================
@@ -2550,9 +1890,22 @@ def search_pipelined(
 
     q = Queue(maxsize=2)
 
+    # Per-thread timing accumulators.
+    # `load_time_total` counts wall-clock the producer thread spent fetching +
+    # refining batches (cache hit/miss, JSON parse, projection). It runs in
+    # parallel with searching, so it is NOT additive with `search_time_total`.
+    load_time_total = [0.0]    # mutable via list so the closure can write
+    wait_time_total = 0.0      # consumer wait on q.get() = "stall on loader"
+    search_time_total = 0.0    # compute time inside _dispatch_search + _update_best
+
+    # Per-stage breakdown (seconds, summed over META_n).
+    breakdown = {"read": 0.0, "prep": 0.0, "cull": 0.0, "rows_in": 0, "rows_out": 0}
+    per_n_breakdown = []  # list of (n, read, prep, cull, rows_in, rows_out)
+
     def producer():
         try:
             for n in priorities:
+                t_load = time()
                 if n == 0:
                     empty_ings = np.full((1, 6), -1, dtype=np.int32)
                     empty_eff = np.full((1, 6), 100, dtype=np.int32)
@@ -2566,18 +1919,34 @@ def search_pipelined(
                     )
                 else:
                     use_culling = culling and n <= max_cull
+                    t_read = time()
                     ings, eff, stat_names, stat_min, stat_max = \
                         _load_cached_arrays(skill, n, base_path)
+                    read_dt = time() - t_read
+
+                    timings = {"prep": 0.0, "cull": 0.0}
                     batch = _refine_batch(
                         ings, eff, stat_names, stat_min, stat_max,
                         query, recipe, culling=use_culling,
+                        timings=timings,
                     )
+                    breakdown["read"] += read_dt
+                    breakdown["prep"] += timings.get("prep", 0.0)
+                    breakdown["cull"] += timings.get("cull", 0.0)
+                    breakdown["rows_in"] += int(ings.shape[0])
+                    breakdown["rows_out"] += int(batch.ings_matrix.shape[0])
+                    per_n_breakdown.append((
+                        n, read_dt, timings.get("prep", 0.0), timings.get("cull", 0.0),
+                        int(ings.shape[0]), int(batch.ings_matrix.shape[0]),
+                    ))
+                load_time_total[0] += time() - t_load
                 q.put((n, batch))
         except Exception as e:
             q.put(("ERROR", e))
         finally:
             q.put(None)
 
+    t_pipeline = time()
     t = Thread(target=producer, daemon=True)
     t.start()
 
@@ -2587,7 +1956,9 @@ def search_pipelined(
     total_possibilities = 0
 
     while True:
+        t_wait = time()
         item = q.get()
+        wait_time_total += time() - t_wait
         if item is None:
             break
         tag, payload = item
@@ -2609,14 +1980,17 @@ def search_pipelined(
             meta_batch, score, meta_index, sol, db, best_score, best_full_slots,
         )
 
+        elapsed = time() - start_time
+        search_time_total += elapsed
         print(
             f"meta batch {6 - meta_batch.void_count}: "
             f"{len(meta_batch.ings_matrix)}, "
-            f"time elapsed: {(time() - start_time) * 1000:.0f}ms"
+            f"time elapsed: {elapsed * 1000:.0f}ms"
         )
         total_possibilities += len(meta_batch.ings_matrix) * db.count ** meta_batch.void_count
 
     t.join()
+    wall = time() - t_pipeline
 
     print()
     print("SEARCHED FINISHED")
@@ -2625,4 +1999,20 @@ def search_pipelined(
     if total_possibilities > 0:
         print(f"Pruning efficiency : {(1 - total_searched[0] / total_possibilities) * 100:.2f}% skipped")
     print()
+    # Load and search run in parallel — wall ≈ max(load, search) + small overhead.
+    # `consumer waited` is time the search thread blocked on q.get() (i.e. loader
+    # was the bottleneck for that stretch). High wait → loading is the long pole.
+    print(f"Load   : {load_time_total[0]:.1f}s  (producer thread, parallel with search)")
+    print(f"Search : {search_time_total:.1f}s  (compute, sum of batches)")
+    print(f"Wall   : {wall:.1f}s  (consumer waited {wait_time_total:.1f}s on loader)")
+    print(
+        f"  load breakdown: read={breakdown['read']:.1f}s "
+        f"prep={breakdown['prep']:.1f}s cull={breakdown['cull']:.1f}s "
+        f"({breakdown['rows_in']:,} -> {breakdown['rows_out']:,} rows)"
+    )
+    for n, rd, pr, cu, ri, ro in per_n_breakdown:
+        print(
+            f"    META_{n}: read={rd*1000:.0f}ms prep={pr*1000:.0f}ms "
+            f"cull={cu*1000:.0f}ms ({ri:,} -> {ro:,})"
+        )
     return best_full_slots

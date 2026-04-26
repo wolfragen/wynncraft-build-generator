@@ -29,6 +29,7 @@ def main():
 
     # ---------- Build User Query ----------
     user_query = {
+        "mage_meteor": {"weight": 100000, "ingredient_filter": True},
         # ===== Skill Points =====
         # "str": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "dex": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
@@ -54,7 +55,7 @@ def main():
         # "healPct":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
 
         # ===== Derived (Composite) =====
-        "ehp":  {"min": 0, "weight": 50, "ingredient_filter": True},
+        # "ehp":  {"min": 0, "weight": 50, "ingredient_filter": True},
         # "ehpr": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "hpr":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
 
@@ -68,8 +69,12 @@ def main():
         # "nMdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "atkTier": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
 
+        # ===== Neutral =====
+        # "nDamPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+
         # ===== Earth =====
         # "eDamPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "eDamRaw": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "eMdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "eSdPct":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "eSdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
@@ -80,6 +85,7 @@ def main():
         # "tDamPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "tDamRaw": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "tMdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "tSdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "tDefPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
 
         # ===== Water =====
@@ -101,11 +107,14 @@ def main():
         # ===== Air =====
         # "aDamPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "aDamRaw": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
-        # "aDefPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "aMdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "aSdPct":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "aSdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "aDefPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
 
         # ===== Rainbow =====
         # "rDamPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "rSdPct":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "rDefPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
 
         # ===== Misc Damage / Defense =====
@@ -134,8 +143,8 @@ def main():
         # "charges":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
     }
 
-    skill = "WOODWORKING"
-    item_type = "WAND"
+    skill = "TAILORING"
+    item_type = "LEGGINGS"
     consumable = skill in CONSU_SKILLS
     
     # ---------- Build Query Object ----------
@@ -154,8 +163,8 @@ def main():
         recipes = recipes,
         item_type=item_type,
         skill=skill,
-        lvl_min=103,
-        lvl_max=105,
+        lvl_min=117,
+        lvl_max=119,
     )
 
     recipe = build_recipe(recipe_raw, query, tier=3) # builds final recipe using material tier
@@ -177,12 +186,11 @@ def main():
     #     print(ing.name)
     
     # ---------- Load + Search (pipelined, overlapped) ----------
-    t_pipeline = time()
+    # search_pipelined prints its own Load/Search/Wall breakdown.
     best_solution = search_pipelined(
         skill, query, recipe, db, max_cull=query.suggested_max_cull,
     )
-    print(f"Load+search pipeline: {time() - t_pipeline:.1f}s")
-
+    
     print("Best solution:", best_solution)
     
     if best_solution is not None:
@@ -191,16 +199,13 @@ def main():
         names = [id_to_name[i] for i in best_solution]
         print(names)
 
-        """
         url = generate_crafter_url(
-            recipe_json_id=best_solution,
+            recipe_id=recipe_raw.data["id"],
+            recipe_type=recipe_raw.item_type,
             tier=3,
-            ingredient_json_ids=db.json_ids,
-            raw_ingredients=ingredients_raw,
-            raw_recipes=recipes_data,
+            ingredient_ids=[int(i) for i in best_solution],
         )
-
-        print("Crafter URL:", url)"""
+        print("Crafter URL:", url)
 
 
 profile = False

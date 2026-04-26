@@ -29,10 +29,7 @@ from data.stats import (
     FORMULA_SPELL_DAMAGE_BASE,
 )
 from data.spells import ATK_SPEED_MULT, SPELL_COUNT
-from data.skillpoint_lookup import (
-    SKP_ELEMENT_PCT,
-    SKP_STR, SKP_DEX, SKP_INT, SKP_DEF, SKP_AGI, SKP_MAX,
-)
+from data.skillpoint_lookup import SKP_MAX
 
 
 _FORMULA_TAGS = {
@@ -57,17 +54,19 @@ _FORMULA_ARITY = {
 
 # Build context layout (numpy float64 array passed to numba kernels).
 # Indices are stable; the spell evaluator reads via these constants.
-# Values come from SKP_ELEMENT_PCT (skillpoint_damage_mult variant), which is
-# what wynnbuilder's calculateSpellDamage uses for both per-element boosts AND
-# the global str_boost. For str/dex/def/agi these are identical to the
-# headline values; for int the damage version uses 1.0 mult (vs 0.619 for
-# mana cost reduction, which we don't currently compute).
-BUILD_CTX_STR_PCT = 0     # skillPointsToPercentage(str) * 1.0
-BUILD_CTX_DEX_PCT = 1     # skillPointsToPercentage(dex) * 1.0
-BUILD_CTX_INT_PCT = 2     # skillPointsToPercentage(int) * 1.0 (water dmg boost)
-BUILD_CTX_DEF_PCT = 3     # ... * 0.867
-BUILD_CTX_AGI_PCT = 4     # ... * 0.951
-BUILD_CTX_ATK_SPD = 5     # baseDamageMultiplier[atk_speed]
+#
+# Skill point slots store the BASE skill point COUNT (0..150) from the user's
+# non-crafted gear (supplied via `_context["str"]` etc.). The spell formula
+# adds the build's crafted-ingredient contribution (from the deps array),
+# clamps to [0, 150], and looks up the percentage curve at evaluation time.
+# This is needed because skillPointsToPercentage is non-linear, so we can't
+# precompute the percentage once at the user level.
+BUILD_CTX_BASE_STR = 0    # base skill point count (clamped 0..150)
+BUILD_CTX_BASE_DEX = 1
+BUILD_CTX_BASE_INT = 2
+BUILD_CTX_BASE_DEF = 3
+BUILD_CTX_BASE_AGI = 4
+BUILD_CTX_ATK_SPD  = 5    # baseDamageMultiplier[atk_speed]
 BUILD_CTX_CRIT_PCT = 6    # crit damage % (default 0)
 BUILD_CTX_SIZE = 7
 
@@ -79,18 +78,22 @@ def _build_ctx_array(ctx_dict):
         {"str": 80, "dex": 0, "int": 100, "def": 0, "agi": 40,
          "atk_speed": "NORMAL", "crit_dam_pct": 0}
     All keys optional; defaults: skillpoints=0, atk_speed="NORMAL", crit=0.
+    Skill points stored as raw counts (clamped to [0, 150]) — the kernel sums
+    them with the build's crafted contribution before looking up the curve.
     """
     arr = np.zeros(BUILD_CTX_SIZE, dtype=np.float64)
     if ctx_dict:
-        for skp_name, skp_idx in (("str", SKP_STR), ("dex", SKP_DEX),
-                                   ("int", SKP_INT), ("def", SKP_DEF),
-                                   ("agi", SKP_AGI)):
+        for skp_name, slot in (("str", BUILD_CTX_BASE_STR),
+                               ("dex", BUILD_CTX_BASE_DEX),
+                               ("int", BUILD_CTX_BASE_INT),
+                               ("def", BUILD_CTX_BASE_DEF),
+                               ("agi", BUILD_CTX_BASE_AGI)):
             count = int(ctx_dict.get(skp_name, 0))
             if count < 0:
                 count = 0
             elif count > SKP_MAX:
                 count = SKP_MAX
-            arr[skp_idx] = float(SKP_ELEMENT_PCT[skp_idx, count])
+            arr[slot] = float(count)
         atk_speed = ctx_dict.get("atk_speed", "NORMAL")
         arr[BUILD_CTX_ATK_SPD] = float(ATK_SPEED_MULT.get(atk_speed, ATK_SPEED_MULT["NORMAL"]))
         arr[BUILD_CTX_CRIT_PCT] = float(ctx_dict.get("crit_dam_pct", 0))
@@ -392,9 +395,13 @@ def build_query(
 
     req_mask_proj = req_mask_full[active_indices]
 
-    suggested_max_cull = 5  # For meta-sets culling.
-    if any(req for req in req_mask_proj):
-        suggested_max_cull = 4  # Si on a au moins un req défini, il vaut mieux ne pas cull le 5
+    # META_5 (~5M rows) and META_4 (~600k rows) are dominated by branch-and-bound
+    # pruning during search; the Pareto cull on those tiers costs more wall-clock
+    # than it saves (measured on Armouring meteor: META_4 cull = 32s, search delta
+    # = +4s, net -28s when skipped). Cap at 3 by default so cull only runs on
+    # META_3 and below where it remains net-positive. Bump higher only if a
+    # specific query shows BB pruning struggling.
+    suggested_max_cull = 3
 
     req_idx = np.full(5, -1)
     i = 0

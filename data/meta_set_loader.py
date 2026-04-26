@@ -181,7 +181,11 @@ def _build_cache(json_path, cache_path):
 # Refine (project into active stat space + cull + sort void effs)
 # ------------------------------------------------------------
 
-def _refine_batch(ings, eff, stat_names, stat_min, stat_max, query, recipe, culling=True):
+def _refine_batch(ings, eff, stat_names, stat_min, stat_max, query, recipe, culling=True, timings=None):
+    """If `timings` is a dict, fills 'prep' and 'cull' (seconds) for profiling."""
+    from time import perf_counter
+    _t0 = perf_counter() if timings is not None else 0.0
+
     N = ings.shape[0]
     active_indices = query.active_indices
     num_active = query.stat_count
@@ -245,6 +249,9 @@ def _refine_batch(ings, eff, stat_names, stat_min, stat_max, query, recipe, cull
             req_mask_full[STAT_INDEX[name]] = True
         req_mask_proj = req_mask_full[active_indices]
 
+        if timings is not None:
+            timings["prep"] = perf_counter() - _t0
+            _tc = perf_counter()
         kept_indices = numba_cull(
             base_min_matrix,
             base_max_matrix,
@@ -255,6 +262,9 @@ def _refine_batch(ings, eff, stat_names, stat_min, stat_max, query, recipe, cull
             query.req_idx,
             query.dura_proj_idx,
         )
+        if timings is not None:
+            timings["cull"] = perf_counter() - _tc
+            _t0 = perf_counter() - timings["cull"]  # so trailing sort is attributed correctly below
         ings_matrix = ings_matrix[kept_indices]
         void_eff_matrix = void_eff_matrix[kept_indices]
         void_real_slot_matrix = void_real_slot_matrix[kept_indices]
@@ -294,7 +304,7 @@ def _refine_batch(ings, eff, stat_names, stat_min, stat_max, query, recipe, cull
 # ------------------------------------------------------------
 
 @njit(fastmath=True, cache=True)
-def compare_vectors(a, b, num_effs, req_idx, dura_i):
+def compare_vectors(a, b, num_effs, is_req_col, dura_i):
     """
     Returns:
        1 if A dominates B
@@ -306,9 +316,9 @@ def compare_vectors(a, b, num_effs, req_idx, dura_i):
         - [0, num_effs)             : void-slot effectiveness (sorted desc)
         - [num_effs, num_effs + K)  : projected stats
     `dura_i` is the absolute column of durability/duration (or -1).
-    For dura, higher is always better (non-invertible). For every other
-    non-req stat, negative values are invertible via negative effectiveness
-    so further-from-zero is better.
+    `is_req_col` is a bool array of length len(a): True for "req stat" columns
+    (where lower is better when positive), False for everything else. Effs/dura
+    columns are False. Avoids a per-pair linear scan over `req_idx`.
     """
     a_better = False
     b_better = False
@@ -347,7 +357,7 @@ def compare_vectors(a, b, num_effs, req_idx, dura_i):
                 if va < vb: a_better = True
                 else:       b_better = True
         else:
-            is_req = (i - num_effs) in req_idx
+            is_req = is_req_col[i]
 
             if va > 0 or vb > 0:
                 if (va > vb) != is_req:
@@ -369,7 +379,7 @@ def compare_vectors(a, b, num_effs, req_idx, dura_i):
 
 
 @njit(cache=True)
-def pareto_filter(matrix, num_effs, req_idx, dura_i):
+def pareto_filter(matrix, num_effs, is_req_col, dura_i):
     """Single-thread reference cull (preserves byte-identity)."""
     n = matrix.shape[0]
     is_kept = np.ones(n, dtype=np.bool_)
@@ -382,7 +392,7 @@ def pareto_filter(matrix, num_effs, req_idx, dura_i):
             if not is_kept[j]:
                 continue
 
-            cmp = compare_vectors(matrix[i], matrix[j], num_effs, req_idx, dura_i)
+            cmp = compare_vectors(matrix[i], matrix[j], num_effs, is_req_col, dura_i)
 
             if cmp == 1:
                 is_kept[j] = False
@@ -397,7 +407,7 @@ def pareto_filter(matrix, num_effs, req_idx, dura_i):
 
 @njit(parallel=True, nogil=True, fastmath=True, cache=True)
 def _parallel_check_block(block_start, block_end, survivors, num_survivors,
-                          matrix, num_effs, req_idx, dura_i, is_kept):
+                          matrix, num_effs, is_req_col, dura_i, is_kept):
     """
     Block-parallel phase 1 — each candidate c in the block is tested in its own
     thread against the snapshot `survivors` (alive indices from prior blocks,
@@ -411,7 +421,7 @@ def _parallel_check_block(block_start, block_end, survivors, num_survivors,
         for k in range(num_survivors):
             s = survivors[k]
             cmp = compare_vectors(
-                matrix[s], matrix[c], num_effs, req_idx, dura_i
+                matrix[s], matrix[c], num_effs, is_req_col, dura_i
             )
             if cmp == 1 or cmp == 2:
                 is_kept[c] = False
@@ -421,7 +431,7 @@ def _parallel_check_block(block_start, block_end, survivors, num_survivors,
 
 
 @njit(nogil=True, fastmath=True, cache=True)
-def _intra_block_cull(block_start, block_end, matrix, num_effs, req_idx,
+def _intra_block_cull(block_start, block_end, matrix, num_effs, is_req_col,
                       dura_i, is_kept):
     """Sequential pareto cull on candidates within a single block."""
     for i in range(block_start, block_end):
@@ -431,7 +441,7 @@ def _intra_block_cull(block_start, block_end, matrix, num_effs, req_idx,
             if not is_kept[j]:
                 continue
             cmp = compare_vectors(
-                matrix[i], matrix[j], num_effs, req_idx, dura_i
+                matrix[i], matrix[j], num_effs, is_req_col, dura_i
             )
             if cmp == 1 or cmp == 2:
                 is_kept[j] = False
@@ -440,7 +450,7 @@ def _intra_block_cull(block_start, block_end, matrix, num_effs, req_idx,
                 break
 
 
-def pareto_filter_block(matrix, num_effs, req_idx, dura_i, block_size=1024):
+def pareto_filter_block(matrix, num_effs, is_req_col, dura_i, block_size=1024):
     """
     Block-parallel pareto cull. Produces a VALID Pareto set identical to the
     serial version on all real queries we've validated; the non-transitive
@@ -459,11 +469,11 @@ def pareto_filter_block(matrix, num_effs, req_idx, dura_i, block_size=1024):
         if survivors.size > 0:
             _parallel_check_block(
                 block_start, block_end, survivors, survivors.size,
-                matrix, num_effs, req_idx, dura_i, is_kept,
+                matrix, num_effs, is_req_col, dura_i, is_kept,
             )
 
         _intra_block_cull(
-            block_start, block_end, matrix, num_effs, req_idx, dura_i, is_kept,
+            block_start, block_end, matrix, num_effs, is_req_col, dura_i, is_kept,
         )
 
         if survivors.size > 0:
@@ -526,11 +536,32 @@ def numba_cull(base_min_matrix,
         base_min_matrix, base_max_matrix, void_eff_matrix, void_count, req_idx,
     )
 
-    # Block-parallel pareto cull for speed. Produces a VALID Pareto set; on all
-    # queries validated end-to-end it matches the serial result byte-for-byte.
-    if matrix.shape[0] >= 2048:
-        is_kept = pareto_filter_block(matrix, void_count, req_idx, dura_i)
-    else:
-        is_kept = pareto_filter(matrix, void_count, req_idx, dura_i)
+    # Precompute per-column "is req stat" lookup so the comparator does an O(1)
+    # array load instead of an O(|req_idx|) linear scan per stat per pair.
+    num_cols = matrix.shape[1]
+    is_req_col = np.zeros(num_cols, dtype=np.bool_)
+    for r in req_idx:
+        if r >= 0:
+            col = void_count + int(r)
+            if 0 <= col < num_cols:
+                is_req_col[col] = True
 
-    return np.where(is_kept)[0]
+    # Sort rows by descending "strength" so the survivor set fills with strong
+    # dominators first. Subsequent candidates hit `break` quickly via the early
+    # exit in _parallel_check_block / _intra_block_cull. The cull output is
+    # still a valid Pareto set; only the choice within incomparable cliques can
+    # change (the comparator is non-transitive on edge cases — same caveat as
+    # the existing block-parallel path).
+    if matrix.shape[0] >= 2048:
+        # Sum of (sorted-desc) void-eff columns is a cheap proxy for "row total
+        # void eff". Higher sum tends to dominate higher in the eff dims.
+        strength = matrix[:, :void_count].sum(axis=1) if void_count > 0 \
+            else np.zeros(matrix.shape[0], dtype=np.int64)
+        order = np.argsort(-strength, kind="stable")
+        sorted_matrix = np.ascontiguousarray(matrix[order])
+        is_kept_sorted = pareto_filter_block(sorted_matrix, void_count, is_req_col, dura_i)
+        kept_in_sorted = np.where(is_kept_sorted)[0]
+        return order[kept_in_sorted]
+    else:
+        is_kept = pareto_filter(matrix, void_count, is_req_col, dura_i)
+        return np.where(is_kept)[0]

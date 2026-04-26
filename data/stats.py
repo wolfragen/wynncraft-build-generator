@@ -20,13 +20,13 @@ Query system uses this registry to map stat names -> indices.
 # ============================================================
 
 IDS_STATS = tuple(sorted([
-    "aDamPct", "aDamRaw", "aDefPct", "aSdPct",
+    "aDamPct", "aDamRaw", "aDefPct", "aMdRaw", "aSdPct", "aSdRaw",
     "agi",
     "atkTier",
     "damPct",
     "def",
     "dex",
-    "eDamPct", "eDefPct", "eMdRaw", "eSdPct", "eSdRaw", "eSteal",
+    "eDamPct", "eDamRaw", "eDefPct", "eMdRaw", "eSdPct", "eSdRaw", "eSteal",
     "expd",
     "fDamPct", "fDamRaw", "fDefPct", "fMdRaw", "fSdPct", "fSdRaw",
     "gSpd", "gXp",
@@ -43,15 +43,15 @@ IDS_STATS = tuple(sorted([
     "mdPct", "mdRaw",
     "mr",
     "ms",
-    "nDamRaw", "nMdRaw",
+    "nDamPct", "nDamRaw", "nMdRaw",
     "poison",
-    "rDamPct", "rDefPct",
+    "rDamPct", "rDefPct", "rSdPct",
     "ref",
     "sdPct", "sdRaw",
     "spd",
     "sprint", "sprintReg",
     "str",
-    "tDamPct", "tDamRaw", "tDefPct", "tMdRaw",
+    "tDamPct", "tDamRaw", "tDefPct", "tMdRaw", "tSdRaw",
     "thorns",
     "wDamPct", "wDamRaw", "wDefPct", "wMdRaw", "wSdPct", "wSdRaw",
     "xpb"
@@ -114,37 +114,47 @@ DERIVED_STATS = (
     "shaman_uproot",
 )
 
+# Spell composites: dep order is the canonical layout defined in data/spells.py
+# (SPELL_SPELL_DEPS for use_spell=True, SPELL_MELEE_DEPS otherwise). Mirrored
+# below so the query parser doesn't need to import that module — but the lists
+# MUST match `data/spells.py` (a defensive assert in the parser would catch drift).
+_SPELL_DEPS = (
+    "nDamRaw", "eDamRaw", "tDamRaw", "wDamRaw", "fDamRaw", "aDamRaw",
+    "nDamPct", "eDamPct", "tDamPct", "wDamPct", "fDamPct", "aDamPct",
+    "eSdPct", "wSdPct", "fSdPct", "aSdPct",
+    "eSdRaw", "tSdRaw", "wSdRaw", "fSdRaw", "aSdRaw",
+    "sdPct", "damPct", "sdRaw",
+    "rDamPct", "rSdPct",
+    "str", "dex", "int", "def", "agi",
+)
+
+_MELEE_DEPS = (
+    "nDamRaw", "eDamRaw", "tDamRaw", "wDamRaw", "fDamRaw", "aDamRaw",
+    "nDamPct", "eDamPct", "tDamPct", "wDamPct", "fDamPct", "aDamPct",
+    "nMdRaw", "eMdRaw", "tMdRaw", "wMdRaw", "fMdRaw", "aMdRaw",
+    "mdPct", "damPct", "mdRaw",
+    "rDamPct",
+    "str", "dex", "int", "def", "agi",
+)
+
 DERIVED_DEPENDENCIES = {
     "hpr": ("hprRaw", "hprPct"),
     "ehp": ("hpBonus", "def", "agi"),
     "ehpr": ("hprRaw", "hprPct", "def", "agi"),
-    # Spell composites: dep order is fixed per spell, defined in data/spells.py
-    # (mirrored here so the parser doesn't need to import that module).
-    "mage_meteor": ("nDamRaw", "sdPct", "sdRaw", "damPct",
-                    "eDamPct", "eSdPct", "eSdRaw"),
-    "mage_ice_snake": ("nDamRaw", "sdPct", "sdRaw", "damPct",
-                       "wDamRaw", "wDamPct", "wSdPct", "wSdRaw"),
-    "warrior_bash": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw", "eMdRaw"),
-    "warrior_uppercut": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw", "eMdRaw",
-                         "tDamRaw", "tDamPct", "tMdRaw"),
-    "warrior_war_scream": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw",
-                           "fDamRaw", "fDamPct", "fMdRaw"),
-    "archer_arrow_storm": ("nDamRaw", "sdPct", "sdRaw", "damPct",
-                           "tDamRaw", "tDamPct"),
-    "archer_arrow_bomb": ("nDamRaw", "sdPct", "sdRaw", "damPct",
-                          "fDamRaw", "fDamPct", "fSdPct", "fSdRaw"),
-    "assassin_spin_attack": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw",
-                             "tDamRaw", "tDamPct", "tMdRaw"),
-    "assassin_multihit": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw",
-                          "wDamRaw", "wDamPct", "wMdRaw"),
-    "assassin_smoke_bomb": ("nDamRaw", "sdPct", "sdRaw", "damPct", "eSdRaw",
-                            "aDamRaw", "aDamPct", "aSdPct"),
-    "shaman_totem": ("nDamRaw", "sdPct", "sdRaw", "damPct",
-                     "aDamRaw", "aDamPct", "aSdPct"),
-    "shaman_aura": ("nDamRaw", "sdPct", "sdRaw", "damPct",
-                    "wDamRaw", "wDamPct", "wSdPct", "wSdRaw"),
-    "shaman_uproot": ("nDamRaw", "mdPct", "mdRaw", "damPct", "nMdRaw", "eMdRaw",
-                      "tDamRaw", "tDamPct", "tMdRaw"),
+    # All spell composites use one of the two canonical layouts above.
+    "mage_meteor":          _SPELL_DEPS,
+    "mage_ice_snake":       _SPELL_DEPS,
+    "warrior_bash":         _MELEE_DEPS,
+    "warrior_uppercut":     _MELEE_DEPS,
+    "warrior_war_scream":   _MELEE_DEPS,
+    "archer_arrow_storm":   _SPELL_DEPS,
+    "archer_arrow_bomb":    _SPELL_DEPS,
+    "assassin_spin_attack": _MELEE_DEPS,
+    "assassin_multihit":    _MELEE_DEPS,
+    "assassin_smoke_bomb":  _SPELL_DEPS,
+    "shaman_totem":         _SPELL_DEPS,
+    "shaman_aura":          _SPELL_DEPS,
+    "shaman_uproot":        _MELEE_DEPS,
 }
 
 # Formula tag per derived stat. Mapped to int in query.py for numba passage.
@@ -213,82 +223,12 @@ ALL_STATS = IDS_STATS + REQ_STATS + SPECIAL_STATS
 
 STAT_COUNT = len(ALL_STATS)
 
-# Fast name -> index lookup (only used during load/query parsing)
-STAT_INDEX = {
-    'aDamPct': 0,
-    'aDamRaw': 1,
-    'aDefPct': 2,
-    'aSdPct': 3,
-    'agi': 4,
-    'atkTier': 5,
-    'damPct': 6,
-    'def': 7,
-    'dex': 8,
-    'eDamPct': 9,
-    'eDefPct': 10,
-    'eMdRaw': 11,
-    'eSdPct': 12,
-    'eSdRaw': 13,
-    'eSteal': 14,
-    'expd': 15,
-    'fDamPct': 16,
-    'fDamRaw': 17,
-    'fDefPct': 18,
-    'fMdRaw': 19,
-    'fSdPct': 20,
-    'fSdRaw': 21,
-    'gSpd': 22,
-    'gXp': 23,
-    'healPct': 24,
-    'hpBonus': 25,
-    'hprPct': 26,
-    'hprRaw': 27,
-    'int': 28,
-    'jh': 29,
-    'kb': 30,
-    'lb': 31,
-    'lq': 32,
-    'ls': 33,
-    'maxMana': 34,
-    'mdPct': 35,
-    'mdRaw': 36,
-    'mr': 37,
-    'ms': 38,
-    'nDamRaw': 39,
-    'nMdRaw': 40,
-    'poison': 41,
-    'rDamPct': 42,
-    'rDefPct': 43,
-    'ref': 44,
-    'sdPct': 45,
-    'sdRaw': 46,
-    'spd': 47,
-    'sprint': 48,
-    'sprintReg': 49,
-    'str': 50,
-    'tDamPct': 51,
-    'tDamRaw': 52,
-    'tDefPct': 53,
-    'tMdRaw': 54,
-    'thorns': 55,
-    'wDamPct': 56,
-    'wDamRaw': 57,
-    'wDefPct': 58,
-    'wMdRaw': 59,
-    'wSdPct': 60,
-    'wSdRaw': 61,
-    'xpb': 62,
-    'strReq': 63,
-    'dexReq': 64,
-    'intReq': 65,
-    'defReq': 66,
-    'agiReq': 67,
-    'durability': 68,
-    'duration': 69,
-    'charges': 70,
-}
+# Fast name -> index lookup (only used during load/query parsing).
+# Derived from ALL_STATS so adding a stat to IDS_STATS automatically reindexes
+# the rest — no manual table to keep in sync.
+STAT_INDEX = {name: i for i, name in enumerate(ALL_STATS)}
 
-REQ_STATS_IDX = (63, 64, 65, 66, 67)
+REQ_STATS_IDX = tuple(STAT_INDEX[name] for name in REQ_STATS)
 
 
 # ============================================================
