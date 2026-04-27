@@ -1,2 +1,8 @@
 *.json
 !items.json
+
+# Python bytecode + numba JIT artifacts
+__pycache__/
+*.pyc
+*.nbc
+*.nbi
