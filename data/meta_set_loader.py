@@ -15,6 +15,7 @@ The pareto cull kernel (`numba_cull`) is unchanged from the pre-cache version.
 
 import numpy as np
 import os
+from time import perf_counter
 from typing import NamedTuple
 
 from numba import njit, prange
@@ -181,9 +182,13 @@ def _build_cache(json_path, cache_path):
 # Refine (project into active stat space + cull + sort void effs)
 # ------------------------------------------------------------
 
-def _refine_batch(ings, eff, stat_names, stat_min, stat_max, query, recipe, culling=True, timings=None):
-    """If `timings` is a dict, fills 'prep' and 'cull' (seconds) for profiling."""
-    from time import perf_counter
+def _refine_batch(ings, eff, stat_names, stat_min, stat_max, query, recipe,
+                  culling=True, cull_budget_s=None, timings=None):
+    """
+    `cull_budget_s`: forwarded to `numba_cull`. None = full cull. A positive
+    value enables semi-cull (early-stop after that many seconds of wall-clock).
+    `timings`: if a dict, fills 'prep' and 'cull' (seconds) for profiling.
+    """
     _t0 = perf_counter() if timings is not None else 0.0
 
     N = ings.shape[0]
@@ -261,6 +266,7 @@ def _refine_batch(ings, eff, stat_names, stat_min, stat_max, query, recipe, cull
             req_mask_proj,
             query.req_idx,
             query.dura_proj_idx,
+            time_budget_s=cull_budget_s,
         )
         if timings is not None:
             timings["cull"] = perf_counter() - _tc
@@ -450,17 +456,31 @@ def _intra_block_cull(block_start, block_end, matrix, num_effs, is_req_col,
                 break
 
 
-def pareto_filter_block(matrix, num_effs, is_req_col, dura_i, block_size=1024):
+def pareto_filter_block(matrix, num_effs, is_req_col, dura_i, block_size=1024,
+                        time_budget_s=None):
     """
-    Block-parallel pareto cull. Produces a VALID Pareto set identical to the
-    serial version on all real queries we've validated; the non-transitive
-    comparator could in theory yield rare divergences, but end-to-end search
-    output is the identity target here.
+    Block-parallel pareto cull.
+
+    `time_budget_s` (semi-cull): if set, stop processing further blocks once
+    elapsed wall-clock exceeds the budget. Unprocessed rows stay marked as
+    kept (default `is_kept=True`) — the cull only ever removes a row when a
+    dominating row was actually compared, so this is correctness-safe: a true
+    Pareto-optimal row is NEVER dropped (its dominators don't exist), only
+    suboptimal rows whose dominators happen to land in unprocessed blocks
+    survive the cull. Combined with the upstream sort-by-strength, the
+    early-processed blocks contain the strongest dominators, so a 1s budget
+    on a multi-second cull still removes most dominated rows.
+
+    Produces a VALID Pareto SUPERSET. End-to-end search output is the identity
+    target (per project_final_validation).
     """
     n = matrix.shape[0]
     is_kept = np.ones(n, dtype=np.bool_)
 
     survivors = np.empty(0, dtype=np.int64)
+
+    t_start = perf_counter() if time_budget_s is not None else 0.0
+    budgeted = time_budget_s is not None
 
     block_start = 0
     while block_start < n:
@@ -484,6 +504,12 @@ def pareto_filter_block(matrix, num_effs, is_req_col, dura_i, block_size=1024):
             survivors = np.concatenate((survivors, alive_in_block))
 
         block_start = block_end
+
+        # Semi-cull: bail out once we've consumed our wall-clock budget. The
+        # check sits AFTER block_start advance so progress is monotonic; rows
+        # in [block_start, n) keep the default `is_kept=True`.
+        if budgeted and perf_counter() - t_start > time_budget_s:
+            break
 
     return is_kept
 
@@ -526,7 +552,14 @@ def numba_cull(base_min_matrix,
                void_count,
                req_mask_proj,
                req_idx,
-               dura_proj_idx):
+               dura_proj_idx,
+               time_budget_s=None):
+    """
+    `time_budget_s`: if set, the block-parallel cull stops after this many
+    seconds of wall-clock — see `pareto_filter_block`. Output is then a
+    valid Pareto SUPERSET (some dominated rows survive, but no Pareto-optimal
+    row is ever dropped). Ignored on the small-matrix sequential path.
+    """
 
     dura_i = -1
     if dura_proj_idx >= 0:
@@ -559,9 +592,14 @@ def numba_cull(base_min_matrix,
             else np.zeros(matrix.shape[0], dtype=np.int64)
         order = np.argsort(-strength, kind="stable")
         sorted_matrix = np.ascontiguousarray(matrix[order])
-        is_kept_sorted = pareto_filter_block(sorted_matrix, void_count, is_req_col, dura_i)
+        is_kept_sorted = pareto_filter_block(
+            sorted_matrix, void_count, is_req_col, dura_i,
+            time_budget_s=time_budget_s,
+        )
         kept_in_sorted = np.where(is_kept_sorted)[0]
         return order[kept_in_sorted]
     else:
+        # Small matrices use the sequential reference path; budgeting it
+        # would add overhead for negligible savings.
         is_kept = pareto_filter(matrix, void_count, is_req_col, dura_i)
         return np.where(is_kept)[0]

@@ -34,18 +34,18 @@ def main():
         # "str": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "dex": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "int": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
-        # "def": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "def": {"min": 20, "ingredient_filter": True, "weight": 500},
         # "agi": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
 
         # ===== Skill Point Requirements =====
-        "strReq": {"max": 100, "ingredient_filter": True},
-        "dexReq": {"max": 100, "ingredient_filter": True},
-        "intReq": {"max": 100, "ingredient_filter": True},
-        "defReq": {"max": 100, "ingredient_filter": True},
-        "agiReq": {"max": 100, "ingredient_filter": True},
+        "strReq": {"max": 53, "ingredient_filter": True},
+        "dexReq": {"max": 48, "ingredient_filter": True},
+        "intReq": {"max": 0, "ingredient_filter": True},
+        "defReq": {"max": 99, "ingredient_filter": True},
+        "agiReq": {"max": 0, "ingredient_filter": True},
 
         # ===== Health / Mana / Regen =====
-        # "hpBonus":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "hpBonus":  {"min": 2000, "ingredient_filter": True, "weight": 10},
         # "hprRaw":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "hprPct":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "mr":       {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
@@ -61,7 +61,7 @@ def main():
 
         # ===== General Damage =====
         # "damPct":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
-        # "mdPct":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        "mdPct":   {"min": 20, "ingredient_filter": True, "weight": 1000},
         # "mdRaw":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "sdPct":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "sdRaw":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
@@ -97,8 +97,8 @@ def main():
         # "wDefPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
 
         # ===== Fire =====
-        # "fDamPct": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
-        # "fDamRaw": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        "fDamPct": {"min": 20, "ingredient_filter": True, "weight": 1000},
+        # "fDamRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "fMdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "fSdPct":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "fSdRaw":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
@@ -143,8 +143,8 @@ def main():
         # "charges":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
     }
 
-    skill = "TAILORING"
-    item_type = "LEGGINGS"
+    skill = "WOODWORKING"
+    item_type = "WAND"
     consumable = skill in CONSU_SKILLS
     
     # ---------- Build Query Object ----------
