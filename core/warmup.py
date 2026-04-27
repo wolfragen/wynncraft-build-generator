@@ -128,6 +128,23 @@ def _warm_search_engine():
             round_offset,
         )
 
+        # v2 ((m, i_0)-parallel) is the production path for k=3. Compile it
+        # eagerly here so the first real batch doesn't pay the parallel-jit cost.
+        se.search_meta_batch_v2(
+            ings, k, void_eff, base_min, base_max,
+            db_stat_min, db_stat_max, db_contrib_pos_mask, db_contrib_neg_mask,
+            N, 0,
+            has_min_mask, has_max_mask, pos_weight_mask, neg_weight_mask,
+            min_vals, max_vals, weights, total_searched,
+            -1e18,
+            comp_count, comp_formula,
+            comp_dep_offset, comp_dep_count, comp_dep_indices,
+            comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
+            build_ctx,
+            round_offset,
+        )
+
+
         se._search_meta_batch_k1(
             void_eff, base_min, base_max,
             db_stat_min, db_stat_max, N, 0,

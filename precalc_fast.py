@@ -319,6 +319,14 @@ def _grid_kernel(
         for kk in range(n):
             k = ing_stat_idx[f, kk]
             if ing_stat_scalable[f, kk]:
+                # NB: This kernel writes the OLD convention (raw db_min*e to
+                # "min", db_max*e to "max"). For negative e this is WRONG —
+                # db_max*e is more negative, so it's actually the min — but
+                # `_refine_batch` in meta_set_loader.py applies a post-load
+                # eff-sign-aware swap before the search engine sees the data,
+                # so the on-disk JSON is consistent with old precalc runs.
+                # If you ever switch to writing NEW convention here, also drop
+                # the loader correction (and create a per-file format marker).
                 b_min = (ing_stat_min[f, kk] * e) // 100
                 b_max = (ing_stat_max[f, kk] * e) // 100
                 if b_min == 0 and b_max == 0:

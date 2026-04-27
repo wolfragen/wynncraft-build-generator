@@ -34,7 +34,7 @@ def main():
         # "str": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "dex": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "int": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
-        # "def": {"min": 20, "ingredient_filter": True, "weight": 500},
+        "def": {"min": 20, "ingredient_filter": True, "weight": 500},
         # "agi": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
 
         # ===== Skill Point Requirements =====
@@ -45,7 +45,7 @@ def main():
         "agiReq": {"max": 0, "ingredient_filter": True},
 
         # ===== Health / Mana / Regen =====
-        # "hpBonus":  {"min": 2000, "ingredient_filter": True, "weight": 10},
+        "hpBonus":  {"min": 2000, "ingredient_filter": True, "weight": 10},
         # "hprRaw":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "hprPct":   {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "mr":       {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
@@ -235,25 +235,6 @@ if __name__ == "__main__":
         main()
     
     print(f"Elapsed time: {time()-start_time:.0f}s")
-    
-"""
-TODO : 
-derived_type        = [HPR_EFF, DPS]
-
-derived_dep_start   = [0, 2]
-derived_dep_count   = [2, 4]
-
-derived_deps        =
-[
-  idx_hprRaw,
-  idx_hprPct,
-
-  idx_sdRaw,
-  idx_sdPct,
-  idx_str,
-  idx_dex
-]
-"""
 
 
 

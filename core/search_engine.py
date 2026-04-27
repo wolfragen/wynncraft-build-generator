@@ -105,7 +105,45 @@ _DFS_SIG = types.void(
     types.int32[::1],         # round_offset (50 for req stats, 0 else)
     types.float64[::1],       # deps_lo scratch (size ≥31, reused per spell call)
     types.float64[::1],       # deps_hi scratch
+    types.Array(types.bool_, 1, "C"),  # useful_pos_eff (per ingredient, eff>0)
+    types.Array(types.bool_, 1, "C"),  # useful_neg_eff (per ingredient, eff<=0)
 )
+
+
+@njit(cache=True)
+def _compute_useful_masks(
+    db_contrib_pos_mask, db_contrib_neg_mask,
+    has_min_mask, has_max_mask, pos_weight_mask, neg_weight_mask,
+):
+    """
+    Precompute per-(ingredient, sign(eff)) whether the ingredient can affect
+    any constraint or weighted stat. The DFS used to rerun this O(S) scan
+    at every node × every ingredient; the result depends only on (i, eff
+    sign), so hoisting it here cuts an inner loop out of the hot path.
+
+    `useful_pos_eff[i]` is True iff some stat s makes ingredient i useful
+    when applied to a slot with eff > 0; `useful_neg_eff[i]` is the
+    symmetric mask for eff <= 0 (matching the DFS's `eff_is_positive = eff > 0`).
+    """
+    N = db_contrib_pos_mask.shape[0]
+    S = db_contrib_pos_mask.shape[1]
+    useful_pos_eff = np.zeros(N, dtype=np.bool_)
+    useful_neg_eff = np.zeros(N, dtype=np.bool_)
+    for i in range(N):
+        for s in range(S):
+            if db_contrib_pos_mask[i, s]:
+                if has_min_mask[s] or pos_weight_mask[s]:
+                    useful_pos_eff[i] = True
+                if has_max_mask[s] or neg_weight_mask[s]:
+                    useful_neg_eff[i] = True
+            if db_contrib_neg_mask[i, s]:
+                if has_max_mask[s] or neg_weight_mask[s]:
+                    useful_pos_eff[i] = True
+                if has_min_mask[s] or pos_weight_mask[s]:
+                    useful_neg_eff[i] = True
+            if useful_pos_eff[i] and useful_neg_eff[i]:
+                break
+    return useful_pos_eff, useful_neg_eff
 
 
 # ============================================================
@@ -670,9 +708,18 @@ def _precompute_bounds(db_stat_min, db_stat_max, meta_void_eff, void_count, dura
                         future_max_ub, future_min_ub, future_max_lb, future_min_lb):
     """
     Build suffix-sum arrays capturing the best/worst additional contribution
-    the remaining slots can add to current_max[s] and current_min[s]. Semantics
-    match the running sums used in dfs: current_max uses db_stat_max across
-    ingredients, current_min uses db_stat_min.
+    the remaining slots can add to current_max[s] and current_min[s].
+
+    Convention: current_max[s] / current_min[s] track the TRUE reachable
+    upper / lower bound on the build's total stat. With independent rolls
+    per slot, that's sum-of-per-slot-max-contribution and sum-of-per-slot-
+    min-contribution respectively. For a single slot d with effectiveness e:
+      e >= 0 :  c_d_max = (db_stat_max * e + ro) // 100
+                c_d_min = (db_stat_min * e + ro) // 100
+      e <  0 :  c_d_max = (db_stat_min * e + ro) // 100   (less negative)
+                c_d_min = (db_stat_max * e + ro) // 100   (more negative)
+    `slot_best_max` / `slot_worst_max` are the max/min over ingredient choice
+    of c_d_max; `slot_best_min` / `slot_worst_min` the same for c_d_min.
 
     Caller must provide four pre-allocated (void_count+1, S) int32 buffers
     (future_max_ub/min_ub/max_lb/min_lb). They are filled in-place; row k is
@@ -695,6 +742,7 @@ def _precompute_bounds(db_stat_min, db_stat_max, meta_void_eff, void_count, dura
     # single-ingredient contribution into the suffix sum.
     for d in range(k - 1, -1, -1):
         eff = meta_void_eff[d]
+        eff_pos = eff >= 0
         for s in range(S):
             if s == dura_idx:
                 # Dura: no eff multiplier, contribution is just db_stat_X[i, dura].
@@ -714,26 +762,35 @@ def _precompute_bounds(db_stat_min, db_stat_max, meta_void_eff, void_count, dura
                     if v < slot_worst_min:
                         slot_worst_min = v
             else:
-                # Stat with effectiveness multiplier. The sign of eff flips
-                # which ingredient side wins.
+                # Eff-sign-aware: db_stat_max ↔ db_stat_min swap when eff < 0,
+                # because (large_db * negative_e) is more negative than
+                # (small_db * negative_e).
                 ro = round_offset[s]
-                v0 = (db_stat_max[0, s] * eff + ro) // 100
-                slot_best_max = v0
-                slot_worst_max = v0
-                v0 = (db_stat_min[0, s] * eff + ro) // 100
-                slot_best_min = v0
-                slot_worst_min = v0
+                if eff_pos:
+                    v_max = (db_stat_max[0, s] * eff + ro) // 100
+                    v_min = (db_stat_min[0, s] * eff + ro) // 100
+                else:
+                    v_max = (db_stat_min[0, s] * eff + ro) // 100
+                    v_min = (db_stat_max[0, s] * eff + ro) // 100
+                slot_best_max = v_max
+                slot_worst_max = v_max
+                slot_best_min = v_min
+                slot_worst_min = v_min
                 for i in range(1, N):
-                    v = (db_stat_max[i, s] * eff + ro) // 100
-                    if v > slot_best_max:
-                        slot_best_max = v
-                    if v < slot_worst_max:
-                        slot_worst_max = v
-                    v = (db_stat_min[i, s] * eff + ro) // 100
-                    if v > slot_best_min:
-                        slot_best_min = v
-                    if v < slot_worst_min:
-                        slot_worst_min = v
+                    if eff_pos:
+                        v_max = (db_stat_max[i, s] * eff + ro) // 100
+                        v_min = (db_stat_min[i, s] * eff + ro) // 100
+                    else:
+                        v_max = (db_stat_min[i, s] * eff + ro) // 100
+                        v_min = (db_stat_max[i, s] * eff + ro) // 100
+                    if v_max > slot_best_max:
+                        slot_best_max = v_max
+                    if v_max < slot_worst_max:
+                        slot_worst_max = v_max
+                    if v_min > slot_best_min:
+                        slot_best_min = v_min
+                    if v_min < slot_worst_min:
+                        slot_worst_min = v_min
 
             future_max_ub[d, s] = future_max_ub[d + 1, s] + slot_best_max
             future_min_ub[d, s] = future_min_ub[d + 1, s] + slot_best_min
@@ -788,6 +845,8 @@ def dfs(
     round_offset,
     deps_lo,
     deps_hi,
+    useful_pos_eff,
+    useful_neg_eff,
 ):
     # Leaf
     if depth == k:
@@ -868,83 +927,106 @@ def dfs(
         return
 
 
+    # Loop-invariant per depth — hoist outside the for-i loop so the compiler
+    # doesn't re-fetch them every ingredient.
+    eff = meta_void_eff[depth]
+    eff_is_positive = eff > 0
+    eff_pos = eff >= 0  # eff_pos: (db_max * e) is the upper extreme; eff_pos==False -> swap
+    next_depth = depth + 1
+    has_next_slot = next_depth < k
+    same_eff_next = has_next_slot and (eff == meta_void_eff[next_depth])
+    # Bind the right precomputed bitmask once per depth (eff sign is fixed
+    # for this DFS frame). Inner loop becomes one bool lookup per ingredient
+    # instead of an O(S) per-stat scan.
+    if eff_is_positive:
+        useful_for_eff = useful_pos_eff
+    else:
+        useful_for_eff = useful_neg_eff
+
     for i in range(start_index, db_count):
 
-        eff = meta_void_eff[depth]
-        
         # ============================================================
         # PRUNING
         # ============================================================
-        
-        useful = False
-        eff_is_positive = eff > 0
-        for s in range(len(current_min)):
 
-            # contrib_pos (ing stat can be > 0):
-            #   eff > 0 → product > 0 → relevant to has_min / positive weight
-            #   eff < 0 → product < 0 → relevant to has_max / negative weight
-            if db_contrib_pos_mask[i, s]:
-                if eff_is_positive and (has_min_mask[s] or pos_weight_mask[s]):
-                    useful = True
-                    break
-                if (not eff_is_positive) and (has_max_mask[s] or neg_weight_mask[s]):
-                    useful = True
-                    break
-
-            # contrib_neg (ing stat can be < 0):
-            #   eff > 0 → product < 0 → relevant to has_max / negative weight
-            #   eff < 0 → product > 0 → relevant to has_min / positive weight
-            if db_contrib_neg_mask[i, s]:
-                if eff_is_positive and (has_max_mask[s] or neg_weight_mask[s]):
-                    useful = True
-                    break
-                if (not eff_is_positive) and (has_min_mask[s] or pos_weight_mask[s]):
-                    useful = True
-                    break
-
-        if not useful:
+        if not useful_for_eff[i]:
             continue
-        
+
         # ---- dura pruning ----
         if current_max[dura_idx] + db_stat_min[i, dura_idx] < min_vals[dura_idx]:
             continue
-        
+
         # ============================================================
-        # 
+        #
         # ============================================================
 
         ingredients[depth] = i
 
-        # Apply ingredient contribution
+        # Apply ingredient contribution. Eff-sign-aware swap so current_min /
+        # current_max stay TRUE reachable extrema (see _precompute_bounds).
         for s in range(len(current_min)):
             if(s == dura_idx):
                 current_min[s] += db_stat_min[i, s]
                 current_max[s] += db_stat_max[i, s]
             else:
                 ro = round_offset[s]
-                current_min[s] += (db_stat_min[i, s] * eff + ro) //100
-                current_max[s] += (db_stat_max[i, s] * eff + ro) //100
+                if eff_pos:
+                    current_min[s] += (db_stat_min[i, s] * eff + ro) // 100
+                    current_max[s] += (db_stat_max[i, s] * eff + ro) // 100
+                else:
+                    current_min[s] += (db_stat_max[i, s] * eff + ro) // 100
+                    current_max[s] += (db_stat_min[i, s] * eff + ro) // 100
 
         # =========================
-        # SCORE UB PRUNING (branch-and-bound)
+        # SCORE UB PRUNING (branch-and-bound) + HARD FEASIBILITY CHECK
         # =========================
-        # Upper-bound the final score assuming remaining slots pick the best
-        # ingredient per-stat (optimistic, stats treated independently). For
-        # weights>0 we use UB on current_max/min; for weights<0 we use LB
-        # (since negative weight * larger value = smaller score).
+        # Single fused pass over stats:
+        #   1. Hard feasibility — if even the best-possible suffix can't make
+        #      max_v ≥ min_vals (or worst-possible suffix can't keep min_v ≤
+        #      max_vals), the entire subtree is infeasible and we skip it
+        #      without bothering with composite UB or recursion. The leaf-only
+        #      check used to catch this much later.
+        #   2. UB score — same as before, optimistic per-stat upper bound on
+        #      the final weighted score.
         ub_score = 0.0
         S = len(current_min)
-        next_depth = depth + 1
+        feasible = True
         for s in range(S):
+            cmax = current_max[s]
+            cmin = current_min[s]
+            f_max_ub = future_max_ub[next_depth, s]
+            f_min_ub = future_min_ub[next_depth, s]
+            f_max_lb = future_max_lb[next_depth, s]
+            f_min_lb = future_min_lb[next_depth, s]
+
+            if has_min_mask[s] and cmax + f_max_ub < min_vals[s]:
+                feasible = False
+                break
+            if has_max_mask[s] and cmin + f_min_lb > max_vals[s]:
+                feasible = False
+                break
+
             w = weights[s]
             if w > 0.0:
-                max_v = current_max[s] + future_max_ub[next_depth, s]
-                min_v = current_min[s] + future_min_ub[next_depth, s]
-                ub_score += w * (max_v * 0.99 + min_v * 0.01)
+                ub_score += w * ((cmax + f_max_ub) * 0.99 + (cmin + f_min_ub) * 0.01)
             elif w < 0.0:
-                max_v = current_max[s] + future_max_lb[next_depth, s]
-                min_v = current_min[s] + future_min_lb[next_depth, s]
-                ub_score += w * (max_v * 0.99 + min_v * 0.01)
+                ub_score += w * ((cmax + f_max_lb) * 0.99 + (cmin + f_min_lb) * 0.01)
+
+        if not feasible:
+            # Undo and skip — entire subtree can't satisfy hard constraints.
+            for s in range(len(current_min)):
+                if s == dura_idx:
+                    current_min[s] -= db_stat_min[i, s]
+                    current_max[s] -= db_stat_max[i, s]
+                else:
+                    ro = round_offset[s]
+                    if eff_pos:
+                        current_min[s] -= (db_stat_min[i, s] * eff + ro) // 100
+                        current_max[s] -= (db_stat_max[i, s] * eff + ro) // 100
+                    else:
+                        current_min[s] -= (db_stat_max[i, s] * eff + ro) // 100
+                        current_max[s] -= (db_stat_min[i, s] * eff + ro) // 100
+            continue
 
         # Composite UB: per-formula admissible bound on the final comp value,
         # using the (current_*[s] + future_*_*[next_depth, s]) range for each dep.
@@ -1057,17 +1139,22 @@ def dfs(
                     current_max[s] -= db_stat_max[i, s]
                 else:
                     ro = round_offset[s]
-                    current_min[s] -= (db_stat_min[i, s] * eff + ro) // 100
-                    current_max[s] -= (db_stat_max[i, s] * eff + ro) // 100
+                    if eff_pos:
+                        current_min[s] -= (db_stat_min[i, s] * eff + ro) // 100
+                        current_max[s] -= (db_stat_max[i, s] * eff + ro) // 100
+                    else:
+                        current_min[s] -= (db_stat_max[i, s] * eff + ro) // 100
+                        current_max[s] -= (db_stat_min[i, s] * eff + ro) // 100
             continue
 
         # Permutation kill: only re-use the same start index when the next
         # void slot has the same effectiveness (slots are sorted desc by eff),
         # otherwise the slot is distinguishable and any ordering is allowed.
-        # When depth+1 == k there's no next slot — the recursion will hit the
-        # leaf and `start_index` is unused, so the value doesn't matter.
+        # `same_eff_next` is precomputed above (loop-invariant); the k==6
+        # special case (kept as in the original) means: at the deepest fan-out
+        # level we always carry the start_index forward as a safety net.
         next_start = 0
-        if k == 6 or (depth + 1 < k and eff == meta_void_eff[depth + 1]):
+        if k == 6 or same_eff_next:
             next_start = i
 
         dfs(
@@ -1112,6 +1199,8 @@ def dfs(
             round_offset,
             deps_lo,
             deps_hi,
+            useful_pos_eff,
+            useful_neg_eff,
         )
 
         # Undo
@@ -1121,8 +1210,12 @@ def dfs(
                 current_max[s] -= db_stat_max[i, s]
             else:
                 ro = round_offset[s]
-                current_min[s] -= (db_stat_min[i, s] * eff + ro) //100
-                current_max[s] -= (db_stat_max[i, s] * eff + ro) //100
+                if eff_pos:
+                    current_min[s] -= (db_stat_min[i, s] * eff + ro) // 100
+                    current_max[s] -= (db_stat_max[i, s] * eff + ro) // 100
+                else:
+                    current_min[s] -= (db_stat_max[i, s] * eff + ro) // 100
+                    current_max[s] -= (db_stat_min[i, s] * eff + ro) // 100
 
 
 # ============================================================
@@ -1178,6 +1271,7 @@ def _search_meta_batch_k1(
 
     for m in prange(M):
         eff = void_eff_matrix[m, 0]
+        eff_pos = eff >= 0
         sb_val = shared_best[0]
         local_best = init_best_score
         if sb_val > local_best:
@@ -1200,9 +1294,16 @@ def _search_meta_batch_k1(
                     min_v = base_min_matrix[m, s] + db_stat_min[i, s]
                     max_v = base_max_matrix[m, s] + db_stat_max[i, s]
                 else:
+                    # Eff-sign-aware: for negative eff, db_max contributes the
+                    # MORE negative value (true min) and db_min the LESS negative
+                    # (true max). Swap accordingly.
                     ro = round_offset[s]
-                    min_v = base_min_matrix[m, s] + (db_stat_min[i, s] * eff + ro) // 100
-                    max_v = base_max_matrix[m, s] + (db_stat_max[i, s] * eff + ro) // 100
+                    if eff_pos:
+                        min_v = base_min_matrix[m, s] + (db_stat_min[i, s] * eff + ro) // 100
+                        max_v = base_max_matrix[m, s] + (db_stat_max[i, s] * eff + ro) // 100
+                    else:
+                        min_v = base_min_matrix[m, s] + (db_stat_max[i, s] * eff + ro) // 100
+                        max_v = base_max_matrix[m, s] + (db_stat_min[i, s] * eff + ro) // 100
 
                 final_min[s] = min_v
                 final_max[s] = max_v
@@ -1356,12 +1457,18 @@ def _search_meta_batch_k2(
     for m in prange(M):
         eff0 = void_eff_matrix[m, 0]
         eff1 = void_eff_matrix[m, 1]
+        eff0_pos = eff0 >= 0
+        eff1_pos = eff1 >= 0
         same_eff = (eff0 == eff1)
 
         # ---- Precompute slot-1 per-stat bounds (one-time O(N*S) per m).
-        # slot1_best_max[s] = max over i of db_stat_max[i, s] * eff1 // 100 (direct for dura).
-        # slot1_best_min[s] = max over i of db_stat_min[i, s] * eff1 // 100.
-        # Used to upper-bound the UB of the final score after picking i0.
+        # Convention (eff-sign-aware):
+        #   slot1_best_max[s]  = max over i of c_max(i)
+        #   slot1_worst_max[s] = min over i of c_max(i)
+        #   slot1_best_min[s]  = max over i of c_min(i)
+        #   slot1_worst_min[s] = min over i of c_min(i)
+        # where c_max / c_min are TRUE per-slot contribution extrema. For
+        # eff1 < 0, db_max ↔ db_min swap (large db × negative e is more negative).
         slot1_best_max = slot1_buf[m, 0]
         slot1_best_min = slot1_buf[m, 1]
         slot1_worst_max = slot1_buf[m, 2]
@@ -1382,19 +1489,27 @@ def _search_meta_batch_k2(
                     if v < wn: wn = v
             else:
                 ro = round_offset[s]
-                v = (db_stat_max[0, s] * eff1 + ro) // 100
-                bm = v
-                wm = v
-                v = (db_stat_min[0, s] * eff1 + ro) // 100
-                bn = v
-                wn = v
+                if eff1_pos:
+                    v_max = (db_stat_max[0, s] * eff1 + ro) // 100
+                    v_min = (db_stat_min[0, s] * eff1 + ro) // 100
+                else:
+                    v_max = (db_stat_min[0, s] * eff1 + ro) // 100
+                    v_min = (db_stat_max[0, s] * eff1 + ro) // 100
+                bm = v_max
+                wm = v_max
+                bn = v_min
+                wn = v_min
                 for i in range(1, db_count):
-                    v = (db_stat_max[i, s] * eff1 + ro) // 100
-                    if v > bm: bm = v
-                    if v < wm: wm = v
-                    v = (db_stat_min[i, s] * eff1 + ro) // 100
-                    if v > bn: bn = v
-                    if v < wn: wn = v
+                    if eff1_pos:
+                        v_max = (db_stat_max[i, s] * eff1 + ro) // 100
+                        v_min = (db_stat_min[i, s] * eff1 + ro) // 100
+                    else:
+                        v_max = (db_stat_min[i, s] * eff1 + ro) // 100
+                        v_min = (db_stat_max[i, s] * eff1 + ro) // 100
+                    if v_max > bm: bm = v_max
+                    if v_max < wm: wm = v_max
+                    if v_min > bn: bn = v_min
+                    if v_min < wn: wn = v_min
             slot1_best_max[s] = bm
             slot1_worst_max[s] = wm
             slot1_best_min[s] = bn
@@ -1428,8 +1543,12 @@ def _search_meta_batch_k2(
                     after_max = base_max_matrix[m, s] + db_stat_max[i0, s]
                 else:
                     ro = round_offset[s]
-                    after_min = base_min_matrix[m, s] + (db_stat_min[i0, s] * eff0 + ro) // 100
-                    after_max = base_max_matrix[m, s] + (db_stat_max[i0, s] * eff0 + ro) // 100
+                    if eff0_pos:
+                        after_min = base_min_matrix[m, s] + (db_stat_min[i0, s] * eff0 + ro) // 100
+                        after_max = base_max_matrix[m, s] + (db_stat_max[i0, s] * eff0 + ro) // 100
+                    else:
+                        after_min = base_min_matrix[m, s] + (db_stat_max[i0, s] * eff0 + ro) // 100
+                        after_max = base_max_matrix[m, s] + (db_stat_min[i0, s] * eff0 + ro) // 100
 
                 after_min_arr[s] = after_min
                 after_max_arr[s] = after_max
@@ -1558,13 +1677,24 @@ def _search_meta_batch_k2(
                         v_min = base_min_matrix[m, s] + db_stat_min[i0, s] + db_stat_min[i1, s]
                         v_max = base_max_matrix[m, s] + db_stat_max[i0, s] + db_stat_max[i1, s]
                     else:
+                        # Eff-sign-aware swap per slot. Each slot's contribution
+                        # extrema are independent; sum gives true reachable
+                        # min/max of total stat.
                         ro = round_offset[s]
-                        v_min = (base_min_matrix[m, s]
-                                 + (db_stat_min[i0, s] * eff0 + ro) // 100
-                                 + (db_stat_min[i1, s] * eff1 + ro) // 100)
-                        v_max = (base_max_matrix[m, s]
-                                 + (db_stat_max[i0, s] * eff0 + ro) // 100
-                                 + (db_stat_max[i1, s] * eff1 + ro) // 100)
+                        if eff0_pos:
+                            c0_min = (db_stat_min[i0, s] * eff0 + ro) // 100
+                            c0_max = (db_stat_max[i0, s] * eff0 + ro) // 100
+                        else:
+                            c0_min = (db_stat_max[i0, s] * eff0 + ro) // 100
+                            c0_max = (db_stat_min[i0, s] * eff0 + ro) // 100
+                        if eff1_pos:
+                            c1_min = (db_stat_min[i1, s] * eff1 + ro) // 100
+                            c1_max = (db_stat_max[i1, s] * eff1 + ro) // 100
+                        else:
+                            c1_min = (db_stat_max[i1, s] * eff1 + ro) // 100
+                            c1_max = (db_stat_min[i1, s] * eff1 + ro) // 100
+                        v_min = base_min_matrix[m, s] + c0_min + c1_min
+                        v_max = base_max_matrix[m, s] + c0_max + c1_max
 
                     final_min_arr[s] = v_min
                     final_max_arr[s] = v_max
@@ -1721,6 +1851,13 @@ def search_meta_batch(
 
     S = base_min_matrix.shape[1]
 
+    # Per-(ingredient, eff sign) "useful" bitmask. Doesn't depend on m or
+    # depth — same for every DFS call in this batch.
+    useful_pos_eff, useful_neg_eff = _compute_useful_masks(
+        db_contrib_pos_mask, db_contrib_neg_mask,
+        has_min_mask, has_max_mask, pos_weight_mask, neg_weight_mask,
+    )
+
     # Pre-allocate the bounds tensor (single big alloc instead of M×4 small
     # ones per batch). Stride per m = 4·(k+1)·S int32 ≈ 432 bytes for k=3,S=9
     # — well above 64-byte cache lines, so adjacent m's land on distinct lines
@@ -1796,6 +1933,8 @@ def search_meta_batch(
             round_offset,
             deps_lo,
             deps_hi,
+            useful_pos_eff,
+            useful_neg_eff,
         )
 
         if best_score_ref[0] > seed_score:
@@ -1821,6 +1960,370 @@ def search_meta_batch(
     total = 0
     for m in range(M):
         total += per_m_searched[m]
+    total_searched[0] += total
+
+    return best_score, best_meta_index, best_solution_global
+
+
+# ============================================================
+# Search One Meta Batch (v2 — (m, i_0)-parallel)
+# ============================================================
+# `search_meta_batch` parallelizes only across m's. For low-M / high-k batches
+# (META_5 with M=20, META_6 with M=1) that strands ~all of a 24-core CPU.
+# This v2 fans out one DFS level deeper: the `prange` is over (m, i_0) so the
+# outer loop has M*N work units. Same DFS body for depths 1..k-1 — we just
+# inline the depth-0 logic and call the existing `dfs` with depth=1.
+#
+# Used for k>=3 batches (k=1 / k=2 keep their specialized paths). Memory use
+# scales with M*N for the per-(m, i_0) result rows; for the largest k>=3
+# batch (k=3, M~4k, N~100), that's ~3MB per result array — negligible.
+
+@njit(parallel=True, cache=True)
+def search_meta_batch_v2(
+    ings_matrix,
+    void_count,
+    void_eff_matrix,
+    base_min_matrix,
+    base_max_matrix,
+    db_stat_min,
+    db_stat_max,
+    db_contrib_pos_mask,
+    db_contrib_neg_mask,
+    db_count,
+    dura_idx,
+    has_min_mask,
+    has_max_mask,
+    pos_weight_mask,
+    neg_weight_mask,
+    min_vals,
+    max_vals,
+    weights,
+    total_searched,
+    init_best_score,
+    comp_count,
+    comp_formula,
+    comp_dep_offset,
+    comp_dep_count,
+    comp_dep_indices,
+    comp_min,
+    comp_max,
+    comp_has_min,
+    comp_has_max,
+    comp_weight,
+    build_ctx,
+    round_offset,
+):
+    M = ings_matrix.shape[0]
+    k = void_count
+    N = db_count
+    S = base_min_matrix.shape[1]
+
+    # Per-(m, i_0) output slots. We don't expect every (m, i_0) to yield a
+    # build, but storing -1e18 sentinel + zero solution is cheap.
+    best_scores_mi0 = np.full((M, N), -1e18, dtype=np.float64)
+    best_solutions_mi0 = np.zeros((M, N, k), dtype=np.int32)
+    per_mi0_searched = np.zeros((M, N), dtype=np.int64)
+
+    # Cross-iteration best, racy-but-benign (same semantics as v1).
+    shared_best = np.array([init_best_score], dtype=np.float64)
+
+    # Per-(ingredient, eff sign) "useful" bitmask — same precompute as v1.
+    useful_pos_eff, useful_neg_eff = _compute_useful_masks(
+        db_contrib_pos_mask, db_contrib_neg_mask,
+        has_min_mask, has_max_mask, pos_weight_mask, neg_weight_mask,
+    )
+
+    # Pre-allocate the bounds tensor once. Phase 1 fills bounds_buf[m] in a
+    # parallel m-loop; Phase 2's (m, i_0) workers all read bounds_buf[m] but
+    # only the slice for their m, so no false-sharing concerns.
+    bounds_buf = np.zeros((M, 4, k + 1, S), dtype=np.int32)
+
+    # Phase 1: precompute bounds for each m.
+    for m in prange(M):
+        future_max_ub_m = bounds_buf[m, 0]
+        future_min_ub_m = bounds_buf[m, 1]
+        future_max_lb_m = bounds_buf[m, 2]
+        future_min_lb_m = bounds_buf[m, 3]
+        _precompute_bounds(
+            db_stat_min, db_stat_max, void_eff_matrix[m], k, dura_idx, round_offset,
+            future_max_ub_m, future_min_ub_m, future_max_lb_m, future_min_lb_m,
+        )
+
+    # Phase 2: (m, i_0) parallel DFS.
+    total_work = M * N
+    for combined in prange(total_work):
+        m = combined // N
+        i_0 = combined % N
+
+        # ----- Per-(m, i_0) state -----
+        ingredients = np.zeros(k, dtype=np.int32)
+        current_min = base_min_matrix[m].copy()
+        current_max = base_max_matrix[m].copy()
+
+        # Seed local best from shared (cross-iteration) best so far.
+        local_init = shared_best[0]
+        if init_best_score > local_init:
+            local_init = init_best_score
+        best_score_ref = np.array([local_init], dtype=np.float64)
+        best_solution_local = np.zeros(k, dtype=np.int32)
+        local_searched = np.zeros(1, dtype=np.int64)
+        seed_score = local_init
+
+        future_max_ub = bounds_buf[m, 0]
+        future_min_ub = bounds_buf[m, 1]
+        future_max_lb = bounds_buf[m, 2]
+        future_min_lb = bounds_buf[m, 3]
+
+        deps_lo = np.empty(31, dtype=np.float64)
+        deps_hi = np.empty(31, dtype=np.float64)
+
+        eff_0 = void_eff_matrix[m, 0]
+        eff_0_is_positive = eff_0 > 0
+        eff_0_pos = eff_0 >= 0
+
+        # ----- Inlined depth=0 body of dfs (only for ingredient i = i_0) -----
+
+        # Useful check via precomputed bitmask (was an O(S) scan per i_0).
+        if eff_0_is_positive:
+            if not useful_pos_eff[i_0]:
+                continue
+        else:
+            if not useful_neg_eff[i_0]:
+                continue
+
+        # Dura prune
+        if current_max[dura_idx] + db_stat_min[i_0, dura_idx] < min_vals[dura_idx]:
+            continue
+
+        ingredients[0] = i_0
+
+        # Apply i_0 to slot 0. Eff-sign-aware swap so current_min / current_max
+        # stay TRUE reachable extrema (see _precompute_bounds).
+        for s in range(S):
+            if s == dura_idx:
+                current_min[s] += db_stat_min[i_0, s]
+                current_max[s] += db_stat_max[i_0, s]
+            else:
+                ro = round_offset[s]
+                if eff_0_pos:
+                    current_min[s] += (db_stat_min[i_0, s] * eff_0 + ro) // 100
+                    current_max[s] += (db_stat_max[i_0, s] * eff_0 + ro) // 100
+                else:
+                    current_min[s] += (db_stat_max[i_0, s] * eff_0 + ro) // 100
+                    current_max[s] += (db_stat_min[i_0, s] * eff_0 + ro) // 100
+
+        # UB check at depth 1 (next_depth = 1) — fused with hard feasibility
+        # so we skip the (composite UB + recurse) work for infeasible builds.
+        ub_score = 0.0
+        feasible = True
+        for s in range(S):
+            cmax = current_max[s]
+            cmin = current_min[s]
+            f_max_ub = future_max_ub[1, s]
+            f_min_ub = future_min_ub[1, s]
+            f_max_lb = future_max_lb[1, s]
+            f_min_lb = future_min_lb[1, s]
+
+            if has_min_mask[s] and cmax + f_max_ub < min_vals[s]:
+                feasible = False
+                break
+            if has_max_mask[s] and cmin + f_min_lb > max_vals[s]:
+                feasible = False
+                break
+
+            w = weights[s]
+            if w > 0.0:
+                ub_score += w * ((cmax + f_max_ub) * 0.99 + (cmin + f_min_ub) * 0.01)
+            elif w < 0.0:
+                ub_score += w * ((cmax + f_max_lb) * 0.99 + (cmin + f_min_lb) * 0.01)
+
+        if not feasible:
+            continue
+
+        # Composite UB at depth 1 (mirrors the dfs composite UB block)
+        for c in range(comp_count):
+            w = comp_weight[c]
+            if w == 0.0:
+                continue
+            off = comp_dep_offset[c]
+            f = comp_formula[c]
+
+            if f == FORMULA_MUL_DIV_100:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
+                pmax_lo, pmax_hi = _product_bounds_div100(
+                    current_max[a] + future_max_lb[1, a],
+                    current_max[a] + future_max_ub[1, a],
+                    current_max[b] + future_max_lb[1, b],
+                    current_max[b] + future_max_ub[1, b],
+                )
+                pmin_lo, pmin_hi = _product_bounds_div100(
+                    current_min[a] + future_min_lb[1, a],
+                    current_min[a] + future_min_ub[1, a],
+                    current_min[b] + future_min_lb[1, b],
+                    current_min[b] + future_min_ub[1, b],
+                )
+            elif f == FORMULA_RAW_TO_PCT:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
+                pmax_lo, pmax_hi = _raw_to_pct_bounds(
+                    current_max[a] + future_max_lb[1, a],
+                    current_max[a] + future_max_ub[1, a],
+                    current_max[b] + future_max_lb[1, b],
+                    current_max[b] + future_max_ub[1, b],
+                )
+                pmin_lo, pmin_hi = _raw_to_pct_bounds(
+                    current_min[a] + future_min_lb[1, a],
+                    current_min[a] + future_min_ub[1, a],
+                    current_min[b] + future_min_lb[1, b],
+                    current_min[b] + future_min_ub[1, b],
+                )
+            elif f == FORMULA_EHP:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
+                cc = comp_dep_indices[off + 2]
+                pmax_lo, pmax_hi = _ehp_bounds(
+                    current_max[a] + future_max_lb[1, a],
+                    current_max[a] + future_max_ub[1, a],
+                    current_max[b] + future_max_lb[1, b],
+                    current_max[b] + future_max_ub[1, b],
+                    current_max[cc] + future_max_lb[1, cc],
+                    current_max[cc] + future_max_ub[1, cc],
+                )
+                pmin_lo, pmin_hi = _ehp_bounds(
+                    current_min[a] + future_min_lb[1, a],
+                    current_min[a] + future_min_ub[1, a],
+                    current_min[b] + future_min_lb[1, b],
+                    current_min[b] + future_min_ub[1, b],
+                    current_min[cc] + future_min_lb[1, cc],
+                    current_min[cc] + future_min_ub[1, cc],
+                )
+            elif f == FORMULA_EHPR:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
+                cc = comp_dep_indices[off + 2]
+                dd = comp_dep_indices[off + 3]
+                pmax_lo, pmax_hi = _ehpr_bounds(
+                    current_max[a] + future_max_lb[1, a],
+                    current_max[a] + future_max_ub[1, a],
+                    current_max[b] + future_max_lb[1, b],
+                    current_max[b] + future_max_ub[1, b],
+                    current_max[cc] + future_max_lb[1, cc],
+                    current_max[cc] + future_max_ub[1, cc],
+                    current_max[dd] + future_max_lb[1, dd],
+                    current_max[dd] + future_max_ub[1, dd],
+                )
+                pmin_lo, pmin_hi = _ehpr_bounds(
+                    current_min[a] + future_min_lb[1, a],
+                    current_min[a] + future_min_ub[1, a],
+                    current_min[b] + future_min_lb[1, b],
+                    current_min[b] + future_min_ub[1, b],
+                    current_min[cc] + future_min_lb[1, cc],
+                    current_min[cc] + future_min_ub[1, cc],
+                    current_min[dd] + future_min_lb[1, dd],
+                    current_min[dd] + future_min_ub[1, dd],
+                )
+            else:  # spell composite
+                spell_id = f - FORMULA_SPELL_DAMAGE_BASE
+                pmax_lo, pmax_hi = _spell_dfs_ub(
+                    spell_id, off, comp_dep_indices, current_max,
+                    future_max_lb, future_max_ub, 1, build_ctx,
+                    deps_lo, deps_hi,
+                )
+                pmin_lo, pmin_hi = _spell_dfs_ub(
+                    spell_id, off, comp_dep_indices, current_min,
+                    future_min_lb, future_min_ub, 1, build_ctx,
+                    deps_lo, deps_hi,
+                )
+
+            if w > 0.0:
+                ub_score += w * (pmax_hi * 0.99 + pmin_hi * 0.01)
+            else:
+                ub_score += w * (pmax_lo * 0.99 + pmin_lo * 0.01)
+
+        if ub_score <= best_score_ref[0]:
+            continue
+
+        # Permutation kill — at depth 0, next slot is depth 1; carry index
+        # forward only when slots 0 and 1 share effectiveness (k>=2 here since
+        # we route k=1/k=2 to specialized paths and v2 only handles k>=3).
+        next_start = 0
+        if k == 6 or (1 < k and eff_0 == void_eff_matrix[m, 1]):
+            next_start = i_0
+
+        # ----- Recurse for depths 1..k-1 -----
+        dfs(
+            1,                          # depth
+            next_start,
+            k,
+            ingredients,
+            current_min,
+            current_max,
+            best_score_ref,
+            best_solution_local,
+            db_stat_min,
+            db_stat_max,
+            db_contrib_pos_mask,
+            db_contrib_neg_mask,
+            db_count,
+            void_eff_matrix[m],
+            dura_idx,
+            has_min_mask,
+            has_max_mask,
+            pos_weight_mask,
+            neg_weight_mask,
+            min_vals,
+            max_vals,
+            weights,
+            local_searched,
+            future_max_ub,
+            future_min_ub,
+            future_max_lb,
+            future_min_lb,
+            comp_count,
+            comp_formula,
+            comp_dep_offset,
+            comp_dep_count,
+            comp_dep_indices,
+            comp_min,
+            comp_max,
+            comp_has_min,
+            comp_has_max,
+            comp_weight,
+            build_ctx,
+            round_offset,
+            deps_lo,
+            deps_hi,
+            useful_pos_eff,
+            useful_neg_eff,
+        )
+
+        # No undo of i_0 needed — current_min/max are this iteration's local copies.
+
+        if best_score_ref[0] > seed_score:
+            if best_score_ref[0] > shared_best[0]:
+                shared_best[0] = best_score_ref[0]
+            best_scores_mi0[m, i_0] = best_score_ref[0]
+            for j in range(k):
+                best_solutions_mi0[m, i_0, j] = best_solution_local[j]
+        per_mi0_searched[m, i_0] = local_searched[0]
+
+    # ----- Reduce: (m, i_0) -> global -----
+    best_score = -1e18
+    best_meta_index = -1
+    best_solution_global = np.zeros(k, dtype=np.int32)
+    for m in range(M):
+        for i_0 in range(N):
+            if best_scores_mi0[m, i_0] > best_score:
+                best_score = best_scores_mi0[m, i_0]
+                best_meta_index = m
+                for j in range(k):
+                    best_solution_global[j] = best_solutions_mi0[m, i_0, j]
+
+    total = 0
+    for m in range(M):
+        for i_0 in range(N):
+            total += per_mi0_searched[m, i_0]
     total_searched[0] += total
 
     return best_score, best_meta_index, best_solution_global
@@ -1894,7 +2397,11 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
         total_searched[0] += added
         return score, meta_index, sol
 
-    return search_meta_batch(
+    # k>=3: route through v2 which parallelizes across (m, i_0). Tried v3
+    # ((m, i_0, i_1)) — measured no win because the extra parallelism breaks
+    # intra-worker BB tightening (each (m, i_0) worker's `i_1` loop benefits
+    # from local_best updates inside its own dfs, which v3 fragments away).
+    return search_meta_batch_v2(
         meta_batch.ings_matrix,
         meta_batch.void_count,
         meta_batch.void_eff_matrix,

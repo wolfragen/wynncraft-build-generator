@@ -37,7 +37,13 @@ from data.stats import STAT_INDEX, STAT_COUNT, REQ_STATS
 
 
 # Bump this when the on-disk cache format changes so old caches are ignored.
-_CACHE_VERSION = 1
+# v2: cache now stores stat_min / stat_max in the NEW eff-sign-aware convention
+# (true reachable lower / upper bound on total stat). The precalc JSON still
+# uses the OLD convention (raw db_min*e -> "min", db_max*e -> "max"); the cache
+# builder applies an eff-sign-aware swap on negative-eff non-void slots so the
+# stored arrays match what the search engine now expects. Old v1 caches mirror
+# the JSON values verbatim and must be discarded.
+_CACHE_VERSION = 3
 
 
 class MetaBatch(NamedTuple):
@@ -165,6 +171,15 @@ def _build_cache(json_path, cache_path):
 
     stat_names_arr = np.array(stat_names, dtype="U32") if stat_names else np.empty(0, dtype="U1")
 
+    # Apply eff-sign-aware correction so the cache stores TRUE reachable
+    # min/max per stat (matching the search engine's new convention). The
+    # precalc kernel writes (db_min*e)//100 -> "min" and (db_max*e)//100 ->
+    # "max" regardless of e's sign — wrong for negative e since (db_max*e)
+    # is more negative than (db_min*e). For each row, swap the per-slot
+    # contribution on negative-eff non-void slots.
+    if S > 0:
+        _apply_inversion_correction(ings, eff, stat_min, stat_max, stat_names_arr)
+
     np.savez(
         cache_path,
         version=np.int32(_CACHE_VERSION),
@@ -176,6 +191,120 @@ def _build_cache(json_path, cache_path):
     )
 
     return ings, eff, stat_names_arr, stat_min, stat_max
+
+
+# ------------------------------------------------------------
+# Inversion correction (eff-sign-aware swap of pre-summed totals)
+# ------------------------------------------------------------
+
+# Lazily-built per-process lookup of raw per-ingredient stat min/max. Loading
+# `data/ingreds_compress.json` is ~2-3 MB JSON parse; cache it so repeated
+# `_build_cache` calls (one per META_n) only pay it once.
+_RAW_STATS_CACHE = None
+
+
+def _get_raw_stats_lookup():
+    """
+    Returns (ing_id_to_idx, raw_stats_min, raw_stats_max).
+      - ing_id_to_idx : (max_id+1,) int32 — JSON id -> row in raw_stats_*, or -1
+      - raw_stats_min : (num_raw, STAT_COUNT) int16 — global stat space
+      - raw_stats_max : (num_raw, STAT_COUNT) int16
+    """
+    global _RAW_STATS_CACHE
+    if _RAW_STATS_CACHE is not None:
+        return _RAW_STATS_CACHE
+
+    # Local import to avoid a hard module-load cycle on import-time.
+    from data.ingredient_loader import load_ingredients
+
+    ings = load_ingredients("data/ingreds_compress.json")
+    if not ings:
+        empty = np.full(1, -1, dtype=np.int32)
+        empty_stats = np.zeros((0, STAT_COUNT), dtype=np.int16)
+        _RAW_STATS_CACHE = (empty, empty_stats, empty_stats)
+        return _RAW_STATS_CACHE
+
+    max_id = max(int(ing.ing_id) for ing in ings)
+    ing_id_to_idx = np.full(max_id + 1, -1, dtype=np.int32)
+    raw_min = np.zeros((len(ings), STAT_COUNT), dtype=np.int16)
+    raw_max = np.zeros((len(ings), STAT_COUNT), dtype=np.int16)
+    for i, ing in enumerate(ings):
+        ing_id_to_idx[int(ing.ing_id)] = i
+        raw_min[i] = ing.stats_min
+        raw_max[i] = ing.stats_max
+    _RAW_STATS_CACHE = (ing_id_to_idx, raw_min, raw_max)
+    return _RAW_STATS_CACHE
+
+
+@njit(cache=True, parallel=True)
+def _correct_inversion_kernel(
+    ings,             # (N, 6) int32 — JSON id per slot, -1 for void
+    eff,              # (N, 6) int32 — per-slot effectiveness
+    stat_min,         # (N, S_file) int32 — IN-PLACE corrected
+    stat_max,         # (N, S_file) int32 — IN-PLACE corrected
+    ing_id_to_idx,    # (max_id+1,) int32 — JSON id -> raw row, or -1
+    raw_stats_min,    # (num_raw, STAT_COUNT) int16
+    raw_stats_max,    # (num_raw, STAT_COUNT) int16
+    file_col_to_global,  # (S_file,) int32 — file column -> global stat idx, or -1
+):
+    """
+    For each row, walk the 6 slots. On any non-void slot with eff < 0, swap
+    the per-slot contribution to stat_min/stat_max (precalc wrote db_min*e
+    -> "min", db_max*e -> "max"; for negative e the two should be swapped).
+    Math:
+      old_min_contrib = (ing_min * e) // 100
+      old_max_contrib = (ing_max * e) // 100
+      delta_min = old_max_contrib - old_min_contrib   (negative for ing_min<ing_max)
+      delta_max = old_min_contrib - old_max_contrib   (= -delta_min)
+    floor-div in Python/numba handles signs consistently with the precalc
+    kernel, so the swap delta is exact at integer level.
+    """
+    N = ings.shape[0]
+    S_file = stat_min.shape[1]
+    max_id_plus_1 = ing_id_to_idx.shape[0]
+    for r in prange(N):
+        for slot in range(6):
+            f_id = ings[r, slot]
+            if f_id < 0:
+                continue
+            if f_id >= max_id_plus_1:
+                continue  # unknown id (shouldn't happen) — skip safely
+            e = eff[r, slot]
+            if e >= 0:
+                continue
+            raw_idx = ing_id_to_idx[f_id]
+            if raw_idx < 0:
+                continue
+            for fc in range(S_file):
+                gc = file_col_to_global[fc]
+                if gc < 0:
+                    continue
+                ing_min = raw_stats_min[raw_idx, gc]
+                ing_max = raw_stats_max[raw_idx, gc]
+                if ing_min == ing_max:
+                    continue  # no spread -> no swap effect
+                old_min_contrib = (ing_min * e) // 100
+                old_max_contrib = (ing_max * e) // 100
+                delta = old_max_contrib - old_min_contrib  # added to stat_min
+                stat_min[r, fc] += delta
+                stat_max[r, fc] -= delta
+
+
+def _apply_inversion_correction(ings, eff, stat_min, stat_max, stat_names_arr):
+    """Build the file-col -> global-stat lookup, then run the numba kernel."""
+    ing_id_to_idx, raw_min, raw_max = _get_raw_stats_lookup()
+
+    file_col_to_global = np.full(stat_names_arr.shape[0], -1, dtype=np.int32)
+    for i in range(stat_names_arr.shape[0]):
+        gi = STAT_INDEX.get(str(stat_names_arr[i]))
+        if gi is not None:
+            file_col_to_global[i] = gi
+
+    _correct_inversion_kernel(
+        ings, eff, stat_min, stat_max,
+        ing_id_to_idx, raw_min, raw_max,
+        file_col_to_global,
+    )
 
 
 # ------------------------------------------------------------
