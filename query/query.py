@@ -158,6 +158,14 @@ class Query(NamedTuple):
     filter_mask: np.ndarray
     proj_stats_idx: np.ndarray
 
+    # Per-stat rounding bias added before `// 100` in eff scaling. 50 for req
+    # stats (matches wynnbuilder's `Math.round(value * eff_mult)` for itemIDs
+    # in craft.js:464-468), 0 for everything else (matches its `Math.floor` for
+    # rolled IDs in craft.js:487). Without this, `(v*eff)//100` undercounts
+    # negative-half contributions by 1 per slot vs WB, making xReq max
+    # constraints leak by up to ~6 units on 6-void builds.
+    round_offset_proj: np.ndarray   # int32[stat_count]
+
     consumable: bool
     suggested_max_cull: int
 
@@ -433,6 +441,8 @@ def build_query(
             req_idx[i] = j
             i += 1
 
+    round_offset_proj = (req_mask_proj.astype(np.int32) * 50).astype(np.int32)
+
     # Resolve dura / duration in projected space (at most one is active).
     dura_proj_idx = -1
     for j, name in enumerate(stat_index_keys_proj):
@@ -502,6 +512,7 @@ def build_query(
         req_idx=req_idx,
         filter_mask=filter_mask_full,
         proj_stats_idx=proj_stats_idx,
+        round_offset_proj=round_offset_proj,
         consumable=consumable,
         suggested_max_cull=suggested_max_cull,
         dura_proj_idx=dura_proj_idx,

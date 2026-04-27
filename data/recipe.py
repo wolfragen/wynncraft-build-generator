@@ -40,8 +40,13 @@ def build_recipe(raw_recipe: dict, query, tier: int) -> Recipe:
 
     mult = TIER_MULT[tier]
 
-    scaled_dura_min = math.floor(base_dura_min * mult)
-    scaled_dura_max = math.floor(base_dura_max * mult)
+    # Wynnbuilder craft.js:322,325 rounds durability/duration after the matmult
+    # scale (Math.round = round-half-toward-+∞), unlike hp/healthOrDamage which
+    # floors (line 320). Python's `round` is banker's rounding (half-to-even),
+    # which diverges from JS at exact .5; `floor(x + 0.5)` is the universal JS
+    # Math.round equivalent for any sign.
+    scaled_dura_min = math.floor(base_dura_min * mult + 0.5)
+    scaled_dura_max = math.floor(base_dura_max * mult + 0.5)
 
     # ------------------------------------------------------------
     # Start from query projected base constraints

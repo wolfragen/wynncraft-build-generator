@@ -89,16 +89,25 @@ def calculate_recipe_stats(grid):
 
     # Effectiveness is NO LONGER clamped to 0 so negative effs evaluate properly.
     total_stats = {}
-    
+
+    # xReq stats (itemIDs in wynnbuilder) use Math.round on the cumulative sum
+    # in craft.js:464-468, while rolled "ids" use Math.floor (craft.js:487).
+    # Floor is the default below (matches `// 100`); for req stats we add 50
+    # before the floor to emulate JS Math.round (round-half-toward-+∞). Without
+    # this, a negative-half contribution like -10*2.15 = -21.5 floors to -22
+    # but wynnbuilder rounds to -21, leaking xReq max constraints by ~1/slot.
+    REQ_STATS = ("strReq", "dexReq", "intReq", "defReq", "agiReq")
+
     for s, ing in enumerate(grid):
         if ing is None: continue
         multiplier = effs[s]
-        
+
         for name, range_val in ing["stats"].items():
             if name == "ingredEff": continue
-            b_min = (range_val["min"] * multiplier) // 100
-            b_max = (range_val["max"] * multiplier) // 100
-            
+            offset = 50 if name in REQ_STATS else 0
+            b_min = (range_val["min"] * multiplier + offset) // 100
+            b_max = (range_val["max"] * multiplier + offset) // 100
+
             if b_min != 0 or b_max != 0:
                 if name not in total_stats: total_stats[name] = {"min": 0, "max": 0}
                 total_stats[name]["min"] += b_min

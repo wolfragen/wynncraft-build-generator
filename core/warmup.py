@@ -98,6 +98,11 @@ def _warm_search_engine():
     build_ctx = np.zeros(BUILD_CTX_SIZE, dtype=np.float64)
     build_ctx[5] = 2.05  # BUILD_CTX_ATK_SPD
 
+    # Per-stat round-half-up bias for eff scaling (real Query passes 50 on req
+    # stats); zero here is fine for warmup since we only need the kernel to
+    # compile, not to compute meaningful values.
+    round_offset = np.zeros(S, dtype=np.int32)
+
     void_eff_k2 = np.full((M, 2), 100, dtype=np.int32)
 
     # Cover every formula tag (fixed + every spell_id). Each loop iteration
@@ -120,6 +125,7 @@ def _warm_search_engine():
             comp_dep_offset, comp_dep_count, comp_dep_indices,
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
+            round_offset,
         )
 
         se._search_meta_batch_k1(
@@ -131,6 +137,7 @@ def _warm_search_engine():
             comp_dep_offset, comp_dep_count, comp_dep_indices,
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
+            round_offset,
         )
 
         se._search_meta_batch_k2(
@@ -142,4 +149,5 @@ def _warm_search_engine():
             comp_dep_offset, comp_dep_count, comp_dep_indices,
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
+            round_offset,
         )

@@ -102,6 +102,9 @@ _DFS_SIG = types.void(
     types.Array(types.bool_, 1, "C"),  # comp_has_max
     types.float32[::1],       # comp_weight
     types.float64[::1],       # build_ctx (skp pcts, atk_spd, crit)
+    types.int32[::1],         # round_offset (50 for req stats, 0 else)
+    types.float64[::1],       # deps_lo scratch (size ≥31, reused per spell call)
+    types.float64[::1],       # deps_hi scratch
 )
 
 
@@ -582,11 +585,15 @@ def _eval_spell_corner_melee(deps, spell_id, ctx):
 # ============================================================
 
 @njit(cache=True)
-def _spell_leaf(spell_id, off, di, mins, maxs, ctx):
-    """Bounds at the leaf — read deps from the build's roll min/max arrays."""
+def _spell_leaf(spell_id, off, di, mins, maxs, ctx, deps_lo, deps_hi):
+    """Bounds at the leaf — read deps from the build's roll min/max arrays.
+
+    `deps_lo` and `deps_hi` are caller-provided scratch buffers of length ≥31
+    (the largest spell-formula dep count). Pre-allocating once per m's DFS and
+    reusing across all spell calls avoids ~2M np.empty() per batch on
+    composite-heavy queries (mage_meteor: 31 deps × 2 arrays per UB/leaf call).
+    """
     if _SPELL_USE_SPELL[spell_id]:
-        deps_lo = np.empty(31, dtype=np.float64)
-        deps_hi = np.empty(31, dtype=np.float64)
         for i in range(31):
             idx = di[off + i]
             deps_lo[i] = mins[idx]
@@ -594,8 +601,6 @@ def _spell_leaf(spell_id, off, di, mins, maxs, ctx):
         lb = _eval_spell_corner_spell(deps_lo, spell_id, ctx)
         ub = _eval_spell_corner_spell(deps_hi, spell_id, ctx)
     else:
-        deps_lo = np.empty(27, dtype=np.float64)
-        deps_hi = np.empty(27, dtype=np.float64)
         for i in range(27):
             idx = di[off + i]
             deps_lo[i] = mins[idx]
@@ -606,15 +611,13 @@ def _spell_leaf(spell_id, off, di, mins, maxs, ctx):
 
 
 @njit(cache=True)
-def _spell_dfs_ub(spell_id, off, di, cur, flb, fub, nd, ctx):
+def _spell_dfs_ub(spell_id, off, di, cur, flb, fub, nd, ctx, deps_lo, deps_hi):
     """
     Bounds at the dfs UB site — each dep value is `cur[idx] + future_lb` (for
     LB) or `cur[idx] + future_ub` (for UB). `nd` is the next-depth index into
-    the future arrays.
+    the future arrays. Buffers reused per caller's m loop (see _spell_leaf).
     """
     if _SPELL_USE_SPELL[spell_id]:
-        deps_lo = np.empty(31, dtype=np.float64)
-        deps_hi = np.empty(31, dtype=np.float64)
         for i in range(31):
             idx = di[off + i]
             base = cur[idx]
@@ -623,8 +626,6 @@ def _spell_dfs_ub(spell_id, off, di, cur, flb, fub, nd, ctx):
         lb = _eval_spell_corner_spell(deps_lo, spell_id, ctx)
         ub = _eval_spell_corner_spell(deps_hi, spell_id, ctx)
     else:
-        deps_lo = np.empty(27, dtype=np.float64)
-        deps_hi = np.empty(27, dtype=np.float64)
         for i in range(27):
             idx = di[off + i]
             base = cur[idx]
@@ -636,14 +637,12 @@ def _spell_dfs_ub(spell_id, off, di, cur, flb, fub, nd, ctx):
 
 
 @njit(cache=True)
-def _spell_k2_ub(spell_id, off, di, after, sw, sb, ctx):
+def _spell_k2_ub(spell_id, off, di, after, sw, sb, ctx, deps_lo, deps_hi):
     """
     Bounds at the k=2 UB site — each dep value is `after[idx] + slot1_worst`
-    (LB) or `after[idx] + slot1_best` (UB).
+    (LB) or `after[idx] + slot1_best` (UB). Buffers reused per m's loop.
     """
     if _SPELL_USE_SPELL[spell_id]:
-        deps_lo = np.empty(31, dtype=np.float64)
-        deps_hi = np.empty(31, dtype=np.float64)
         for i in range(31):
             idx = di[off + i]
             base = after[idx]
@@ -652,8 +651,6 @@ def _spell_k2_ub(spell_id, off, di, after, sw, sb, ctx):
         lb = _eval_spell_corner_spell(deps_lo, spell_id, ctx)
         ub = _eval_spell_corner_spell(deps_hi, spell_id, ctx)
     else:
-        deps_lo = np.empty(27, dtype=np.float64)
-        deps_hi = np.empty(27, dtype=np.float64)
         for i in range(27):
             idx = di[off + i]
             base = after[idx]
@@ -669,27 +666,30 @@ def _spell_k2_ub(spell_id, off, di, after, sw, sb, ctx):
 # ============================================================
 
 @njit(cache=True)
-def _precompute_bounds(db_stat_min, db_stat_max, meta_void_eff, void_count, dura_idx):
+def _precompute_bounds(db_stat_min, db_stat_max, meta_void_eff, void_count, dura_idx, round_offset,
+                        future_max_ub, future_min_ub, future_max_lb, future_min_lb):
     """
     Build suffix-sum arrays capturing the best/worst additional contribution
     the remaining slots can add to current_max[s] and current_min[s]. Semantics
     match the running sums used in dfs: current_max uses db_stat_max across
     ingredients, current_min uses db_stat_min.
 
-    Returns four (void_count+1, S) int32 arrays:
-      future_max_ub[d, s] — max extra contribution to current_max from slots d..k-1
-      future_min_ub[d, s] — max extra contribution to current_min from slots d..k-1
-      future_max_lb[d, s] — min extra contribution to current_max from slots d..k-1
-      future_min_lb[d, s] — min extra contribution to current_min from slots d..k-1
+    Caller must provide four pre-allocated (void_count+1, S) int32 buffers
+    (future_max_ub/min_ub/max_lb/min_lb). They are filled in-place; row k is
+    zeroed (the empty-suffix sum). Pre-allocation outside the prange loop
+    avoids ~M × 4 numpy allocations per batch — significant for big M.
     """
     S = db_stat_min.shape[1]
     N = db_stat_min.shape[0]
     k = void_count
 
-    future_max_ub = np.zeros((k + 1, S), dtype=np.int32)
-    future_min_ub = np.zeros((k + 1, S), dtype=np.int32)
-    future_max_lb = np.zeros((k + 1, S), dtype=np.int32)
-    future_min_lb = np.zeros((k + 1, S), dtype=np.int32)
+    # Zero the "empty suffix" sentinel row (row k); the loop below writes the
+    # rest based on row d+1, so seeding row k is enough.
+    for s in range(S):
+        future_max_ub[k, s] = 0
+        future_min_ub[k, s] = 0
+        future_max_lb[k, s] = 0
+        future_min_lb[k, s] = 0
 
     # Walk slots from last to first; accumulate the per-slot best/worst
     # single-ingredient contribution into the suffix sum.
@@ -716,19 +716,20 @@ def _precompute_bounds(db_stat_min, db_stat_max, meta_void_eff, void_count, dura
             else:
                 # Stat with effectiveness multiplier. The sign of eff flips
                 # which ingredient side wins.
-                v0 = (db_stat_max[0, s] * eff) // 100
+                ro = round_offset[s]
+                v0 = (db_stat_max[0, s] * eff + ro) // 100
                 slot_best_max = v0
                 slot_worst_max = v0
-                v0 = (db_stat_min[0, s] * eff) // 100
+                v0 = (db_stat_min[0, s] * eff + ro) // 100
                 slot_best_min = v0
                 slot_worst_min = v0
                 for i in range(1, N):
-                    v = (db_stat_max[i, s] * eff) // 100
+                    v = (db_stat_max[i, s] * eff + ro) // 100
                     if v > slot_best_max:
                         slot_best_max = v
                     if v < slot_worst_max:
                         slot_worst_max = v
-                    v = (db_stat_min[i, s] * eff) // 100
+                    v = (db_stat_min[i, s] * eff + ro) // 100
                     if v > slot_best_min:
                         slot_best_min = v
                     if v < slot_worst_min:
@@ -738,8 +739,6 @@ def _precompute_bounds(db_stat_min, db_stat_max, meta_void_eff, void_count, dura
             future_min_ub[d, s] = future_min_ub[d + 1, s] + slot_best_min
             future_max_lb[d, s] = future_max_lb[d + 1, s] + slot_worst_max
             future_min_lb[d, s] = future_min_lb[d + 1, s] + slot_worst_min
-
-    return future_max_ub, future_min_ub, future_max_lb, future_min_lb
 
 
 # ============================================================
@@ -786,6 +785,9 @@ def dfs(
     comp_has_max,
     comp_weight,
     build_ctx,
+    round_offset,
+    deps_lo,
+    deps_hi,
 ):
     # Leaf
     if depth == k:
@@ -848,6 +850,7 @@ def dfs(
                 cmin, cmax = _spell_leaf(
                     spell_id, off, comp_dep_indices,
                     current_min, current_max, build_ctx,
+                    deps_lo, deps_hi,
                 )
 
             if comp_has_min[c] and cmax < comp_min[c]:
@@ -918,8 +921,9 @@ def dfs(
                 current_min[s] += db_stat_min[i, s]
                 current_max[s] += db_stat_max[i, s]
             else:
-                current_min[s] += (db_stat_min[i, s] * eff) //100
-                current_max[s] += (db_stat_max[i, s] * eff) //100
+                ro = round_offset[s]
+                current_min[s] += (db_stat_min[i, s] * eff + ro) //100
+                current_max[s] += (db_stat_max[i, s] * eff + ro) //100
 
         # =========================
         # SCORE UB PRUNING (branch-and-bound)
@@ -1032,10 +1036,12 @@ def dfs(
                 pmax_lo, pmax_hi = _spell_dfs_ub(
                     spell_id, off, comp_dep_indices, current_max,
                     future_max_lb, future_max_ub, next_depth, build_ctx,
+                    deps_lo, deps_hi,
                 )
                 pmin_lo, pmin_hi = _spell_dfs_ub(
                     spell_id, off, comp_dep_indices, current_min,
                     future_min_lb, future_min_ub, next_depth, build_ctx,
+                    deps_lo, deps_hi,
                 )
 
             if w > 0.0:
@@ -1050,8 +1056,9 @@ def dfs(
                     current_min[s] -= db_stat_min[i, s]
                     current_max[s] -= db_stat_max[i, s]
                 else:
-                    current_min[s] -= (db_stat_min[i, s] * eff) // 100
-                    current_max[s] -= (db_stat_max[i, s] * eff) // 100
+                    ro = round_offset[s]
+                    current_min[s] -= (db_stat_min[i, s] * eff + ro) // 100
+                    current_max[s] -= (db_stat_max[i, s] * eff + ro) // 100
             continue
 
         # Permutation kill: only re-use the same start index when the next
@@ -1102,6 +1109,9 @@ def dfs(
             comp_has_max,
             comp_weight,
             build_ctx,
+            round_offset,
+            deps_lo,
+            deps_hi,
         )
 
         # Undo
@@ -1110,8 +1120,9 @@ def dfs(
                 current_min[s] -= db_stat_min[i, s]
                 current_max[s] -= db_stat_max[i, s]
             else:
-                current_min[s] -= (db_stat_min[i, s] * eff) //100
-                current_max[s] -= (db_stat_max[i, s] * eff) //100
+                ro = round_offset[s]
+                current_min[s] -= (db_stat_min[i, s] * eff + ro) //100
+                current_max[s] -= (db_stat_max[i, s] * eff + ro) //100
 
 
 # ============================================================
@@ -1148,6 +1159,7 @@ def _search_meta_batch_k1(
     comp_has_max,
     comp_weight,
     build_ctx,
+    round_offset,
 ):
     M = base_min_matrix.shape[0]
     S = base_min_matrix.shape[1]
@@ -1156,15 +1168,29 @@ def _search_meta_batch_k1(
     best_solutions = np.zeros((M, 1), dtype=np.int32)
     per_m_searched = np.zeros(M, dtype=np.int64)
 
+    # Shared best score across prange m's; racy but benign (see search_meta_batch).
+    shared_best = np.array([init_best_score], dtype=np.float64)
+
+    # Pre-allocate per-m scratch (final_min/max, deps_lo/hi). Each row is at
+    # least 64 bytes so adjacent m's don't false-share.
+    final_buf = np.empty((M, 2, S), dtype=np.int32)
+    deps_buf = np.empty((M, 2, 31), dtype=np.float64)
+
     for m in prange(M):
         eff = void_eff_matrix[m, 0]
+        sb_val = shared_best[0]
         local_best = init_best_score
+        if sb_val > local_best:
+            local_best = sb_val
         local_best_i = -1
         local_searched = 0
 
         # Per-iter storage so composite can reread dep values after the base loop.
-        final_min = np.empty(S, dtype=np.int32)
-        final_max = np.empty(S, dtype=np.int32)
+        final_min = final_buf[m, 0]
+        final_max = final_buf[m, 1]
+        # Spell-eval scratch reused across every composite call this m.
+        deps_lo = deps_buf[m, 0]
+        deps_hi = deps_buf[m, 1]
 
         for i in range(db_count):
             feasible = True
@@ -1174,8 +1200,9 @@ def _search_meta_batch_k1(
                     min_v = base_min_matrix[m, s] + db_stat_min[i, s]
                     max_v = base_max_matrix[m, s] + db_stat_max[i, s]
                 else:
-                    min_v = base_min_matrix[m, s] + (db_stat_min[i, s] * eff) // 100
-                    max_v = base_max_matrix[m, s] + (db_stat_max[i, s] * eff) // 100
+                    ro = round_offset[s]
+                    min_v = base_min_matrix[m, s] + (db_stat_min[i, s] * eff + ro) // 100
+                    max_v = base_max_matrix[m, s] + (db_stat_max[i, s] * eff + ro) // 100
 
                 final_min[s] = min_v
                 final_max[s] = max_v
@@ -1231,6 +1258,7 @@ def _search_meta_batch_k1(
                     cmin, cmax = _spell_leaf(
                         spell_id, off, comp_dep_indices,
                         final_min, final_max, build_ctx,
+                        deps_lo, deps_hi,
                     )
                 if comp_has_min[c] and cmax < comp_min[c]:
                     feasible = False
@@ -1248,8 +1276,10 @@ def _search_meta_batch_k1(
                 local_best = score
                 local_best_i = i
 
-        best_scores[m] = local_best
         if local_best_i >= 0:
+            if local_best > shared_best[0]:
+                shared_best[0] = local_best
+            best_scores[m] = local_best
             best_solutions[m, 0] = local_best_i
         per_m_searched[m] = local_searched
 
@@ -1303,6 +1333,7 @@ def _search_meta_batch_k2(
     comp_has_max,
     comp_weight,
     build_ctx,
+    round_offset,
 ):
     M = base_min_matrix.shape[0]
     S = base_min_matrix.shape[1]
@@ -1310,6 +1341,17 @@ def _search_meta_batch_k2(
     best_scores = np.full(M, -1e18, dtype=np.float64)
     best_solutions = np.zeros((M, 2), dtype=np.int32)
     per_m_searched = np.zeros(M, dtype=np.int64)
+
+    # Shared best score across prange m's; racy but benign (see search_meta_batch).
+    shared_best = np.array([init_best_score], dtype=np.float64)
+
+    # Pre-allocate slot-1 bounds buffers (4×S int32 per m; ~144 bytes for S=9,
+    # well above 64-byte cache lines so adjacent m rows don't share lines).
+    slot1_buf = np.empty((M, 4, S), dtype=np.int32)
+    # Per-m after-state + final-state for composite UB / leaf rereads.
+    state_buf = np.empty((M, 4, S), dtype=np.int32)
+    # Spell-eval scratch (max 31 deps).
+    deps_buf = np.empty((M, 2, 31), dtype=np.float64)
 
     for m in prange(M):
         eff0 = void_eff_matrix[m, 0]
@@ -1320,10 +1362,10 @@ def _search_meta_batch_k2(
         # slot1_best_max[s] = max over i of db_stat_max[i, s] * eff1 // 100 (direct for dura).
         # slot1_best_min[s] = max over i of db_stat_min[i, s] * eff1 // 100.
         # Used to upper-bound the UB of the final score after picking i0.
-        slot1_best_max = np.empty(S, dtype=np.int32)
-        slot1_best_min = np.empty(S, dtype=np.int32)
-        slot1_worst_max = np.empty(S, dtype=np.int32)
-        slot1_worst_min = np.empty(S, dtype=np.int32)
+        slot1_best_max = slot1_buf[m, 0]
+        slot1_best_min = slot1_buf[m, 1]
+        slot1_worst_max = slot1_buf[m, 2]
+        slot1_worst_min = slot1_buf[m, 3]
 
         for s in range(S):
             if s == dura_idx:
@@ -1339,17 +1381,18 @@ def _search_meta_batch_k2(
                     if v > bn: bn = v
                     if v < wn: wn = v
             else:
-                v = (db_stat_max[0, s] * eff1) // 100
+                ro = round_offset[s]
+                v = (db_stat_max[0, s] * eff1 + ro) // 100
                 bm = v
                 wm = v
-                v = (db_stat_min[0, s] * eff1) // 100
+                v = (db_stat_min[0, s] * eff1 + ro) // 100
                 bn = v
                 wn = v
                 for i in range(1, db_count):
-                    v = (db_stat_max[i, s] * eff1) // 100
+                    v = (db_stat_max[i, s] * eff1 + ro) // 100
                     if v > bm: bm = v
                     if v < wm: wm = v
-                    v = (db_stat_min[i, s] * eff1) // 100
+                    v = (db_stat_min[i, s] * eff1 + ro) // 100
                     if v > bn: bn = v
                     if v < wn: wn = v
             slot1_best_max[s] = bm
@@ -1357,17 +1400,23 @@ def _search_meta_batch_k2(
             slot1_best_min[s] = bn
             slot1_worst_min[s] = wn
 
+        sb_val = shared_best[0]
         local_best = init_best_score
+        if sb_val > local_best:
+            local_best = sb_val
         local_best_i0 = -1
         local_best_i1 = -1
         local_searched = 0
 
         # Per-i0 after-state, needed again for composite UB.
-        after_min_arr = np.empty(S, dtype=np.int32)
-        after_max_arr = np.empty(S, dtype=np.int32)
+        after_min_arr = state_buf[m, 0]
+        after_max_arr = state_buf[m, 1]
         # Per-i1 final-state, needed again for composite leaf check + score.
-        final_min_arr = np.empty(S, dtype=np.int32)
-        final_max_arr = np.empty(S, dtype=np.int32)
+        final_min_arr = state_buf[m, 2]
+        final_max_arr = state_buf[m, 3]
+        # Spell-eval scratch reused across every composite call this m.
+        deps_lo = deps_buf[m, 0]
+        deps_hi = deps_buf[m, 1]
 
         for i0 in range(db_count):
             # Apply i0: running state after placing first ingredient.
@@ -1378,8 +1427,9 @@ def _search_meta_batch_k2(
                     after_min = base_min_matrix[m, s] + db_stat_min[i0, s]
                     after_max = base_max_matrix[m, s] + db_stat_max[i0, s]
                 else:
-                    after_min = base_min_matrix[m, s] + (db_stat_min[i0, s] * eff0) // 100
-                    after_max = base_max_matrix[m, s] + (db_stat_max[i0, s] * eff0) // 100
+                    ro = round_offset[s]
+                    after_min = base_min_matrix[m, s] + (db_stat_min[i0, s] * eff0 + ro) // 100
+                    after_max = base_max_matrix[m, s] + (db_stat_max[i0, s] * eff0 + ro) // 100
 
                 after_min_arr[s] = after_min
                 after_max_arr[s] = after_max
@@ -1482,10 +1532,12 @@ def _search_meta_batch_k2(
                     pmax_lo, pmax_hi = _spell_k2_ub(
                         spell_id, off, comp_dep_indices, after_max_arr,
                         slot1_worst_max, slot1_best_max, build_ctx,
+                        deps_lo, deps_hi,
                     )
                     pmin_lo, pmin_hi = _spell_k2_ub(
                         spell_id, off, comp_dep_indices, after_min_arr,
                         slot1_worst_min, slot1_best_min, build_ctx,
+                        deps_lo, deps_hi,
                     )
 
                 if w > 0.0:
@@ -1506,12 +1558,13 @@ def _search_meta_batch_k2(
                         v_min = base_min_matrix[m, s] + db_stat_min[i0, s] + db_stat_min[i1, s]
                         v_max = base_max_matrix[m, s] + db_stat_max[i0, s] + db_stat_max[i1, s]
                     else:
+                        ro = round_offset[s]
                         v_min = (base_min_matrix[m, s]
-                                 + (db_stat_min[i0, s] * eff0) // 100
-                                 + (db_stat_min[i1, s] * eff1) // 100)
+                                 + (db_stat_min[i0, s] * eff0 + ro) // 100
+                                 + (db_stat_min[i1, s] * eff1 + ro) // 100)
                         v_max = (base_max_matrix[m, s]
-                                 + (db_stat_max[i0, s] * eff0) // 100
-                                 + (db_stat_max[i1, s] * eff1) // 100)
+                                 + (db_stat_max[i0, s] * eff0 + ro) // 100
+                                 + (db_stat_max[i1, s] * eff1 + ro) // 100)
 
                     final_min_arr[s] = v_min
                     final_max_arr[s] = v_max
@@ -1567,6 +1620,7 @@ def _search_meta_batch_k2(
                         cmin, cmax = _spell_leaf(
                             spell_id, off, comp_dep_indices,
                             final_min_arr, final_max_arr, build_ctx,
+                            deps_lo, deps_hi,
                         )
                     if comp_has_min[c] and cmax < comp_min[c]:
                         feasible = False
@@ -1585,8 +1639,10 @@ def _search_meta_batch_k2(
                     local_best_i0 = i0
                     local_best_i1 = i1
 
-        best_scores[m] = local_best
         if local_best_i0 >= 0:
+            if local_best > shared_best[0]:
+                shared_best[0] = local_best
+            best_scores[m] = local_best
             best_solutions[m, 0] = local_best_i0
             best_solutions[m, 1] = local_best_i1
         per_m_searched[m] = local_searched
@@ -1646,6 +1702,7 @@ def search_meta_batch(
     comp_has_max,
     comp_weight,
     build_ctx,
+    round_offset,
 ):
     M = ings_matrix.shape[0]
     k = void_count
@@ -1655,19 +1712,47 @@ def search_meta_batch(
     best_solutions = np.zeros((M, k), dtype=np.int32)
     per_m_searched = np.zeros(M, dtype=np.int64)
 
+    # Shared best score for cross-m BB pruning. Read/write is racy under
+    # prange (no atomic CAS in CPU numba), but benign: each m's local DFS
+    # uses its own best_score_ref so correctness is preserved. Worst case
+    # is that shared_best gets clobbered to a lower value, costing some
+    # pruning on subsequent m's but never losing a real solution.
+    shared_best = np.array([init_best_score], dtype=np.float64)
+
+    S = base_min_matrix.shape[1]
+
+    # Pre-allocate the bounds tensor (single big alloc instead of M×4 small
+    # ones per batch). Stride per m = 4·(k+1)·S int32 ≈ 432 bytes for k=3,S=9
+    # — well above 64-byte cache lines, so adjacent m's land on distinct lines
+    # and false-sharing is not a concern.
+    bounds_buf = np.zeros((M, 4, k + 1, S), dtype=np.int32)
+
     for m in prange(M):
         ingredients = np.zeros(k, dtype=np.int32)
         current_min = base_min_matrix[m].copy()
         current_max = base_max_matrix[m].copy()
-        best_score_ref = np.array([init_best_score], dtype=np.float64)
+        # Seed local best from the shared (cross-m) best so far.
+        local_init = shared_best[0]
+        if init_best_score > local_init:
+            local_init = init_best_score
+        best_score_ref = np.array([local_init], dtype=np.float64)
         best_solution_local = np.zeros(k, dtype=np.int32)
         local_searched = np.zeros(1, dtype=np.int64)
+        seed_score = local_init
 
-        # Precompute UB/LB suffix sums for this meta set.
-        future_max_ub, future_min_ub, future_max_lb, future_min_lb = \
-            _precompute_bounds(
-                db_stat_min, db_stat_max, void_eff_matrix[m], k, dura_idx,
-            )
+        future_max_ub = bounds_buf[m, 0]
+        future_min_ub = bounds_buf[m, 1]
+        future_max_lb = bounds_buf[m, 2]
+        future_min_lb = bounds_buf[m, 3]
+        _precompute_bounds(
+            db_stat_min, db_stat_max, void_eff_matrix[m], k, dura_idx, round_offset,
+            future_max_ub, future_min_ub, future_max_lb, future_min_lb,
+        )
+
+        # Spell-eval scratch reused across every spell helper call inside
+        # this m's DFS (replaces ~thousands of np.empty(31) per m).
+        deps_lo = np.empty(31, dtype=np.float64)
+        deps_hi = np.empty(31, dtype=np.float64)
 
         dfs(
             0,
@@ -1708,11 +1793,17 @@ def search_meta_batch(
             comp_has_max,
             comp_weight,
             build_ctx,
+            round_offset,
+            deps_lo,
+            deps_hi,
         )
 
-        best_scores[m] = best_score_ref[0]
-        for i in range(k):
-            best_solutions[m, i] = best_solution_local[i]
+        if best_score_ref[0] > seed_score:
+            if best_score_ref[0] > shared_best[0]:
+                shared_best[0] = best_score_ref[0]
+            best_scores[m] = best_score_ref[0]
+            for i in range(k):
+                best_solutions[m, i] = best_solution_local[i]
         per_m_searched[m] = local_searched[0]
 
     # Serial reduction — picks the earliest m with the max score (matches
@@ -1767,6 +1858,7 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             query.comp_has_max,
             query.comp_weight,
             query.build_ctx,
+            query.round_offset_proj,
         )
         total_searched[0] += added
         return score, meta_index, sol
@@ -1797,6 +1889,7 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             query.comp_has_max,
             query.comp_weight,
             query.build_ctx,
+            query.round_offset_proj,
         )
         total_searched[0] += added
         return score, meta_index, sol
@@ -1833,6 +1926,7 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
         query.comp_has_max,
         query.comp_weight,
         query.build_ctx,
+        query.round_offset_proj,
     )
 
 
@@ -1957,8 +2051,6 @@ def search_pipelined(
         print("Min dura should be strictly positive. Aborting.")
         return None
 
-    # Priority: META_5 first (cheap search, sets best_score quickly), then
-    # descending k for the rest. META_0 is synthetic and trivial.
     priorities = [5, 4, 3, 2, 1, 0]
 
     q = Queue(maxsize=2)
