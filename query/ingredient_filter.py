@@ -132,7 +132,8 @@ def filter_raw_ingredients(
     filtered = pareto_cull_ingredients(filtered, query, recipe)
     n_culled = len(filtered)
     
-    print(f"Ingredient culling: {n_filtered} => {n_culled}, {n_culled/n_filtered*100:.2f}% left")
+    pct = (n_culled / n_filtered * 100) if n_filtered else 0.0
+    print(f"Ingredient culling: {n_filtered} => {n_culled}, {pct:.2f}% left")
     return filtered
 
 
