@@ -103,11 +103,14 @@ def _warm_search_engine():
     # compile, not to compute meaningful values.
     round_offset = np.zeros(S, dtype=np.int32)
 
-    # SP-cap clamp arrays (real Query passes ±ctx_base / SKP_MAX-ctx_base for
-    # SP stats, sentinel ±1e9 elsewhere). Sentinel-only here is enough to
-    # exercise both branches of the per-stat clamp.
-    skp_score_lo = np.full(S, -1_000_000_000, dtype=np.int32)
-    skp_score_hi = np.full(S,  1_000_000_000, dtype=np.int32)
+    # SP-cap-aware scoring metadata. Real Query marks SP stats active and
+    # passes their ctx + corresponding xReq idx; warm-up uses all-inactive
+    # to exercise the non-SP fast path. The req-idx array still needs to
+    # type as int32, hence the explicit dtype.
+    sp_score_active = np.zeros(S, dtype=np.bool_)
+    sp_score_ctx = np.zeros(S, dtype=np.int32)
+    sp_score_req_idx = np.full(S, -1, dtype=np.int32)
+    sp_score_req_base = np.zeros(S, dtype=np.int32)
 
     void_eff_k2 = np.full((M, 2), 100, dtype=np.int32)
 
@@ -132,7 +135,7 @@ def _warm_search_engine():
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
             round_offset,
-            skp_score_lo, skp_score_hi,
+            sp_score_active, sp_score_ctx, sp_score_req_idx, sp_score_req_base,
         )
 
         # v2 ((m, i_0)-parallel) is the production path for k=3. Compile it
@@ -149,7 +152,7 @@ def _warm_search_engine():
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
             round_offset,
-            skp_score_lo, skp_score_hi,
+            sp_score_active, sp_score_ctx, sp_score_req_idx, sp_score_req_base,
         )
 
 
@@ -163,7 +166,7 @@ def _warm_search_engine():
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
             round_offset,
-            skp_score_lo, skp_score_hi,
+            sp_score_active, sp_score_ctx, sp_score_req_idx, sp_score_req_base,
         )
 
         se._search_meta_batch_k2(
@@ -176,5 +179,5 @@ def _warm_search_engine():
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
             round_offset,
-            skp_score_lo, skp_score_hi,
+            sp_score_active, sp_score_ctx, sp_score_req_idx, sp_score_req_base,
         )
