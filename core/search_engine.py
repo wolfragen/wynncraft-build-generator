@@ -59,6 +59,15 @@ _BCTX_WD_T = 9
 _BCTX_WD_W = 10
 _BCTX_WD_F = 11
 _BCTX_WD_A = 12
+# Existing player allocation per attribute (= max equipped xReq). The spell
+# formula folds it into the player's total SP via
+# `s_str = ctx[BASE_STR] + deps[strBonus] + max(deps[strReq], ctx[BASE_REQ_STR])`.
+# Mirrors BUILD_CTX_BASE_REQ_* in query.py.
+_BCTX_BASE_REQ_STR = 13
+_BCTX_BASE_REQ_DEX = 14
+_BCTX_BASE_REQ_INT = 15
+_BCTX_BASE_REQ_DEF = 16
+_BCTX_BASE_REQ_AGI = 17
 
 
 # Explicit signature so the recursive dfs can be persisted to disk with
@@ -107,7 +116,7 @@ _DFS_SIG = types.void(
     types.int32[::1],         # sp_score_ctx (ctx_base per stat)
     types.int32[::1],         # sp_score_req_idx (req's proj idx, -1 else)
     types.int32[::1],         # sp_score_req_base (user's req base, 0 else)
-    types.float64[::1],       # deps_lo scratch (size ≥31, reused per spell call)
+    types.float64[::1],       # deps_lo scratch (size ≥36, reused per spell call)
     types.float64[::1],       # deps_hi scratch
     types.Array(types.bool_, 1, "C"),  # useful_pos_eff (per ingredient, eff>0)
     types.Array(types.bool_, 1, "C"),  # useful_neg_eff (per ingredient, eff<=0)
@@ -436,12 +445,32 @@ def _eval_spell_corner_spell(deps, spell_id, ctx):
     # Globals + rainbow
     g_sd_pct = deps[21]; g_dam_pct = deps[22]; g_sd_raw = deps[23]
     r_dam_pct = deps[24]; r_sd_pct = deps[25]
-    # Skill points (additive over user's base in ctx; clamped 0..150)
-    s_str = int(deps[26] + ctx[_BCTX_BASE_STR])
-    s_dex = int(deps[27] + ctx[_BCTX_BASE_DEX])
-    s_int = int(deps[28] + ctx[_BCTX_BASE_INT])
-    s_def = int(deps[29] + ctx[_BCTX_BASE_DEF])
-    s_agi = int(deps[30] + ctx[_BCTX_BASE_AGI])
+    # Skill points: total = ctx_base (existing bonus) + craft bonus +
+    #   max(craft_req, ctx_base_req). The max() captures that the player
+    #   allocates max(reqs across items), which counts toward total SP
+    #   (skillpoints.js apply_to_fit). With the build's own req as deps[31..35]
+    #   (zeroed out from the additive base by query.py — see MAX semantic) and
+    #   the existing-build allocation in ctx[BASE_REQ_*], the formula is:
+    #     s_str = ctx[BASE_STR] + deps[26] + max(deps[31], ctx[BASE_REQ_STR])
+    #   Clamped to [0, SKP_MAX]. Without this, the search saw only bonus and
+    #   would chase wasted bonus past 150 — total = bonus + allocation could
+    #   reach 191 with all the useful headroom already spent on allocation.
+    a_str = int(deps[31])
+    if a_str < ctx[_BCTX_BASE_REQ_STR]: a_str = int(ctx[_BCTX_BASE_REQ_STR])
+    a_dex = int(deps[32])
+    if a_dex < ctx[_BCTX_BASE_REQ_DEX]: a_dex = int(ctx[_BCTX_BASE_REQ_DEX])
+    a_int = int(deps[33])
+    if a_int < ctx[_BCTX_BASE_REQ_INT]: a_int = int(ctx[_BCTX_BASE_REQ_INT])
+    a_def = int(deps[34])
+    if a_def < ctx[_BCTX_BASE_REQ_DEF]: a_def = int(ctx[_BCTX_BASE_REQ_DEF])
+    a_agi = int(deps[35])
+    if a_agi < ctx[_BCTX_BASE_REQ_AGI]: a_agi = int(ctx[_BCTX_BASE_REQ_AGI])
+
+    s_str = int(deps[26] + ctx[_BCTX_BASE_STR]) + a_str
+    s_dex = int(deps[27] + ctx[_BCTX_BASE_DEX]) + a_dex
+    s_int = int(deps[28] + ctx[_BCTX_BASE_INT]) + a_int
+    s_def = int(deps[29] + ctx[_BCTX_BASE_DEF]) + a_def
+    s_agi = int(deps[30] + ctx[_BCTX_BASE_AGI]) + a_agi
     if s_str < 0: s_str = 0
     elif s_str > SKP_MAX: s_str = SKP_MAX
     if s_dex < 0: s_dex = 0
@@ -545,11 +574,24 @@ def _eval_spell_corner_melee(deps, spell_id, ctx):
     g_md_pct = deps[18]; g_dam_pct = deps[19]; g_md_raw = deps[20]
     r_dam_pct = deps[21]   # rMdPct absent -> no rainbow Md %
 
-    s_str = int(deps[22] + ctx[_BCTX_BASE_STR])
-    s_dex = int(deps[23] + ctx[_BCTX_BASE_DEX])
-    s_int = int(deps[24] + ctx[_BCTX_BASE_INT])
-    s_def = int(deps[25] + ctx[_BCTX_BASE_DEF])
-    s_agi = int(deps[26] + ctx[_BCTX_BASE_AGI])
+    # Skill point allocation: see _eval_spell_corner_spell for semantics.
+    # Melee deps layout has reqs at indices 27..31 (after SP at 22..26).
+    a_str = int(deps[27])
+    if a_str < ctx[_BCTX_BASE_REQ_STR]: a_str = int(ctx[_BCTX_BASE_REQ_STR])
+    a_dex = int(deps[28])
+    if a_dex < ctx[_BCTX_BASE_REQ_DEX]: a_dex = int(ctx[_BCTX_BASE_REQ_DEX])
+    a_int = int(deps[29])
+    if a_int < ctx[_BCTX_BASE_REQ_INT]: a_int = int(ctx[_BCTX_BASE_REQ_INT])
+    a_def = int(deps[30])
+    if a_def < ctx[_BCTX_BASE_REQ_DEF]: a_def = int(ctx[_BCTX_BASE_REQ_DEF])
+    a_agi = int(deps[31])
+    if a_agi < ctx[_BCTX_BASE_REQ_AGI]: a_agi = int(ctx[_BCTX_BASE_REQ_AGI])
+
+    s_str = int(deps[22] + ctx[_BCTX_BASE_STR]) + a_str
+    s_dex = int(deps[23] + ctx[_BCTX_BASE_DEX]) + a_dex
+    s_int = int(deps[24] + ctx[_BCTX_BASE_INT]) + a_int
+    s_def = int(deps[25] + ctx[_BCTX_BASE_DEF]) + a_def
+    s_agi = int(deps[26] + ctx[_BCTX_BASE_AGI]) + a_agi
     if s_str < 0: s_str = 0
     elif s_str > SKP_MAX: s_str = SKP_MAX
     if s_dex < 0: s_dex = 0
@@ -630,20 +672,20 @@ def _eval_spell_corner_melee(deps, spell_id, ctx):
 def _spell_leaf(spell_id, off, di, mins, maxs, ctx, deps_lo, deps_hi):
     """Bounds at the leaf — read deps from the build's roll min/max arrays.
 
-    `deps_lo` and `deps_hi` are caller-provided scratch buffers of length ≥31
+    `deps_lo` and `deps_hi` are caller-provided scratch buffers of length ≥36
     (the largest spell-formula dep count). Pre-allocating once per m's DFS and
     reusing across all spell calls avoids ~2M np.empty() per batch on
     composite-heavy queries (mage_meteor: 31 deps × 2 arrays per UB/leaf call).
     """
     if _SPELL_USE_SPELL[spell_id]:
-        for i in range(31):
+        for i in range(36):
             idx = di[off + i]
             deps_lo[i] = mins[idx]
             deps_hi[i] = maxs[idx]
         lb = _eval_spell_corner_spell(deps_lo, spell_id, ctx)
         ub = _eval_spell_corner_spell(deps_hi, spell_id, ctx)
     else:
-        for i in range(27):
+        for i in range(32):
             idx = di[off + i]
             deps_lo[i] = mins[idx]
             deps_hi[i] = maxs[idx]
@@ -660,7 +702,7 @@ def _spell_dfs_ub(spell_id, off, di, cur, flb, fub, nd, ctx, deps_lo, deps_hi):
     the future arrays. Buffers reused per caller's m loop (see _spell_leaf).
     """
     if _SPELL_USE_SPELL[spell_id]:
-        for i in range(31):
+        for i in range(36):
             idx = di[off + i]
             base = cur[idx]
             deps_lo[i] = base + flb[nd, idx]
@@ -668,7 +710,7 @@ def _spell_dfs_ub(spell_id, off, di, cur, flb, fub, nd, ctx, deps_lo, deps_hi):
         lb = _eval_spell_corner_spell(deps_lo, spell_id, ctx)
         ub = _eval_spell_corner_spell(deps_hi, spell_id, ctx)
     else:
-        for i in range(27):
+        for i in range(32):
             idx = di[off + i]
             base = cur[idx]
             deps_lo[i] = base + flb[nd, idx]
@@ -685,7 +727,7 @@ def _spell_k2_ub(spell_id, off, di, after, sw, sb, ctx, deps_lo, deps_hi):
     (LB) or `after[idx] + slot1_best` (UB). Buffers reused per m's loop.
     """
     if _SPELL_USE_SPELL[spell_id]:
-        for i in range(31):
+        for i in range(36):
             idx = di[off + i]
             base = after[idx]
             deps_lo[i] = base + sw[idx]
@@ -693,7 +735,7 @@ def _spell_k2_ub(spell_id, off, di, after, sw, sb, ctx, deps_lo, deps_hi):
         lb = _eval_spell_corner_spell(deps_lo, spell_id, ctx)
         ub = _eval_spell_corner_spell(deps_hi, spell_id, ctx)
     else:
-        for i in range(27):
+        for i in range(32):
             idx = di[off + i]
             base = after[idx]
             deps_lo[i] = base + sw[idx]
@@ -1342,7 +1384,7 @@ def _search_meta_batch_k1(
     # Pre-allocate per-m scratch (final_min/max, deps_lo/hi). Each row is at
     # least 64 bytes so adjacent m's don't false-share.
     final_buf = np.empty((M, 2, S), dtype=np.int32)
-    deps_buf = np.empty((M, 2, 31), dtype=np.float64)
+    deps_buf = np.empty((M, 2, 36), dtype=np.float64)
 
     for m in prange(M):
         eff = void_eff_matrix[m, 0]
@@ -1567,7 +1609,7 @@ def _search_meta_batch_k2(
     # Per-m after-state + final-state for composite UB / leaf rereads.
     state_buf = np.empty((M, 4, S), dtype=np.int32)
     # Spell-eval scratch (max 31 deps).
-    deps_buf = np.empty((M, 2, 31), dtype=np.float64)
+    deps_buf = np.empty((M, 2, 36), dtype=np.float64)
 
     for m in prange(M):
         eff0 = void_eff_matrix[m, 0]
@@ -2087,8 +2129,8 @@ def search_meta_batch(
 
         # Spell-eval scratch reused across every spell helper call inside
         # this m's DFS (replaces ~thousands of np.empty(31) per m).
-        deps_lo = np.empty(31, dtype=np.float64)
-        deps_hi = np.empty(31, dtype=np.float64)
+        deps_lo = np.empty(36, dtype=np.float64)
+        deps_hi = np.empty(36, dtype=np.float64)
 
         dfs(
             0,
@@ -2281,8 +2323,8 @@ def search_meta_batch_v2(
         future_max_lb = bounds_buf[m, 2]
         future_min_lb = bounds_buf[m, 3]
 
-        deps_lo = np.empty(31, dtype=np.float64)
-        deps_hi = np.empty(31, dtype=np.float64)
+        deps_lo = np.empty(36, dtype=np.float64)
+        deps_hi = np.empty(36, dtype=np.float64)
 
         eff_0 = void_eff_matrix[m, 0]
         eff_0_is_positive = eff_0 > 0

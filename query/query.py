@@ -82,7 +82,20 @@ BUILD_CTX_WD_T = 9
 BUILD_CTX_WD_W = 10
 BUILD_CTX_WD_F = 11
 BUILD_CTX_WD_A = 12
-BUILD_CTX_SIZE = 13
+# Existing player skill-point ALLOCATION per attribute (= max equipped xReq).
+# The player must allocate max(reqs) to satisfy items (skillpoints.js
+# can_equip), and that allocation contributes to total str/dex/int/def/agi
+# (which feeds into the SP cap and the spell formula's skp_e/_t/etc.). Set
+# from `_context["strReq"]` etc., or by main_build_temp.py from the
+# aggregated max equipped req; default 0. The spell kernel uses
+# `s_str = ctx[BASE_STR] + deps[strBonus] + max(deps[strReq], ctx[BASE_REQ_STR])`
+# before clamping to [0, SKP_MAX].
+BUILD_CTX_BASE_REQ_STR = 13
+BUILD_CTX_BASE_REQ_DEX = 14
+BUILD_CTX_BASE_REQ_INT = 15
+BUILD_CTX_BASE_REQ_DEF = 16
+BUILD_CTX_BASE_REQ_AGI = 17
+BUILD_CTX_SIZE = 18
 
 
 def _build_ctx_array(ctx_dict):
@@ -111,6 +124,18 @@ def _build_ctx_array(ctx_dict):
         atk_speed = ctx_dict.get("atk_speed", "NORMAL")
         arr[BUILD_CTX_ATK_SPD] = float(ATK_SPEED_MULT.get(atk_speed, ATK_SPEED_MULT["NORMAL"]))
         arr[BUILD_CTX_CRIT_PCT] = float(ctx_dict.get("crit_dam_pct", 0))
+        # Existing player skill-point allocation per attribute (max equipped xReq).
+        for req_name, slot in (("strReq", BUILD_CTX_BASE_REQ_STR),
+                               ("dexReq", BUILD_CTX_BASE_REQ_DEX),
+                               ("intReq", BUILD_CTX_BASE_REQ_INT),
+                               ("defReq", BUILD_CTX_BASE_REQ_DEF),
+                               ("agiReq", BUILD_CTX_BASE_REQ_AGI)):
+            v = int(ctx_dict.get(req_name, 0))
+            if v < 0:
+                v = 0
+            elif v > SKP_MAX:
+                v = SKP_MAX
+            arr[slot] = float(v)
         # weapon_dam: optional 6-tuple (n, e, t, w, f, a) for builds with a
         # fixed already-equipped weapon. Default 0 — search_pipelined will
         # overlay recipe.weapon_dam_neutral when crafting a weapon directly.

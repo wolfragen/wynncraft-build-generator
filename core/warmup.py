@@ -58,12 +58,12 @@ def _warm_ingredient_filter():
 def _warm_search_engine():
     """
     Force the JIT compile of `dfs` and `search_meta_batch` (parallel=True is
-    expensive to compile, 1-2s per process). M=1, k=1, S=31, N=1 — S=31 so the
-    largest spell formula (any spell-mode spell, 31 deps in canonical layout)
-    can read its slots. We invoke each kernel once per formula tag (fixed +
-    every spell) so all branches compile eagerly.
+    expensive to compile, 1-2s per process). M=1, k=1, S=36, N=1 — S=36 so the
+    largest spell formula (any spell-mode spell, 36 deps in canonical layout
+    after adding the SP-req slots) can read its slots. We invoke each kernel
+    once per formula tag (fixed + every spell) so all branches compile eagerly.
     """
-    M, k, S, N = 1, 1, 31, 1
+    M, k, S, N = 1, 1, 36, 1
     ings = np.zeros((M, 6), dtype=np.int32)
     void_eff = np.full((M, k), 100, dtype=np.int32)
     base_min = np.zeros((M, S), dtype=np.int32)

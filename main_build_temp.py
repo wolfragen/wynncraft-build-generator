@@ -933,6 +933,106 @@ SEARCH_PRIORITY = ["weapon", "helmet", "chestplate", "leggings", "boots",
 # Query augmentation
 # ============================================================
 
+def _piece_req_value(slot, items_by_id, ings_by_id):
+    """
+    Return {req_name: int} for one slot's per-stat skill requirement. For
+    crafted pieces this sums per-ingredient itemIDs reqs with effectiveness
+    (mirroring `_accumulate_crafted_item`'s inner loop). Consumables and
+    empty slots return all zeros — they don't consume player skillpoints.
+    """
+    out = {r: 0 for r in REQ_STATS}
+    if slot is None:
+        return out
+    kind = slot.get("kind")
+    if kind == "normal":
+        item = items_by_id.get(slot["id"])
+        if item is None:
+            return out
+        for r in REQ_STATS:
+            out[r] = int(item.get(r, 0) or 0)
+        return out
+    if kind != "crafted":
+        return out
+    recipe = slot.get("recipe")
+    if recipe is None:
+        return out
+    rtype = recipe["type"].lower()
+    if rtype in ("potion", "scroll", "food"):
+        return out  # consumables don't have skill reqs
+    ing_objs = [ings_by_id.get(iid) for iid in slot["ing_ids"]]
+    pos_mods = []
+    for ing in ing_objs:
+        if ing is None:
+            pos_mods.append([0] * 6)
+        else:
+            raw_pm = ing.get("posMods", {})
+            pos_mods.append([raw_pm.get(k, 0) for k in POSMOD_ORDER])
+    eff_flat = _compute_effectiveness(pos_mods)
+    for n, ing in enumerate(ing_objs):
+        if ing is None:
+            continue
+        eff_mult = eff_flat[n] / 100.0
+        is_powder = ing.get("isPowder", False)
+        for key, value in ing.get("itemIDs", {}).items():
+            if key not in REQ_STATS:
+                continue
+            v = value if is_powder else round(value * eff_mult)
+            out[key] += int(v)
+    return out
+
+
+def _max_equipped_reqs(slots, items_by_id, ings_by_id):
+    """
+    MAX of each skill req across all non-empty slots. The player allocates
+    max(reqs) of skillpoints to satisfy the build (skillpoints.js apply_to_fit
+    + can_equip), and that allocation contributes to total str/dex/int/def/agi
+    — so it has to be folded into the SP cap calc (see Query.sp_score_*).
+    """
+    out = {r: 0 for r in REQ_STATS}
+    for slot in slots:
+        piece = _piece_req_value(slot, items_by_id, ings_by_id)
+        for r in REQ_STATS:
+            v = piece[r]
+            if v > out[r]:
+                out[r] = v
+    return out
+
+
+def _augment_query_with_equipped_reqs(user_query, equipped_max_reqs):
+    """
+    Return a shallow copy of `user_query` with two augmentations driven by
+    the per-attribute MAX of equipped pieces' skill reqs:
+
+      1. Each xReq stat's `base` is raised to the max-equipped value (kept
+         if higher). Feeds `Query.sp_score_req_base_proj` so the SP cap
+         clamp on direct-weight scoring accounts for the player's existing
+         allocation.
+
+      2. `_context["xReq"]` is set to the same value. Feeds
+         `BUILD_CTX_BASE_REQ_*` so the spell-composite formula folds the
+         existing allocation into the player's total SP via
+         `s_str = ctx[BASE_STR] + deps[strBonus] + max(deps[strReq], ctx[BASE_REQ_STR])`,
+         which matches `skillpoints.js apply_to_fit` semantics — the
+         player allocates max(reqs across items) and that allocation
+         contributes to total SP (and the 150 cap).
+    """
+    augmented = dict(user_query)
+    ctx_existing = augmented.get("_context") or {}
+    ctx_new = dict(ctx_existing)
+    for req_name, max_req in equipped_max_reqs.items():
+        if max_req <= 0:
+            continue
+        cfg = dict(augmented.get(req_name, {}))
+        existing_base = int(cfg.get("base", 0) or 0)
+        cfg["base"] = max(existing_base, int(max_req))
+        augmented[req_name] = cfg
+        existing_ctx_req = int(ctx_new.get(req_name, 0) or 0)
+        ctx_new[req_name] = max(existing_ctx_req, int(max_req))
+    if ctx_new != ctx_existing:
+        augmented["_context"] = ctx_new
+    return augmented
+
+
 def _find_recipe(recipes_raw, item_type, skill, lvl_min, lvl_max):
     """Same as data.recipe_loader.find_recipe but reusable here."""
     from data.ingredient_loader import SKILL_INDEX
@@ -1270,12 +1370,17 @@ def eval_meteor_wb(slots, items_by_id, ings_by_id, build_ctx, spell_name="mage_m
         return float(g_mid[idx]) if idx is not None else 0.0
 
     # 5.1 % boost — per element (1 + skp_dam_mult * skpPct + static + (specPct + DamPct)/100)
-    # Skill points: gear str/dex/etc. + user-assigned (here from build_ctx).
-    skp_str = int(g_mid[STAT_INDEX["str"]] + build_ctx[0])
-    skp_dex = int(g_mid[STAT_INDEX["dex"]] + build_ctx[1])
-    skp_int = int(g_mid[STAT_INDEX["int"]] + build_ctx[2])
-    skp_def = int(g_mid[STAT_INDEX["def"]] + build_ctx[3])
-    skp_agi = int(g_mid[STAT_INDEX["agi"]] + build_ctx[4])
+    # Skill points: gear str/dex/etc. (bonus) + user-assigned (build_ctx[0..4])
+    # + max(equipped req per attribute) for the player's allocated SP. The
+    # allocation is the player's max-req allocation that satisfies all items'
+    # xReq (skillpoints.js can_equip), and it counts toward the total SP that
+    # feeds skillPointsToPercentage. Pulled from build_ctx[BASE_REQ_*]
+    # (BUILD_CTX_BASE_REQ_STR..AGI = indices 13..17).
+    skp_str = int(g_mid[STAT_INDEX["str"]] + build_ctx[0]) + int(build_ctx[13])
+    skp_dex = int(g_mid[STAT_INDEX["dex"]] + build_ctx[1]) + int(build_ctx[14])
+    skp_int = int(g_mid[STAT_INDEX["int"]] + build_ctx[2]) + int(build_ctx[15])
+    skp_def = int(g_mid[STAT_INDEX["def"]] + build_ctx[3]) + int(build_ctx[16])
+    skp_agi = int(g_mid[STAT_INDEX["agi"]] + build_ctx[4]) + int(build_ctx[17])
     skps = [skp_str, skp_dex, skp_int, skp_def, skp_agi]
     skps = [max(0, min(SKP_MAX, s)) for s in skps]
     # skill_boost[0] = 0 (neutral), [1..5] = element bonus from skp[i]
@@ -1536,8 +1641,17 @@ def main():
 
         print(f"\n{'='*60}\nGenerating {slot_name} ({skill} {item_type} lvl {lvl_min}-{lvl_max} t{tier})\n{'='*60}")
 
+        # Fold the build's current max(req) per attribute into the query as
+        # `base` for each xReq stat. Reqs aggregate via MAX (one allocation
+        # satisfies all items at that attribute), and that allocation is
+        # added to the player's total SP — query.py captures the base into
+        # sp_score_req_base_proj so the SP cap clamp at scoring time sees
+        # the right headroom (SKP_MAX - ctx - max(equipped_req, craft_req)).
+        equipped_max_reqs = _max_equipped_reqs(slots, items_by_id, ings_by_id)
+        per_slot_query = _augment_query_with_equipped_reqs(USER_QUERY, equipped_max_reqs)
+
         query = build_query(
-            user_json=USER_QUERY,
+            user_json=per_slot_query,
             search_for_inversion=True,
             item_type=item_type,
             skill=skill,
@@ -1646,7 +1760,13 @@ def main():
                    and n.startswith(("mage_", "warrior_", "archer_",
                                      "assassin_", "shaman_"))]
     if spell_names:
-        build_ctx = _build_ctx_array_from_query(USER_QUERY)
+        # Inject the assembled build's max-equipped req into _context so the
+        # WB-faithful eval sees the player's allocated SP (the player must
+        # allocate max(reqs) and that allocation contributes to total str/dex/
+        # /etc., which the spell formula folds in via ctx[BASE_REQ_*]).
+        final_max_reqs = _max_equipped_reqs(slots, items_by_id, ings_by_id)
+        eval_query = _augment_query_with_equipped_reqs(USER_QUERY, final_max_reqs)
+        build_ctx = _build_ctx_array_from_query(eval_query)
         ctx = USER_QUERY.get("_context")
         skp_note = ""
         if not ctx or not any(k in (ctx or {}) for k in ("str","dex","int","def","agi")):

@@ -51,8 +51,12 @@ SPELL_SPELL_DEPS = (
     "sdPct", "damPct", "sdRaw",
     # [24..25] Rainbow (applied to non-neutral elements only)
     "rDamPct", "rSdPct",
-    # [26..30] Skill points (added to user's base from _context, capped 0..150)
+    # [26..30] Skill point bonuses (added to user's base from _context, capped 0..150)
     "str", "dex", "int", "def", "agi",
+    # [31..35] Skill point requirements — folded into total SP via
+    # `s_str = ctx[BASE_STR] + deps[strBonus] + max(deps[strReq], ctx[BASE_REQ_STR])`
+    # so the player's allocation (= max req across items) counts toward the cap.
+    "strReq", "dexReq", "intReq", "defReq", "agiReq",
 )
 
 SPELL_MELEE_DEPS = (
@@ -66,12 +70,14 @@ SPELL_MELEE_DEPS = (
     "mdPct", "damPct", "mdRaw",
     # [21]     Rainbow (no rMdPct in registry)
     "rDamPct",
-    # [22..26] Skill points
+    # [22..26] Skill point bonuses
     "str", "dex", "int", "def", "agi",
+    # [27..31] Skill point requirements — see SPELL_SPELL_DEPS comment.
+    "strReq", "dexReq", "intReq", "defReq", "agiReq",
 )
 
 # Slot constants — indexed into the per-spell dep array inside the kernel.
-# Spell layout: 31 deps. Melee layout: 27 deps. Element-indexed slots use
+# Spell layout: 36 deps. Melee layout: 32 deps. Element-indexed slots use
 # i ∈ 0..5 with 0=neutral, 1=earth, 2=thunder, 3=water, 4=fire, 5=air.
 
 # Common (same offsets in both layouts)
