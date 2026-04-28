@@ -32,6 +32,7 @@ from utils.hash_generator import generate_crafter_url
 from data.stats import (
     STAT_INDEX, STAT_COUNT, CONSU_SKILLS,
     IDX_DURABILITY, IDX_DURATION,
+    REQ_STATS, REQ_STATS_IDX,
 )
 from core.search_engine import search_pipelined
 from core.warmup import warm_numba
@@ -531,6 +532,14 @@ def _accumulate_normal_item(item, base_min, base_max, powders=None,
     for stat_name, idx in STAT_INDEX.items():
         if stat_name in ("durability", "duration", "charges"):
             continue  # not contributed by equipped items
+        # Skill-point requirements aggregate as MAX across pieces, not SUM
+        # (skillpoints.js:can_equip checks each item's req individually). The
+        # search engine adds candidate stats to base, so summing equipped reqs
+        # here would inflate the build's effective req. Drop them entirely:
+        # the user's req max constraint then applies to the new craft alone,
+        # which is the right semantic when all equipped pieces also satisfy it.
+        if idx in REQ_STATS_IDX:
+            continue
         lo, hi = _normal_item_stat_range(item, stat_name)
         base_min[idx] += lo
         base_max[idx] += hi
@@ -814,8 +823,14 @@ def _accumulate_crafted_item(crafted, ings_by_id, base_min, base_max):
 
         # consumableIDs: skip — they affect duration/charges, not equipment stats.
 
-    # Add the rolled-id and itemIDs sums (already aggregated)
+    # Add the rolled-id and itemIDs sums (already aggregated). Skip req
+    # stats: they aggregate as MAX across pieces, not SUM. Inside a single
+    # craft the per-ingredient sum above gives the piece's strReq/dexReq/
+    # etc., but folding that into a multi-piece base_min/max would inflate
+    # the build's effective req (see _accumulate_normal_item for details).
     for idx in range(STAT_COUNT):
+        if idx in REQ_STATS_IDX:
+            continue
         if add_min[idx] or add_max[idx]:
             base_min[idx] += int(add_min[idx])
             base_max[idx] += int(add_max[idx])
@@ -1104,6 +1119,10 @@ def _aggregate_gear_ids_only(slots, items_by_id, ings_by_id):
             for stat_name, idx in STAT_INDEX.items():
                 if stat_name in ("durability", "duration", "charges"):
                     continue
+                # Reqs aggregate MAX across pieces, not SUM — see
+                # _accumulate_normal_item.
+                if idx in REQ_STATS_IDX:
+                    continue
                 lo, hi = _normal_item_stat_range(item, stat_name)
                 base_min[idx] += lo
                 base_max[idx] += hi
@@ -1146,6 +1165,12 @@ def _accumulate_crafted_id_rolls_only(crafted, ings_by_id, base_min, base_max):
                 continue
             idx = STAT_INDEX.get(key)
             if idx is None:
+                continue
+            # Reqs aggregate MAX across pieces, not SUM — see
+            # _accumulate_normal_item. This path is called once per equipped
+            # crafted piece, so skipping here keeps gear_min/max free of
+            # cross-piece req inflation.
+            if idx in REQ_STATS_IDX:
                 continue
             v = value if is_powder else round(value * eff_mult)
             base_min[idx] += v
