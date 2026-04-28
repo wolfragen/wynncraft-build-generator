@@ -103,6 +103,12 @@ def _warm_search_engine():
     # compile, not to compute meaningful values.
     round_offset = np.zeros(S, dtype=np.int32)
 
+    # SP-cap clamp arrays (real Query passes ±ctx_base / SKP_MAX-ctx_base for
+    # SP stats, sentinel ±1e9 elsewhere). Sentinel-only here is enough to
+    # exercise both branches of the per-stat clamp.
+    skp_score_lo = np.full(S, -1_000_000_000, dtype=np.int32)
+    skp_score_hi = np.full(S,  1_000_000_000, dtype=np.int32)
+
     void_eff_k2 = np.full((M, 2), 100, dtype=np.int32)
 
     # Cover every formula tag (fixed + every spell_id). Each loop iteration
@@ -126,6 +132,7 @@ def _warm_search_engine():
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
             round_offset,
+            skp_score_lo, skp_score_hi,
         )
 
         # v2 ((m, i_0)-parallel) is the production path for k=3. Compile it
@@ -142,6 +149,7 @@ def _warm_search_engine():
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
             round_offset,
+            skp_score_lo, skp_score_hi,
         )
 
 
@@ -155,6 +163,7 @@ def _warm_search_engine():
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
             round_offset,
+            skp_score_lo, skp_score_hi,
         )
 
         se._search_meta_batch_k2(
@@ -167,4 +176,5 @@ def _warm_search_engine():
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
             round_offset,
+            skp_score_lo, skp_score_hi,
         )

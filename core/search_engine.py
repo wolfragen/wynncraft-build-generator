@@ -103,6 +103,8 @@ _DFS_SIG = types.void(
     types.float32[::1],       # comp_weight
     types.float64[::1],       # build_ctx (skp pcts, atk_spd, crit)
     types.int32[::1],         # round_offset (50 for req stats, 0 else)
+    types.int32[::1],         # skp_score_lo (per stat, lower clamp for SP scoring)
+    types.int32[::1],         # skp_score_hi (per stat, upper clamp for SP scoring)
     types.float64[::1],       # deps_lo scratch (size ≥31, reused per spell call)
     types.float64[::1],       # deps_hi scratch
     types.Array(types.bool_, 1, "C"),  # useful_pos_eff (per ingredient, eff>0)
@@ -843,6 +845,8 @@ def dfs(
     comp_weight,
     build_ctx,
     round_offset,
+    skp_score_lo,
+    skp_score_hi,
     deps_lo,
     deps_hi,
     useful_pos_eff,
@@ -866,8 +870,19 @@ def dfs(
             if has_max_mask[s] and min_v > max_vals[s]:
                 return
 
-            score += weights[s] * max_v * 0.99
-            score += weights[s] * min_v * 0.01
+            # SP-cap clamp: for str/dex/int/def/agi, cap the value to the
+            # player's useful headroom (ctx_base..SKP_MAX). For non-SP
+            # stats the bounds are ±1e9 sentinels so the clamp is a no-op.
+            sc_lo = skp_score_lo[s]
+            sc_hi = skp_score_hi[s]
+            sm = max_v
+            if sm > sc_hi: sm = sc_hi
+            if sm < sc_lo: sm = sc_lo
+            sn = min_v
+            if sn > sc_hi: sn = sc_hi
+            if sn < sc_lo: sn = sc_lo
+            score += weights[s] * sm * 0.99
+            score += weights[s] * sn * 0.01
 
         # Composite stats: compute on the finalized build, check constraints,
         # add weighted contribution.
@@ -1007,10 +1022,23 @@ def dfs(
                 break
 
             w = weights[s]
-            if w > 0.0:
-                ub_score += w * ((cmax + f_max_ub) * 0.99 + (cmin + f_min_ub) * 0.01)
-            elif w < 0.0:
-                ub_score += w * ((cmax + f_max_lb) * 0.99 + (cmin + f_min_lb) * 0.01)
+            if w != 0.0:
+                # SP-cap clamp on (current + future) extrema before weighting
+                # (sentinel ±1e9 for non-SP makes it a no-op). Must mirror the
+                # leaf clamp so UB ≥ leaf score holds.
+                sc_lo = skp_score_lo[s]
+                sc_hi = skp_score_hi[s]
+                if w > 0.0:
+                    u_max = cmax + f_max_ub
+                    u_min = cmin + f_min_ub
+                else:
+                    u_max = cmax + f_max_lb
+                    u_min = cmin + f_min_lb
+                if u_max > sc_hi: u_max = sc_hi
+                if u_max < sc_lo: u_max = sc_lo
+                if u_min > sc_hi: u_min = sc_hi
+                if u_min < sc_lo: u_min = sc_lo
+                ub_score += w * (u_max * 0.99 + u_min * 0.01)
 
         if not feasible:
             # Undo and skip — entire subtree can't satisfy hard constraints.
@@ -1197,6 +1225,8 @@ def dfs(
             comp_weight,
             build_ctx,
             round_offset,
+            skp_score_lo,
+            skp_score_hi,
             deps_lo,
             deps_hi,
             useful_pos_eff,
@@ -1253,6 +1283,8 @@ def _search_meta_batch_k1(
     comp_weight,
     build_ctx,
     round_offset,
+    skp_score_lo,
+    skp_score_hi,
 ):
     M = base_min_matrix.shape[0]
     S = base_min_matrix.shape[1]
@@ -1315,7 +1347,16 @@ def _search_meta_batch_k1(
                     feasible = False
                     break
 
-                score += weights[s] * (max_v * 0.99 + min_v * 0.01)
+                # SP-cap clamp on the value used for scoring (no-op for non-SP).
+                sc_lo = skp_score_lo[s]
+                sc_hi = skp_score_hi[s]
+                sm = max_v
+                if sm > sc_hi: sm = sc_hi
+                if sm < sc_lo: sm = sc_lo
+                sn = min_v
+                if sn > sc_hi: sn = sc_hi
+                if sn < sc_lo: sn = sc_lo
+                score += weights[s] * (sm * 0.99 + sn * 0.01)
 
             if not feasible:
                 continue
@@ -1435,6 +1476,8 @@ def _search_meta_batch_k2(
     comp_weight,
     build_ctx,
     round_offset,
+    skp_score_lo,
+    skp_score_hi,
 ):
     M = base_min_matrix.shape[0]
     S = base_min_matrix.shape[1]
@@ -1554,14 +1597,21 @@ def _search_meta_batch_k2(
                 after_max_arr[s] = after_max
 
                 w = weights[s]
-                if w > 0.0:
-                    ub_max = after_max + slot1_best_max[s]
-                    ub_min = after_min + slot1_best_min[s]
-                    ub_score += w * (ub_max * 0.99 + ub_min * 0.01)
-                elif w < 0.0:
-                    lb_max = after_max + slot1_worst_max[s]
-                    lb_min = after_min + slot1_worst_min[s]
-                    ub_score += w * (lb_max * 0.99 + lb_min * 0.01)
+                if w != 0.0:
+                    # SP-cap clamp before weighting; mirrors the leaf clamp.
+                    sc_lo = skp_score_lo[s]
+                    sc_hi = skp_score_hi[s]
+                    if w > 0.0:
+                        u_max = after_max + slot1_best_max[s]
+                        u_min = after_min + slot1_best_min[s]
+                    else:
+                        u_max = after_max + slot1_worst_max[s]
+                        u_min = after_min + slot1_worst_min[s]
+                    if u_max > sc_hi: u_max = sc_hi
+                    if u_max < sc_lo: u_max = sc_lo
+                    if u_min > sc_hi: u_min = sc_hi
+                    if u_min < sc_lo: u_min = sc_lo
+                    ub_score += w * (u_max * 0.99 + u_min * 0.01)
 
             # Composite UB: per-formula bound on [after_* + slot1_{worst,best}_*] rectangle.
             for c in range(comp_count):
@@ -1706,7 +1756,16 @@ def _search_meta_batch_k2(
                         feasible = False
                         break
 
-                    score += weights[s] * (v_max * 0.99 + v_min * 0.01)
+                    # SP-cap clamp on the value used for scoring (no-op for non-SP).
+                    sc_lo = skp_score_lo[s]
+                    sc_hi = skp_score_hi[s]
+                    sm = v_max
+                    if sm > sc_hi: sm = sc_hi
+                    if sm < sc_lo: sm = sc_lo
+                    sn = v_min
+                    if sn > sc_hi: sn = sc_hi
+                    if sn < sc_lo: sn = sc_lo
+                    score += weights[s] * (sm * 0.99 + sn * 0.01)
 
                 if not feasible:
                     continue
@@ -1833,6 +1892,8 @@ def search_meta_batch(
     comp_weight,
     build_ctx,
     round_offset,
+    skp_score_lo,
+    skp_score_hi,
 ):
     M = ings_matrix.shape[0]
     k = void_count
@@ -1931,6 +1992,8 @@ def search_meta_batch(
             comp_weight,
             build_ctx,
             round_offset,
+            skp_score_lo,
+            skp_score_hi,
             deps_lo,
             deps_hi,
             useful_pos_eff,
@@ -2012,6 +2075,8 @@ def search_meta_batch_v2(
     comp_weight,
     build_ctx,
     round_offset,
+    skp_score_lo,
+    skp_score_hi,
 ):
     M = ings_matrix.shape[0]
     k = void_count
@@ -2132,10 +2197,23 @@ def search_meta_batch_v2(
                 break
 
             w = weights[s]
-            if w > 0.0:
-                ub_score += w * ((cmax + f_max_ub) * 0.99 + (cmin + f_min_ub) * 0.01)
-            elif w < 0.0:
-                ub_score += w * ((cmax + f_max_lb) * 0.99 + (cmin + f_min_lb) * 0.01)
+            if w != 0.0:
+                # SP-cap clamp on (current + future) extrema before weighting
+                # (sentinel ±1e9 for non-SP makes it a no-op). Must mirror the
+                # leaf clamp so UB ≥ leaf score holds.
+                sc_lo = skp_score_lo[s]
+                sc_hi = skp_score_hi[s]
+                if w > 0.0:
+                    u_max = cmax + f_max_ub
+                    u_min = cmin + f_min_ub
+                else:
+                    u_max = cmax + f_max_lb
+                    u_min = cmin + f_min_lb
+                if u_max > sc_hi: u_max = sc_hi
+                if u_max < sc_lo: u_max = sc_lo
+                if u_min > sc_hi: u_min = sc_hi
+                if u_min < sc_lo: u_min = sc_lo
+                ub_score += w * (u_max * 0.99 + u_min * 0.01)
 
         if not feasible:
             continue
@@ -2292,6 +2370,8 @@ def search_meta_batch_v2(
             comp_weight,
             build_ctx,
             round_offset,
+            skp_score_lo,
+            skp_score_hi,
             deps_lo,
             deps_hi,
             useful_pos_eff,
@@ -2362,6 +2442,8 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             query.comp_weight,
             query.build_ctx,
             query.round_offset_proj,
+            query.skp_score_lo_proj,
+            query.skp_score_hi_proj,
         )
         total_searched[0] += added
         return score, meta_index, sol
@@ -2393,6 +2475,8 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             query.comp_weight,
             query.build_ctx,
             query.round_offset_proj,
+            query.skp_score_lo_proj,
+            query.skp_score_hi_proj,
         )
         total_searched[0] += added
         return score, meta_index, sol
@@ -2434,6 +2518,8 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
         query.comp_weight,
         query.build_ctx,
         query.round_offset_proj,
+        query.skp_score_lo_proj,
+        query.skp_score_hi_proj,
     )
 
 

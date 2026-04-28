@@ -177,6 +177,17 @@ class Query(NamedTuple):
     # passed verbatim to numba kernels. See BUILD_CTX_* indices above.
     build_ctx: np.ndarray  # float64[BUILD_CTX_SIZE]
 
+    # Per-projected-stat clamp applied to `current_min/max` before scoring,
+    # so direct user weights on str/dex/int/def/agi saturate at the SP cap
+    # (skillPointsToPercentage clamps at 150). For an SP stat with ctx_base
+    # = b: lo = -b, hi = SKP_MAX - b — matches "useful craft contribution =
+    # clamp(ctx + craft, 0, 150) - ctx". For non-SP stats lo/hi are sentinel
+    # ±1e9 so the clamp is a no-op. Composite formulas already cap internally
+    # (see `_clamp_skp` and `_eval_spell_corner_*`); this only fixes the
+    # leaf/UB scoring of stats with a direct, non-zero weight.
+    skp_score_lo_proj: np.ndarray   # int32[stat_count]
+    skp_score_hi_proj: np.ndarray   # int32[stat_count]
+
     # Composite (derived) stats — Struct-of-Arrays for numba passage.
     # All indexed 0..comp_count-1. Dep indices are stored in a flat array,
     # variable-arity per composite via (offset, count) pairs.
@@ -443,6 +454,24 @@ def build_query(
 
     round_offset_proj = (req_mask_proj.astype(np.int32) * 50).astype(np.int32)
 
+    # SP-cap clamp for direct scoring (see field doc on Query). Sentinels
+    # are large but well within int32 + arithmetic headroom.
+    _SCORE_CLAMP_SENTINEL = np.int32(1_000_000_000)
+    skp_score_lo_proj = np.full(stat_count, -_SCORE_CLAMP_SENTINEL, dtype=np.int32)
+    skp_score_hi_proj = np.full(stat_count,  _SCORE_CLAMP_SENTINEL, dtype=np.int32)
+    _SKP_NAME_TO_CTX = {
+        "str": BUILD_CTX_BASE_STR, "dex": BUILD_CTX_BASE_DEX,
+        "int": BUILD_CTX_BASE_INT, "def": BUILD_CTX_BASE_DEF,
+        "agi": BUILD_CTX_BASE_AGI,
+    }
+    for j, name in enumerate(stat_index_keys_proj):
+        ctx_slot = _SKP_NAME_TO_CTX.get(name)
+        if ctx_slot is None:
+            continue
+        ctx_base = int(build_ctx_arr[ctx_slot])  # already clamped to [0, SKP_MAX]
+        skp_score_lo_proj[j] = -ctx_base
+        skp_score_hi_proj[j] = SKP_MAX - ctx_base
+
     # Resolve dura / duration in projected space (at most one is active).
     dura_proj_idx = -1
     for j, name in enumerate(stat_index_keys_proj):
@@ -517,6 +546,8 @@ def build_query(
         suggested_max_cull=suggested_max_cull,
         dura_proj_idx=dura_proj_idx,
         build_ctx=build_ctx_arr,
+        skp_score_lo_proj=skp_score_lo_proj,
+        skp_score_hi_proj=skp_score_hi_proj,
         comp_count=comp_count,
         comp_formula=comp_formula_arr,
         comp_dep_offset=comp_dep_offset,
