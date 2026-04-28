@@ -95,6 +95,14 @@ def build_recipe(raw_recipe: dict, query, tier: int) -> Recipe:
         hod_min = recipe_data["healthOrDamage"]["minimum"]
         hod_max = recipe_data["healthOrDamage"]["maximum"]
 
+        # craft.js:337-338 (weapon) and craft.js:388-389 (armor) both apply
+        # matmult to healthOrDamage with Math.floor. Skipping it made armor
+        # hpBonus base read as ~3000 at tier 3 instead of ~4200, forcing the
+        # search to top up via void-slot ingredients to satisfy hp constraints
+        # the recipe alone already covers.
+        hod_min = math.floor(hod_min * mult)
+        hod_max = math.floor(hod_max * mult)
+
         if query.skill in ("TAILORING", "ARMOURING"):
             # Armor: healthOrDamage maps to hpBonus (stat used for ehp etc.).
             inject_stat(STAT_INDEX["hpBonus"], hod_min, hod_max)
