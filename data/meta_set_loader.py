@@ -33,7 +33,7 @@ except ImportError:
         with open(path, "r", encoding="utf-8") as f:
             return _json.load(f)
 
-from data.stats import STAT_INDEX, STAT_COUNT, REQ_STATS
+from data.stats import STAT_INDEX, STAT_COUNT
 
 
 # Bump this when the on-disk cache format changes so old caches are ignored.
@@ -378,11 +378,6 @@ def _refine_batch(ings, eff, stat_names, stat_min, stat_max, query, recipe,
     ings_matrix = np.ascontiguousarray(ings, dtype=np.int32)
 
     if culling:
-        req_mask_full = np.zeros(STAT_COUNT, dtype=np.bool_)
-        for name in REQ_STATS:
-            req_mask_full[STAT_INDEX[name]] = True
-        req_mask_proj = req_mask_full[active_indices]
-
         if timings is not None:
             timings["prep"] = perf_counter() - _t0
             _tc = perf_counter()
@@ -392,8 +387,7 @@ def _refine_batch(ings, eff, stat_names, stat_min, stat_max, query, recipe,
             void_eff_matrix,
             ings_matrix,
             void_count,
-            req_mask_proj,
-            query.req_idx,
+            query.lower_better_proj,
             query.dura_proj_idx,
             time_budget_s=cull_budget_s,
         )
@@ -451,9 +445,12 @@ def compare_vectors(a, b, num_effs, is_req_col, dura_i):
         - [0, num_effs)             : void-slot effectiveness (sorted desc)
         - [num_effs, num_effs + K)  : projected stats
     `dura_i` is the absolute column of durability/duration (or -1).
-    `is_req_col` is a bool array of length len(a): True for "req stat" columns
-    (where lower is better when positive), False for everything else. Effs/dura
-    columns are False. Avoids a per-pair linear scan over `req_idx`.
+    `is_req_col` is a bool array of length len(a): True iff the user prefers
+    smaller values on that column (drives the dominance flip). Built from
+    `query.lower_better_proj` in `numba_cull`; eff and dura columns are
+    always False (higher always better). The legacy name reflects that for
+    typical queries this set still equals the req stats, but a positive
+    weight on a req now (correctly) pulls it out of this set.
     """
     a_better = False
     b_better = False
@@ -645,8 +642,14 @@ def pareto_filter_block(matrix, num_effs, is_req_col, dura_i, block_size=1024,
 
 @njit(parallel=True, cache=True)
 def _build_cull_matrix(base_min_matrix, base_max_matrix, void_eff_matrix,
-                       void_count, req_idx):
-    """Builds the comparison matrix used by pareto_filter, in parallel over rows."""
+                       void_count, lower_better_proj):
+    """Builds the comparison matrix used by pareto_filter, in parallel over rows.
+
+    `lower_better_proj` is a bool[num_stats] array driven by user intent:
+    True iff smaller values dominate larger ones for that stat. Picks the
+    most-dominating side of each [min, max] interval as the row's
+    representative.
+    """
     num_sets, num_stats = base_min_matrix.shape
     matrix = np.zeros((num_sets, void_count + num_stats), dtype=np.int32)
 
@@ -660,7 +663,7 @@ def _build_cull_matrix(base_min_matrix, base_max_matrix, void_eff_matrix,
         for s in range(num_stats):
             max_val = base_max_matrix[i, s]
             col = void_count + s
-            if s in req_idx:
+            if lower_better_proj[s]:
                 if max_val > 0:
                     matrix[i, col] = base_min_matrix[i, s]
                 else:
@@ -679,11 +682,13 @@ def numba_cull(base_min_matrix,
                void_eff_matrix,
                ings_matrix,
                void_count,
-               req_mask_proj,
-               req_idx,
+               lower_better_proj,
                dura_proj_idx,
                time_budget_s=None):
     """
+    `lower_better_proj`: bool[num_stats], True iff the user prefers smaller
+    values on that stat (drives the cull's dominance direction per column).
+
     `time_budget_s`: if set, the block-parallel cull stops after this many
     seconds of wall-clock — see `pareto_filter_block`. Output is then a
     valid Pareto SUPERSET (some dominated rows survive, but no Pareto-optimal
@@ -695,16 +700,17 @@ def numba_cull(base_min_matrix,
         dura_i = void_count + dura_proj_idx
 
     matrix = _build_cull_matrix(
-        base_min_matrix, base_max_matrix, void_eff_matrix, void_count, req_idx,
+        base_min_matrix, base_max_matrix, void_eff_matrix, void_count,
+        lower_better_proj,
     )
 
-    # Precompute per-column "is req stat" lookup so the comparator does an O(1)
-    # array load instead of an O(|req_idx|) linear scan per stat per pair.
+    # Precompute per-column "lower-better" lookup so the comparator does an
+    # O(1) array load. Eff and dura columns are False (higher always better).
     num_cols = matrix.shape[1]
     is_req_col = np.zeros(num_cols, dtype=np.bool_)
-    for r in req_idx:
-        if r >= 0:
-            col = void_count + int(r)
+    for s in range(lower_better_proj.shape[0]):
+        if lower_better_proj[s]:
+            col = void_count + s
             if 0 <= col < num_cols:
                 is_req_col[col] = True
 

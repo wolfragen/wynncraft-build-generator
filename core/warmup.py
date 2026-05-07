@@ -27,7 +27,10 @@ def warm_numba():
 def _warm_meta_set_loader():
     # Small 2-row x 3-col matrix: 1 void-eff column + 2 stat columns.
     mat = np.zeros((2, 3), dtype=np.int32)
-    req_idx = np.full(5, -1, dtype=np.int32)
+    # `_build_cull_matrix` reads lower_better_proj as a bool[num_stats] array;
+    # the per-column bool used by the comparator has the void-eff offset
+    # baked in (length = num_cols).
+    lower_better_proj = np.zeros(1, dtype=np.bool_)
     is_req_col = np.zeros(3, dtype=np.bool_)
 
     msl.compare_vectors(mat[0], mat[1], 1, is_req_col, -1)
@@ -43,16 +46,17 @@ def _warm_meta_set_loader():
     base_min = np.zeros((2, 1), dtype=np.int32)
     base_max = np.zeros((2, 1), dtype=np.int32)
     void_eff = np.zeros((2, 1), dtype=np.int32)
-    msl._build_cull_matrix(base_min, base_max, void_eff, 1, req_idx)
+    msl._build_cull_matrix(base_min, base_max, void_eff, 1, lower_better_proj)
 
     msl.pareto_filter_block(mat, 1, is_req_col, -1, block_size=1)
 
 
 def _warm_ingredient_filter():
     mat = np.zeros((2, 3), dtype=np.int32)
-    req_idx = np.full(5, -1, dtype=np.int32)
-    ingf.compare_stat_vectors(mat[0], mat[1], req_idx, -1)
-    ingf.pareto_filter_ingredients(mat, req_idx, -1)
+    # Comparator bool array is per-column (length = matrix width).
+    lower_better = np.zeros(3, dtype=np.bool_)
+    ingf.compare_stat_vectors(mat[0], mat[1], lower_better, -1)
+    ingf.pareto_filter_ingredients(mat, lower_better, -1)
 
 
 def _warm_search_engine():

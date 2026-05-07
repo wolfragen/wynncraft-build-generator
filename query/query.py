@@ -180,6 +180,13 @@ class Query(NamedTuple):
     stat_index_keys_proj: List[str]
     req_mask_proj: np.ndarray
     req_idx: np.ndarray
+    # Per-projected-stat "lower-is-better" preference for the Pareto cull,
+    # derived from the user's actual intent (weight sign, then min/max
+    # constraints, then req-stat fallback). Replaces the old "is this a req
+    # stat?" heuristic, which always assumed reqs were lower-better and
+    # culled high-req ingredients even when the user explicitly weighted the
+    # req positively (e.g. `"strReq": {"weight": 100000}`).
+    lower_better_proj: np.ndarray  # bool[stat_count]
     filter_mask: np.ndarray
     proj_stats_idx: np.ndarray
 
@@ -507,6 +514,33 @@ def build_query(
 
     req_mask_proj = req_mask_full[active_indices]
 
+    # Per-stat "lower-is-better" preference for the Pareto cull, derived from
+    # user intent rather than the legacy "is_req → flip" heuristic. The cull
+    # uses this to decide which direction makes one ingredient dominate
+    # another along each stat axis. Priority:
+    #   weight > 0          → False (higher better)
+    #   weight < 0          → True  (lower better — inversion-aware)
+    #   has_min only        → False (closer to / above min = better)
+    #   has_max only        → True  (closer to / below max = better)
+    #   both / neither      → fallback to is_req (legacy default)
+    lower_better_proj = np.zeros(stat_count, dtype=np.bool_)
+    for j in range(stat_count):
+        full_idx = int(active_indices[j])
+        w = float(weights[full_idx])
+        h_min = bool(has_min_mask[full_idx])
+        h_max = bool(has_max_mask[full_idx])
+        is_req = bool(req_mask_proj[j])
+        if w > 0.0:
+            lower_better_proj[j] = False
+        elif w < 0.0:
+            lower_better_proj[j] = True
+        elif h_min and not h_max:
+            lower_better_proj[j] = False
+        elif h_max and not h_min:
+            lower_better_proj[j] = True
+        else:
+            lower_better_proj[j] = is_req
+
     # META_5 (~5M rows) and META_4 (~600k rows) are dominated by branch-and-bound
     # pruning during search; the Pareto cull on those tiers costs more wall-clock
     # than it saves (measured on Armouring meteor: META_4 cull = 32s, search delta
@@ -622,6 +656,7 @@ def build_query(
         stat_index_keys_proj=stat_index_keys_proj,
         req_mask_proj=req_mask_proj,
         req_idx=req_idx,
+        lower_better_proj=lower_better_proj,
         filter_mask=filter_mask_full,
         proj_stats_idx=proj_stats_idx,
         round_offset_proj=round_offset_proj,
