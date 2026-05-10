@@ -1,4 +1,6 @@
 *.json
+*.npz
+data/precalc
 !items.json
 
 # Python bytecode + numba JIT artifacts
