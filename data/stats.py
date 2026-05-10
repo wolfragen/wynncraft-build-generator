@@ -118,6 +118,10 @@ DERIVED_STATS = (
 # (SPELL_SPELL_DEPS for use_spell=True, SPELL_MELEE_DEPS otherwise). Mirrored
 # below so the query parser doesn't need to import that module — but the lists
 # MUST match `data/spells.py` (a defensive assert in the parser would catch drift).
+# The xReq deps at the end let the spell formula fold the build's own
+# craft-side req allocation into the player's total SP (via
+# `s_str = ctx[BASE_STR] + deps[strBonus] + max(deps[strReq], ctx[BASE_REQ_STR])`).
+# Length: SPELL = 36, MELEE = 32.
 _SPELL_DEPS = (
     "nDamRaw", "eDamRaw", "tDamRaw", "wDamRaw", "fDamRaw", "aDamRaw",
     "nDamPct", "eDamPct", "tDamPct", "wDamPct", "fDamPct", "aDamPct",
@@ -126,6 +130,7 @@ _SPELL_DEPS = (
     "sdPct", "damPct", "sdRaw",
     "rDamPct", "rSdPct",
     "str", "dex", "int", "def", "agi",
+    "strReq", "dexReq", "intReq", "defReq", "agiReq",
 )
 
 _MELEE_DEPS = (
@@ -135,6 +140,7 @@ _MELEE_DEPS = (
     "mdPct", "damPct", "mdRaw",
     "rDamPct",
     "str", "dex", "int", "def", "agi",
+    "strReq", "dexReq", "intReq", "defReq", "agiReq",
 )
 
 DERIVED_DEPENDENCIES = {

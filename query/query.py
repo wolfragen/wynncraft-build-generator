@@ -82,7 +82,20 @@ BUILD_CTX_WD_T = 9
 BUILD_CTX_WD_W = 10
 BUILD_CTX_WD_F = 11
 BUILD_CTX_WD_A = 12
-BUILD_CTX_SIZE = 13
+# Existing player skill-point ALLOCATION per attribute (= max equipped xReq).
+# The player must allocate max(reqs) to satisfy items (skillpoints.js
+# can_equip), and that allocation contributes to total str/dex/int/def/agi
+# (which feeds into the SP cap and the spell formula's skp_e/_t/etc.). Set
+# from `_context["strReq"]` etc., or by main_build_temp.py from the
+# aggregated max equipped req; default 0. The spell kernel uses
+# `s_str = ctx[BASE_STR] + deps[strBonus] + max(deps[strReq], ctx[BASE_REQ_STR])`
+# before clamping to [0, SKP_MAX].
+BUILD_CTX_BASE_REQ_STR = 13
+BUILD_CTX_BASE_REQ_DEX = 14
+BUILD_CTX_BASE_REQ_INT = 15
+BUILD_CTX_BASE_REQ_DEF = 16
+BUILD_CTX_BASE_REQ_AGI = 17
+BUILD_CTX_SIZE = 18
 
 
 def _build_ctx_array(ctx_dict):
@@ -111,6 +124,18 @@ def _build_ctx_array(ctx_dict):
         atk_speed = ctx_dict.get("atk_speed", "NORMAL")
         arr[BUILD_CTX_ATK_SPD] = float(ATK_SPEED_MULT.get(atk_speed, ATK_SPEED_MULT["NORMAL"]))
         arr[BUILD_CTX_CRIT_PCT] = float(ctx_dict.get("crit_dam_pct", 0))
+        # Existing player skill-point allocation per attribute (max equipped xReq).
+        for req_name, slot in (("strReq", BUILD_CTX_BASE_REQ_STR),
+                               ("dexReq", BUILD_CTX_BASE_REQ_DEX),
+                               ("intReq", BUILD_CTX_BASE_REQ_INT),
+                               ("defReq", BUILD_CTX_BASE_REQ_DEF),
+                               ("agiReq", BUILD_CTX_BASE_REQ_AGI)):
+            v = int(ctx_dict.get(req_name, 0))
+            if v < 0:
+                v = 0
+            elif v > SKP_MAX:
+                v = SKP_MAX
+            arr[slot] = float(v)
         # weapon_dam: optional 6-tuple (n, e, t, w, f, a) for builds with a
         # fixed already-equipped weapon. Default 0 — search_pipelined will
         # overlay recipe.weapon_dam_neutral when crafting a weapon directly.
@@ -155,6 +180,13 @@ class Query(NamedTuple):
     stat_index_keys_proj: List[str]
     req_mask_proj: np.ndarray
     req_idx: np.ndarray
+    # Per-projected-stat "lower-is-better" preference for the Pareto cull,
+    # derived from the user's actual intent (weight sign, then min/max
+    # constraints, then req-stat fallback). Replaces the old "is this a req
+    # stat?" heuristic, which always assumed reqs were lower-better and
+    # culled high-req ingredients even when the user explicitly weighted the
+    # req positively (e.g. `"strReq": {"weight": 100000}`).
+    lower_better_proj: np.ndarray  # bool[stat_count]
     filter_mask: np.ndarray
     proj_stats_idx: np.ndarray
 
@@ -176,6 +208,28 @@ class Query(NamedTuple):
     # Build-context constants (skillpoint percentages, atk_speed mult, crit pct)
     # passed verbatim to numba kernels. See BUILD_CTX_* indices above.
     build_ctx: np.ndarray  # float64[BUILD_CTX_SIZE]
+
+    # SP-cap-aware scoring metadata (replaces the older static skp_score_lo/hi
+    # arrays). The cap on a SP stat's useful contribution depends on the
+    # craft's matching skill requirement (player allocates max(reqs) of SP,
+    # which counts toward the total → reduces the cap headroom for the bonus
+    # score), so we look up the req's per-leaf value dynamically rather than
+    # precomputing a static clamp.
+    #
+    #   sp_score_active_proj[s]  : True iff stat s is one of str/dex/int/def/agi
+    #                              and should be scored with the SP cap.
+    #   sp_score_ctx_proj[s]     : the user's ctx_base for that SP (from
+    #                              `_context`), already clamped to [0, SKP_MAX].
+    #   sp_score_req_idx_proj[s] : projected idx of the corresponding xReq
+    #                              stat (e.g., dex → dexReq), or -1 if no
+    #                              req is active in the query.
+    #   sp_score_req_base_proj[s]: user-provided `base` (or `min_base`) on
+    #                              that req stat — combined via MAX with the
+    #                              craft's req in the cap calc. 0 if none.
+    sp_score_active_proj: np.ndarray   # bool[stat_count]
+    sp_score_ctx_proj: np.ndarray      # int32[stat_count]
+    sp_score_req_idx_proj: np.ndarray  # int32[stat_count]
+    sp_score_req_base_proj: np.ndarray # int32[stat_count]
 
     # Composite (derived) stats — Struct-of-Arrays for numba passage.
     # All indexed 0..comp_count-1. Dep indices are stored in a flat array,
@@ -236,6 +290,15 @@ def build_query(
     # activation doesn't overwrite it with DEFAULT_BASE.
     explicit_base_set = np.zeros(STAT_COUNT, dtype=np.bool_)
 
+    # User-provided `base` for skill-req stats — captured separately so the
+    # search treats it via MAX (not SUM) with the craft's req. The additive
+    # `base_min/max_stats` slot for req stats stays at 0; the constraint
+    # check applies to the craft alone (valid since `max(base, craft) ≤
+    # max_constraint ⇔ base ≤ max_constraint AND craft ≤ max_constraint`,
+    # and we validate the first conjunct upfront). Indexed by req stat
+    # global idx (strReq..agiReq); 0 means "no user base".
+    req_user_base_full = np.zeros(STAT_COUNT, dtype=np.int32)
+
     # ------------------------------------------------------------
     # Build context (skillpoints, atk speed, crit) — query-level constants
     # used by spell composites. Pulled out of user_json before stat parsing.
@@ -289,18 +352,43 @@ def build_query(
         stat_min_base = config.get("min_base")
         stat_max_base = config.get("max_base")
 
-        if stat_base is not None:
-            base_min_stats[idx] = stat_base
-            base_max_stats[idx] = stat_base
-            explicit_base_set[idx] = True
+        is_req_stat = stat_name in REQ_STATS
 
-        if stat_min_base is not None:
-            base_min_stats[idx] = stat_min_base
-            explicit_base_set[idx] = True
+        if is_req_stat:
+            # Skill-req stats use MAX semantic (not SUM) when combining the
+            # user's base with the craft. Capture the base into a side array
+            # and skip the additive base_*_stats writes — the constraint
+            # check then applies to the craft alone (we validate the user's
+            # base against any user-set max constraint below).
+            user_req_base = 0
+            if stat_base is not None:
+                user_req_base = max(user_req_base, int(stat_base))
+            if stat_min_base is not None:
+                user_req_base = max(user_req_base, int(stat_min_base))
+            if stat_max_base is not None:
+                user_req_base = max(user_req_base, int(stat_max_base))
+            if user_req_base > 0:
+                req_user_base_full[idx] = user_req_base
+                explicit_base_set[idx] = True
+                if stat_max is not None and user_req_base > stat_max:
+                    raise ValueError(
+                        f"Query '{stat_name}': base ({user_req_base}) > max "
+                        f"({stat_max}). The craft alone cannot drop the "
+                        f"build's req below the user-supplied base."
+                    )
+        else:
+            if stat_base is not None:
+                base_min_stats[idx] = stat_base
+                base_max_stats[idx] = stat_base
+                explicit_base_set[idx] = True
 
-        if stat_max_base is not None:
-            base_max_stats[idx] = stat_max_base
-            explicit_base_set[idx] = True
+            if stat_min_base is not None:
+                base_min_stats[idx] = stat_min_base
+                explicit_base_set[idx] = True
+
+            if stat_max_base is not None:
+                base_max_stats[idx] = stat_max_base
+                explicit_base_set[idx] = True
 
         should_filter_stat = config.get("ingredient_filter")
         if should_filter_stat is not None:
@@ -426,6 +514,33 @@ def build_query(
 
     req_mask_proj = req_mask_full[active_indices]
 
+    # Per-stat "lower-is-better" preference for the Pareto cull, derived from
+    # user intent rather than the legacy "is_req → flip" heuristic. The cull
+    # uses this to decide which direction makes one ingredient dominate
+    # another along each stat axis. Priority:
+    #   weight > 0          → False (higher better)
+    #   weight < 0          → True  (lower better — inversion-aware)
+    #   has_min only        → False (closer to / above min = better)
+    #   has_max only        → True  (closer to / below max = better)
+    #   both / neither      → fallback to is_req (legacy default)
+    lower_better_proj = np.zeros(stat_count, dtype=np.bool_)
+    for j in range(stat_count):
+        full_idx = int(active_indices[j])
+        w = float(weights[full_idx])
+        h_min = bool(has_min_mask[full_idx])
+        h_max = bool(has_max_mask[full_idx])
+        is_req = bool(req_mask_proj[j])
+        if w > 0.0:
+            lower_better_proj[j] = False
+        elif w < 0.0:
+            lower_better_proj[j] = True
+        elif h_min and not h_max:
+            lower_better_proj[j] = False
+        elif h_max and not h_min:
+            lower_better_proj[j] = True
+        else:
+            lower_better_proj[j] = is_req
+
     # META_5 (~5M rows) and META_4 (~600k rows) are dominated by branch-and-bound
     # pruning during search; the Pareto cull on those tiers costs more wall-clock
     # than it saves (measured on Armouring meteor: META_4 cull = 32s, search delta
@@ -442,6 +557,37 @@ def build_query(
             i += 1
 
     round_offset_proj = (req_mask_proj.astype(np.int32) * 50).astype(np.int32)
+
+    # SP-cap-aware scoring metadata. For each active SP stat, look up the
+    # ctx base (from `_context`), the corresponding xReq stat's projected
+    # idx (or -1 if no req active), and the user's req base. The cap calc
+    # at scoring time uses `max(user_req_base, current[req_idx])` for the
+    # req, then clamps the bonus to [-(ctx+req), SKP_MAX-(ctx+req)].
+    sp_score_active_proj = np.zeros(stat_count, dtype=np.bool_)
+    sp_score_ctx_proj = np.zeros(stat_count, dtype=np.int32)
+    sp_score_req_idx_proj = np.full(stat_count, -1, dtype=np.int32)
+    sp_score_req_base_proj = np.zeros(stat_count, dtype=np.int32)
+    _SKP_NAME_TO_CTX = {
+        "str": BUILD_CTX_BASE_STR, "dex": BUILD_CTX_BASE_DEX,
+        "int": BUILD_CTX_BASE_INT, "def": BUILD_CTX_BASE_DEF,
+        "agi": BUILD_CTX_BASE_AGI,
+    }
+    _SP_TO_REQ_NAME = {"str": "strReq", "dex": "dexReq", "int": "intReq",
+                       "def": "defReq", "agi": "agiReq"}
+    for j, name in enumerate(stat_index_keys_proj):
+        ctx_slot = _SKP_NAME_TO_CTX.get(name)
+        if ctx_slot is None:
+            continue
+        sp_score_active_proj[j] = True
+        sp_score_ctx_proj[j] = int(build_ctx_arr[ctx_slot])  # 0..SKP_MAX
+        req_name = _SP_TO_REQ_NAME[name]
+        req_full_idx = STAT_INDEX[req_name]
+        req_proj = int(proj_stats_idx[req_full_idx])
+        if req_proj >= 0:
+            sp_score_req_idx_proj[j] = req_proj
+        # User-provided base on the corresponding xReq (captured separately
+        # in pass 1 when we encountered that req stat).
+        sp_score_req_base_proj[j] = int(req_user_base_full[req_full_idx])
 
     # Resolve dura / duration in projected space (at most one is active).
     dura_proj_idx = -1
@@ -510,6 +656,7 @@ def build_query(
         stat_index_keys_proj=stat_index_keys_proj,
         req_mask_proj=req_mask_proj,
         req_idx=req_idx,
+        lower_better_proj=lower_better_proj,
         filter_mask=filter_mask_full,
         proj_stats_idx=proj_stats_idx,
         round_offset_proj=round_offset_proj,
@@ -517,6 +664,10 @@ def build_query(
         suggested_max_cull=suggested_max_cull,
         dura_proj_idx=dura_proj_idx,
         build_ctx=build_ctx_arr,
+        sp_score_active_proj=sp_score_active_proj,
+        sp_score_ctx_proj=sp_score_ctx_proj,
+        sp_score_req_idx_proj=sp_score_req_idx_proj,
+        sp_score_req_base_proj=sp_score_req_base_proj,
         comp_count=comp_count,
         comp_formula=comp_formula_arr,
         comp_dep_offset=comp_dep_offset,

@@ -59,6 +59,15 @@ _BCTX_WD_T = 9
 _BCTX_WD_W = 10
 _BCTX_WD_F = 11
 _BCTX_WD_A = 12
+# Existing player allocation per attribute (= max equipped xReq). The spell
+# formula folds it into the player's total SP via
+# `s_str = ctx[BASE_STR] + deps[strBonus] + max(deps[strReq], ctx[BASE_REQ_STR])`.
+# Mirrors BUILD_CTX_BASE_REQ_* in query.py.
+_BCTX_BASE_REQ_STR = 13
+_BCTX_BASE_REQ_DEX = 14
+_BCTX_BASE_REQ_INT = 15
+_BCTX_BASE_REQ_DEF = 16
+_BCTX_BASE_REQ_AGI = 17
 
 
 # Explicit signature so the recursive dfs can be persisted to disk with
@@ -103,7 +112,11 @@ _DFS_SIG = types.void(
     types.float32[::1],       # comp_weight
     types.float64[::1],       # build_ctx (skp pcts, atk_spd, crit)
     types.int32[::1],         # round_offset (50 for req stats, 0 else)
-    types.float64[::1],       # deps_lo scratch (size ≥31, reused per spell call)
+    types.Array(types.bool_, 1, "C"),  # sp_score_active (True if SP stat)
+    types.int32[::1],         # sp_score_ctx (ctx_base per stat)
+    types.int32[::1],         # sp_score_req_idx (req's proj idx, -1 else)
+    types.int32[::1],         # sp_score_req_base (user's req base, 0 else)
+    types.float64[::1],       # deps_lo scratch (size ≥36, reused per spell call)
     types.float64[::1],       # deps_hi scratch
     types.Array(types.bool_, 1, "C"),  # useful_pos_eff (per ingredient, eff>0)
     types.Array(types.bool_, 1, "C"),  # useful_neg_eff (per ingredient, eff<=0)
@@ -432,12 +445,32 @@ def _eval_spell_corner_spell(deps, spell_id, ctx):
     # Globals + rainbow
     g_sd_pct = deps[21]; g_dam_pct = deps[22]; g_sd_raw = deps[23]
     r_dam_pct = deps[24]; r_sd_pct = deps[25]
-    # Skill points (additive over user's base in ctx; clamped 0..150)
-    s_str = int(deps[26] + ctx[_BCTX_BASE_STR])
-    s_dex = int(deps[27] + ctx[_BCTX_BASE_DEX])
-    s_int = int(deps[28] + ctx[_BCTX_BASE_INT])
-    s_def = int(deps[29] + ctx[_BCTX_BASE_DEF])
-    s_agi = int(deps[30] + ctx[_BCTX_BASE_AGI])
+    # Skill points: total = ctx_base (existing bonus) + craft bonus +
+    #   max(craft_req, ctx_base_req). The max() captures that the player
+    #   allocates max(reqs across items), which counts toward total SP
+    #   (skillpoints.js apply_to_fit). With the build's own req as deps[31..35]
+    #   (zeroed out from the additive base by query.py — see MAX semantic) and
+    #   the existing-build allocation in ctx[BASE_REQ_*], the formula is:
+    #     s_str = ctx[BASE_STR] + deps[26] + max(deps[31], ctx[BASE_REQ_STR])
+    #   Clamped to [0, SKP_MAX]. Without this, the search saw only bonus and
+    #   would chase wasted bonus past 150 — total = bonus + allocation could
+    #   reach 191 with all the useful headroom already spent on allocation.
+    a_str = int(deps[31])
+    if a_str < ctx[_BCTX_BASE_REQ_STR]: a_str = int(ctx[_BCTX_BASE_REQ_STR])
+    a_dex = int(deps[32])
+    if a_dex < ctx[_BCTX_BASE_REQ_DEX]: a_dex = int(ctx[_BCTX_BASE_REQ_DEX])
+    a_int = int(deps[33])
+    if a_int < ctx[_BCTX_BASE_REQ_INT]: a_int = int(ctx[_BCTX_BASE_REQ_INT])
+    a_def = int(deps[34])
+    if a_def < ctx[_BCTX_BASE_REQ_DEF]: a_def = int(ctx[_BCTX_BASE_REQ_DEF])
+    a_agi = int(deps[35])
+    if a_agi < ctx[_BCTX_BASE_REQ_AGI]: a_agi = int(ctx[_BCTX_BASE_REQ_AGI])
+
+    s_str = int(deps[26] + ctx[_BCTX_BASE_STR]) + a_str
+    s_dex = int(deps[27] + ctx[_BCTX_BASE_DEX]) + a_dex
+    s_int = int(deps[28] + ctx[_BCTX_BASE_INT]) + a_int
+    s_def = int(deps[29] + ctx[_BCTX_BASE_DEF]) + a_def
+    s_agi = int(deps[30] + ctx[_BCTX_BASE_AGI]) + a_agi
     if s_str < 0: s_str = 0
     elif s_str > SKP_MAX: s_str = SKP_MAX
     if s_dex < 0: s_dex = 0
@@ -541,11 +574,24 @@ def _eval_spell_corner_melee(deps, spell_id, ctx):
     g_md_pct = deps[18]; g_dam_pct = deps[19]; g_md_raw = deps[20]
     r_dam_pct = deps[21]   # rMdPct absent -> no rainbow Md %
 
-    s_str = int(deps[22] + ctx[_BCTX_BASE_STR])
-    s_dex = int(deps[23] + ctx[_BCTX_BASE_DEX])
-    s_int = int(deps[24] + ctx[_BCTX_BASE_INT])
-    s_def = int(deps[25] + ctx[_BCTX_BASE_DEF])
-    s_agi = int(deps[26] + ctx[_BCTX_BASE_AGI])
+    # Skill point allocation: see _eval_spell_corner_spell for semantics.
+    # Melee deps layout has reqs at indices 27..31 (after SP at 22..26).
+    a_str = int(deps[27])
+    if a_str < ctx[_BCTX_BASE_REQ_STR]: a_str = int(ctx[_BCTX_BASE_REQ_STR])
+    a_dex = int(deps[28])
+    if a_dex < ctx[_BCTX_BASE_REQ_DEX]: a_dex = int(ctx[_BCTX_BASE_REQ_DEX])
+    a_int = int(deps[29])
+    if a_int < ctx[_BCTX_BASE_REQ_INT]: a_int = int(ctx[_BCTX_BASE_REQ_INT])
+    a_def = int(deps[30])
+    if a_def < ctx[_BCTX_BASE_REQ_DEF]: a_def = int(ctx[_BCTX_BASE_REQ_DEF])
+    a_agi = int(deps[31])
+    if a_agi < ctx[_BCTX_BASE_REQ_AGI]: a_agi = int(ctx[_BCTX_BASE_REQ_AGI])
+
+    s_str = int(deps[22] + ctx[_BCTX_BASE_STR]) + a_str
+    s_dex = int(deps[23] + ctx[_BCTX_BASE_DEX]) + a_dex
+    s_int = int(deps[24] + ctx[_BCTX_BASE_INT]) + a_int
+    s_def = int(deps[25] + ctx[_BCTX_BASE_DEF]) + a_def
+    s_agi = int(deps[26] + ctx[_BCTX_BASE_AGI]) + a_agi
     if s_str < 0: s_str = 0
     elif s_str > SKP_MAX: s_str = SKP_MAX
     if s_dex < 0: s_dex = 0
@@ -626,20 +672,20 @@ def _eval_spell_corner_melee(deps, spell_id, ctx):
 def _spell_leaf(spell_id, off, di, mins, maxs, ctx, deps_lo, deps_hi):
     """Bounds at the leaf — read deps from the build's roll min/max arrays.
 
-    `deps_lo` and `deps_hi` are caller-provided scratch buffers of length ≥31
+    `deps_lo` and `deps_hi` are caller-provided scratch buffers of length ≥36
     (the largest spell-formula dep count). Pre-allocating once per m's DFS and
     reusing across all spell calls avoids ~2M np.empty() per batch on
     composite-heavy queries (mage_meteor: 31 deps × 2 arrays per UB/leaf call).
     """
     if _SPELL_USE_SPELL[spell_id]:
-        for i in range(31):
+        for i in range(36):
             idx = di[off + i]
             deps_lo[i] = mins[idx]
             deps_hi[i] = maxs[idx]
         lb = _eval_spell_corner_spell(deps_lo, spell_id, ctx)
         ub = _eval_spell_corner_spell(deps_hi, spell_id, ctx)
     else:
-        for i in range(27):
+        for i in range(32):
             idx = di[off + i]
             deps_lo[i] = mins[idx]
             deps_hi[i] = maxs[idx]
@@ -656,7 +702,7 @@ def _spell_dfs_ub(spell_id, off, di, cur, flb, fub, nd, ctx, deps_lo, deps_hi):
     the future arrays. Buffers reused per caller's m loop (see _spell_leaf).
     """
     if _SPELL_USE_SPELL[spell_id]:
-        for i in range(31):
+        for i in range(36):
             idx = di[off + i]
             base = cur[idx]
             deps_lo[i] = base + flb[nd, idx]
@@ -664,7 +710,7 @@ def _spell_dfs_ub(spell_id, off, di, cur, flb, fub, nd, ctx, deps_lo, deps_hi):
         lb = _eval_spell_corner_spell(deps_lo, spell_id, ctx)
         ub = _eval_spell_corner_spell(deps_hi, spell_id, ctx)
     else:
-        for i in range(27):
+        for i in range(32):
             idx = di[off + i]
             base = cur[idx]
             deps_lo[i] = base + flb[nd, idx]
@@ -681,7 +727,7 @@ def _spell_k2_ub(spell_id, off, di, after, sw, sb, ctx, deps_lo, deps_hi):
     (LB) or `after[idx] + slot1_best` (UB). Buffers reused per m's loop.
     """
     if _SPELL_USE_SPELL[spell_id]:
-        for i in range(31):
+        for i in range(36):
             idx = di[off + i]
             base = after[idx]
             deps_lo[i] = base + sw[idx]
@@ -689,7 +735,7 @@ def _spell_k2_ub(spell_id, off, di, after, sw, sb, ctx, deps_lo, deps_hi):
         lb = _eval_spell_corner_spell(deps_lo, spell_id, ctx)
         ub = _eval_spell_corner_spell(deps_hi, spell_id, ctx)
     else:
-        for i in range(27):
+        for i in range(32):
             idx = di[off + i]
             base = after[idx]
             deps_lo[i] = base + sw[idx]
@@ -843,6 +889,10 @@ def dfs(
     comp_weight,
     build_ctx,
     round_offset,
+    sp_score_active,
+    sp_score_ctx,
+    sp_score_req_idx,
+    sp_score_req_base,
     deps_lo,
     deps_hi,
     useful_pos_eff,
@@ -866,8 +916,37 @@ def dfs(
             if has_max_mask[s] and min_v > max_vals[s]:
                 return
 
-            score += weights[s] * max_v * 0.99
-            score += weights[s] * min_v * 0.01
+            sm = max_v
+            sn = min_v
+            if sp_score_active[s]:
+                # SP cap: useful = clamp(bonus, -ctx-req, SKP_MAX-ctx-req)
+                # where req = max(user_req_base, craft's req in this leaf).
+                # The req-allocation eats SP budget: player allocates max(reqs)
+                # of skill points, which counts toward the cap (skillpoints.js
+                # apply_to_fit / curve clamp). We apply directional req bounds:
+                # max-track scoring uses min req (smallest cap denominator →
+                # widest cap), min-track uses max req (smallest cap).
+                ctx_b = sp_score_ctx[s]
+                rb = sp_score_req_base[s]
+                ri = sp_score_req_idx[s]
+                if ri >= 0:
+                    req_lo = current_min[ri]
+                    req_hi = current_max[ri]
+                else:
+                    req_lo = 0
+                    req_hi = 0
+                if rb > req_lo: req_lo = rb
+                if rb > req_hi: req_hi = rb
+                hi_for_max = SKP_MAX - ctx_b - req_lo
+                lo_for_max = -ctx_b - req_lo
+                hi_for_min = SKP_MAX - ctx_b - req_hi
+                lo_for_min = -ctx_b - req_hi
+                if sm > hi_for_max: sm = hi_for_max
+                if sm < lo_for_max: sm = lo_for_max
+                if sn > hi_for_min: sn = hi_for_min
+                if sn < lo_for_min: sn = lo_for_min
+            score += weights[s] * sm * 0.99
+            score += weights[s] * sn * 0.01
 
         # Composite stats: compute on the finalized build, check constraints,
         # add weighted contribution.
@@ -1007,10 +1086,40 @@ def dfs(
                 break
 
             w = weights[s]
-            if w > 0.0:
-                ub_score += w * ((cmax + f_max_ub) * 0.99 + (cmin + f_min_ub) * 0.01)
-            elif w < 0.0:
-                ub_score += w * ((cmax + f_max_lb) * 0.99 + (cmin + f_min_lb) * 0.01)
+            if w != 0.0:
+                if w > 0.0:
+                    u_max = cmax + f_max_ub
+                    u_min = cmin + f_min_ub
+                else:
+                    u_max = cmax + f_max_lb
+                    u_min = cmin + f_min_lb
+                if sp_score_active[s]:
+                    # SP-cap-aware UB. To bound the cap conservatively in the
+                    # right direction:
+                    #   w>0 → max useful → use the SMALLEST possible req across
+                    #     all future ingredient choices and rolls.
+                    #   w<0 → min useful (max |w|*useful) → use the LARGEST.
+                    ctx_b = sp_score_ctx[s]
+                    rb = sp_score_req_base[s]
+                    ri = sp_score_req_idx[s]
+                    if w > 0.0:
+                        if ri >= 0:
+                            req_eff = current_min[ri] + future_min_lb[next_depth, ri]
+                        else:
+                            req_eff = 0
+                    else:
+                        if ri >= 0:
+                            req_eff = current_max[ri] + future_max_ub[next_depth, ri]
+                        else:
+                            req_eff = 0
+                    if rb > req_eff: req_eff = rb
+                    hi_cap = SKP_MAX - ctx_b - req_eff
+                    lo_cap = -ctx_b - req_eff
+                    if u_max > hi_cap: u_max = hi_cap
+                    if u_max < lo_cap: u_max = lo_cap
+                    if u_min > hi_cap: u_min = hi_cap
+                    if u_min < lo_cap: u_min = lo_cap
+                ub_score += w * (u_max * 0.99 + u_min * 0.01)
 
         if not feasible:
             # Undo and skip — entire subtree can't satisfy hard constraints.
@@ -1197,6 +1306,10 @@ def dfs(
             comp_weight,
             build_ctx,
             round_offset,
+            sp_score_active,
+            sp_score_ctx,
+            sp_score_req_idx,
+            sp_score_req_base,
             deps_lo,
             deps_hi,
             useful_pos_eff,
@@ -1253,6 +1366,10 @@ def _search_meta_batch_k1(
     comp_weight,
     build_ctx,
     round_offset,
+    sp_score_active,
+    sp_score_ctx,
+    sp_score_req_idx,
+    sp_score_req_base,
 ):
     M = base_min_matrix.shape[0]
     S = base_min_matrix.shape[1]
@@ -1267,7 +1384,7 @@ def _search_meta_batch_k1(
     # Pre-allocate per-m scratch (final_min/max, deps_lo/hi). Each row is at
     # least 64 bytes so adjacent m's don't false-share.
     final_buf = np.empty((M, 2, S), dtype=np.int32)
-    deps_buf = np.empty((M, 2, 31), dtype=np.float64)
+    deps_buf = np.empty((M, 2, 36), dtype=np.float64)
 
     for m in prange(M):
         eff = void_eff_matrix[m, 0]
@@ -1315,7 +1432,43 @@ def _search_meta_batch_k1(
                     feasible = False
                     break
 
-                score += weights[s] * (max_v * 0.99 + min_v * 0.01)
+                sm = max_v
+                sn = min_v
+                if sp_score_active[s]:
+                    # SP-cap clamp. The k1 leaf fills `final_*` progressively
+                    # in stat order, so reading final_*[ri] for a forward req
+                    # would be stale; recompute the req's per-leaf value
+                    # inline using the same formula as above. Cheap because
+                    # only ≤5 SP stats fire this branch.
+                    ctx_b = sp_score_ctx[s]
+                    rb = sp_score_req_base[s]
+                    ri = sp_score_req_idx[s]
+                    if ri >= 0:
+                        if ri == dura_idx:
+                            req_lo = base_min_matrix[m, ri] + db_stat_min[i, ri]
+                            req_hi = base_max_matrix[m, ri] + db_stat_max[i, ri]
+                        else:
+                            ro_r = round_offset[ri]
+                            if eff_pos:
+                                req_lo = base_min_matrix[m, ri] + (db_stat_min[i, ri] * eff + ro_r) // 100
+                                req_hi = base_max_matrix[m, ri] + (db_stat_max[i, ri] * eff + ro_r) // 100
+                            else:
+                                req_lo = base_min_matrix[m, ri] + (db_stat_max[i, ri] * eff + ro_r) // 100
+                                req_hi = base_max_matrix[m, ri] + (db_stat_min[i, ri] * eff + ro_r) // 100
+                    else:
+                        req_lo = 0
+                        req_hi = 0
+                    if rb > req_lo: req_lo = rb
+                    if rb > req_hi: req_hi = rb
+                    hi_for_max = SKP_MAX - ctx_b - req_lo
+                    lo_for_max = -ctx_b - req_lo
+                    hi_for_min = SKP_MAX - ctx_b - req_hi
+                    lo_for_min = -ctx_b - req_hi
+                    if sm > hi_for_max: sm = hi_for_max
+                    if sm < lo_for_max: sm = lo_for_max
+                    if sn > hi_for_min: sn = hi_for_min
+                    if sn < lo_for_min: sn = lo_for_min
+                score += weights[s] * (sm * 0.99 + sn * 0.01)
 
             if not feasible:
                 continue
@@ -1435,6 +1588,10 @@ def _search_meta_batch_k2(
     comp_weight,
     build_ctx,
     round_offset,
+    sp_score_active,
+    sp_score_ctx,
+    sp_score_req_idx,
+    sp_score_req_base,
 ):
     M = base_min_matrix.shape[0]
     S = base_min_matrix.shape[1]
@@ -1452,7 +1609,7 @@ def _search_meta_batch_k2(
     # Per-m after-state + final-state for composite UB / leaf rereads.
     state_buf = np.empty((M, 4, S), dtype=np.int32)
     # Spell-eval scratch (max 31 deps).
-    deps_buf = np.empty((M, 2, 31), dtype=np.float64)
+    deps_buf = np.empty((M, 2, 36), dtype=np.float64)
 
     for m in prange(M):
         eff0 = void_eff_matrix[m, 0]
@@ -1554,14 +1711,51 @@ def _search_meta_batch_k2(
                 after_max_arr[s] = after_max
 
                 w = weights[s]
-                if w > 0.0:
-                    ub_max = after_max + slot1_best_max[s]
-                    ub_min = after_min + slot1_best_min[s]
-                    ub_score += w * (ub_max * 0.99 + ub_min * 0.01)
-                elif w < 0.0:
-                    lb_max = after_max + slot1_worst_max[s]
-                    lb_min = after_min + slot1_worst_min[s]
-                    ub_score += w * (lb_max * 0.99 + lb_min * 0.01)
+                if w != 0.0:
+                    if w > 0.0:
+                        u_max = after_max + slot1_best_max[s]
+                        u_min = after_min + slot1_best_min[s]
+                    else:
+                        u_max = after_max + slot1_worst_max[s]
+                        u_min = after_min + slot1_worst_min[s]
+                    if sp_score_active[s]:
+                        # SP-cap-aware UB. Need bounds on the OTHER slot's
+                        # contribution to req. We don't have after_*[ri] yet
+                        # (the loop just stores `after_*` for stat s), but
+                        # base + db slot0's contribution is known. For slot 1,
+                        # use slot1_best/worst on the req. For w>0 (max useful):
+                        # use the SMALLEST possible req at slot 1; for w<0:
+                        # use the LARGEST. Recompute slot 0's req inline.
+                        ctx_b = sp_score_ctx[s]
+                        rb = sp_score_req_base[s]
+                        ri = sp_score_req_idx[s]
+                        if ri >= 0:
+                            # Slot-0 (i0) contribution to req at this m.
+                            if ri == dura_idx:
+                                req_after_min = base_min_matrix[m, ri] + db_stat_min[i0, ri]
+                                req_after_max = base_max_matrix[m, ri] + db_stat_max[i0, ri]
+                            else:
+                                ro_r = round_offset[ri]
+                                if eff0_pos:
+                                    req_after_min = base_min_matrix[m, ri] + (db_stat_min[i0, ri] * eff0 + ro_r) // 100
+                                    req_after_max = base_max_matrix[m, ri] + (db_stat_max[i0, ri] * eff0 + ro_r) // 100
+                                else:
+                                    req_after_min = base_min_matrix[m, ri] + (db_stat_max[i0, ri] * eff0 + ro_r) // 100
+                                    req_after_max = base_max_matrix[m, ri] + (db_stat_min[i0, ri] * eff0 + ro_r) // 100
+                            if w > 0.0:
+                                req_eff = req_after_min + slot1_worst_min[ri]
+                            else:
+                                req_eff = req_after_max + slot1_best_max[ri]
+                        else:
+                            req_eff = 0
+                        if rb > req_eff: req_eff = rb
+                        hi_cap = SKP_MAX - ctx_b - req_eff
+                        lo_cap = -ctx_b - req_eff
+                        if u_max > hi_cap: u_max = hi_cap
+                        if u_max < lo_cap: u_max = lo_cap
+                        if u_min > hi_cap: u_min = hi_cap
+                        if u_min < lo_cap: u_min = lo_cap
+                    ub_score += w * (u_max * 0.99 + u_min * 0.01)
 
             # Composite UB: per-formula bound on [after_* + slot1_{worst,best}_*] rectangle.
             for c in range(comp_count):
@@ -1706,7 +1900,50 @@ def _search_meta_batch_k2(
                         feasible = False
                         break
 
-                    score += weights[s] * (v_max * 0.99 + v_min * 0.01)
+                    sm = v_max
+                    sn = v_min
+                    if sp_score_active[s]:
+                        # SP-cap clamp; recompute req's per-leaf value inline
+                        # since the k2 leaf fills final_*_arr forward.
+                        ctx_b = sp_score_ctx[s]
+                        rb = sp_score_req_base[s]
+                        ri = sp_score_req_idx[s]
+                        if ri >= 0:
+                            if ri == dura_idx:
+                                req_lo = (base_min_matrix[m, ri]
+                                          + db_stat_min[i0, ri] + db_stat_min[i1, ri])
+                                req_hi = (base_max_matrix[m, ri]
+                                          + db_stat_max[i0, ri] + db_stat_max[i1, ri])
+                            else:
+                                ro_r = round_offset[ri]
+                                if eff0_pos:
+                                    c0_min_r = (db_stat_min[i0, ri] * eff0 + ro_r) // 100
+                                    c0_max_r = (db_stat_max[i0, ri] * eff0 + ro_r) // 100
+                                else:
+                                    c0_min_r = (db_stat_max[i0, ri] * eff0 + ro_r) // 100
+                                    c0_max_r = (db_stat_min[i0, ri] * eff0 + ro_r) // 100
+                                if eff1_pos:
+                                    c1_min_r = (db_stat_min[i1, ri] * eff1 + ro_r) // 100
+                                    c1_max_r = (db_stat_max[i1, ri] * eff1 + ro_r) // 100
+                                else:
+                                    c1_min_r = (db_stat_max[i1, ri] * eff1 + ro_r) // 100
+                                    c1_max_r = (db_stat_min[i1, ri] * eff1 + ro_r) // 100
+                                req_lo = base_min_matrix[m, ri] + c0_min_r + c1_min_r
+                                req_hi = base_max_matrix[m, ri] + c0_max_r + c1_max_r
+                        else:
+                            req_lo = 0
+                            req_hi = 0
+                        if rb > req_lo: req_lo = rb
+                        if rb > req_hi: req_hi = rb
+                        hi_for_max = SKP_MAX - ctx_b - req_lo
+                        lo_for_max = -ctx_b - req_lo
+                        hi_for_min = SKP_MAX - ctx_b - req_hi
+                        lo_for_min = -ctx_b - req_hi
+                        if sm > hi_for_max: sm = hi_for_max
+                        if sm < lo_for_max: sm = lo_for_max
+                        if sn > hi_for_min: sn = hi_for_min
+                        if sn < lo_for_min: sn = lo_for_min
+                    score += weights[s] * (sm * 0.99 + sn * 0.01)
 
                 if not feasible:
                     continue
@@ -1833,6 +2070,10 @@ def search_meta_batch(
     comp_weight,
     build_ctx,
     round_offset,
+    sp_score_active,
+    sp_score_ctx,
+    sp_score_req_idx,
+    sp_score_req_base,
 ):
     M = ings_matrix.shape[0]
     k = void_count
@@ -1888,8 +2129,8 @@ def search_meta_batch(
 
         # Spell-eval scratch reused across every spell helper call inside
         # this m's DFS (replaces ~thousands of np.empty(31) per m).
-        deps_lo = np.empty(31, dtype=np.float64)
-        deps_hi = np.empty(31, dtype=np.float64)
+        deps_lo = np.empty(36, dtype=np.float64)
+        deps_hi = np.empty(36, dtype=np.float64)
 
         dfs(
             0,
@@ -1931,6 +2172,10 @@ def search_meta_batch(
             comp_weight,
             build_ctx,
             round_offset,
+            sp_score_active,
+            sp_score_ctx,
+            sp_score_req_idx,
+            sp_score_req_base,
             deps_lo,
             deps_hi,
             useful_pos_eff,
@@ -2012,6 +2257,10 @@ def search_meta_batch_v2(
     comp_weight,
     build_ctx,
     round_offset,
+    sp_score_active,
+    sp_score_ctx,
+    sp_score_req_idx,
+    sp_score_req_base,
 ):
     M = ings_matrix.shape[0]
     k = void_count
@@ -2074,8 +2323,8 @@ def search_meta_batch_v2(
         future_max_lb = bounds_buf[m, 2]
         future_min_lb = bounds_buf[m, 3]
 
-        deps_lo = np.empty(31, dtype=np.float64)
-        deps_hi = np.empty(31, dtype=np.float64)
+        deps_lo = np.empty(36, dtype=np.float64)
+        deps_hi = np.empty(36, dtype=np.float64)
 
         eff_0 = void_eff_matrix[m, 0]
         eff_0_is_positive = eff_0 > 0
@@ -2132,10 +2381,38 @@ def search_meta_batch_v2(
                 break
 
             w = weights[s]
-            if w > 0.0:
-                ub_score += w * ((cmax + f_max_ub) * 0.99 + (cmin + f_min_ub) * 0.01)
-            elif w < 0.0:
-                ub_score += w * ((cmax + f_max_lb) * 0.99 + (cmin + f_min_lb) * 0.01)
+            if w != 0.0:
+                if w > 0.0:
+                    u_max = cmax + f_max_ub
+                    u_min = cmin + f_min_ub
+                else:
+                    u_max = cmax + f_max_lb
+                    u_min = cmin + f_min_lb
+                if sp_score_active[s]:
+                    # SP-cap-aware UB at depth 1 — same logic as the dfs UB,
+                    # but with the literal `1` (we're past slot 0, looking at
+                    # the suffix from slot 1 onward).
+                    ctx_b = sp_score_ctx[s]
+                    rb = sp_score_req_base[s]
+                    ri = sp_score_req_idx[s]
+                    if w > 0.0:
+                        if ri >= 0:
+                            req_eff = current_min[ri] + future_min_lb[1, ri]
+                        else:
+                            req_eff = 0
+                    else:
+                        if ri >= 0:
+                            req_eff = current_max[ri] + future_max_ub[1, ri]
+                        else:
+                            req_eff = 0
+                    if rb > req_eff: req_eff = rb
+                    hi_cap = SKP_MAX - ctx_b - req_eff
+                    lo_cap = -ctx_b - req_eff
+                    if u_max > hi_cap: u_max = hi_cap
+                    if u_max < lo_cap: u_max = lo_cap
+                    if u_min > hi_cap: u_min = hi_cap
+                    if u_min < lo_cap: u_min = lo_cap
+                ub_score += w * (u_max * 0.99 + u_min * 0.01)
 
         if not feasible:
             continue
@@ -2292,6 +2569,10 @@ def search_meta_batch_v2(
             comp_weight,
             build_ctx,
             round_offset,
+            sp_score_active,
+            sp_score_ctx,
+            sp_score_req_idx,
+            sp_score_req_base,
             deps_lo,
             deps_hi,
             useful_pos_eff,
@@ -2362,6 +2643,10 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             query.comp_weight,
             query.build_ctx,
             query.round_offset_proj,
+            query.sp_score_active_proj,
+            query.sp_score_ctx_proj,
+            query.sp_score_req_idx_proj,
+            query.sp_score_req_base_proj,
         )
         total_searched[0] += added
         return score, meta_index, sol
@@ -2393,6 +2678,10 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             query.comp_weight,
             query.build_ctx,
             query.round_offset_proj,
+            query.sp_score_active_proj,
+            query.sp_score_ctx_proj,
+            query.sp_score_req_idx_proj,
+            query.sp_score_req_base_proj,
         )
         total_searched[0] += added
         return score, meta_index, sol
@@ -2434,6 +2723,10 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
         query.comp_weight,
         query.build_ctx,
         query.round_offset_proj,
+        query.sp_score_active_proj,
+        query.sp_score_ctx_proj,
+        query.sp_score_req_idx_proj,
+        query.sp_score_req_base_proj,
     )
 
 

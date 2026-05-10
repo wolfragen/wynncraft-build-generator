@@ -9,7 +9,7 @@ adapted to dense stat vectors.
 Effectiveness filtering removed.
 """
 
-from data.stats import STAT_INDEX, IDX_DURABILITY, IDX_DURATION, IDX_CHARGES, REQ_STATS_IDX
+from data.stats import STAT_INDEX, IDX_DURABILITY, IDX_DURATION, IDX_CHARGES
 from data.ingredient_loader import SKILL_INDEX
 
 import numpy as np
@@ -132,7 +132,8 @@ def filter_raw_ingredients(
     filtered = pareto_cull_ingredients(filtered, query, recipe)
     n_culled = len(filtered)
     
-    print(f"Ingredient culling: {n_filtered} => {n_culled}, {n_culled/n_filtered*100:.2f}% left")
+    pct = (n_culled / n_filtered * 100) if n_filtered else 0.0
+    print(f"Ingredient culling: {n_filtered} => {n_culled}, {pct:.2f}% left")
     return filtered
 
 
@@ -142,7 +143,7 @@ def pareto_cull_ingredients(ingredients, query, recipe):
         return ingredients
 
     active = query.active_indices
-    req_idx = query.req_idx
+    lower_better = query.lower_better_proj
     stat_count = query.stat_count
     dura_proj_idx = query.dura_proj_idx
 
@@ -163,7 +164,11 @@ def pareto_cull_ingredients(ingredients, query, recipe):
                 max_val += recipe.scaled_dura_max
 
             # ---- select best representative value ----
-            if stat_idx in REQ_STATS_IDX:
+            # "Best" follows the user's actual direction preference for this
+            # stat (lower_better_proj). For lower-better stats we pick the
+            # smallest representative when the range is positive (= most-
+            # dominating side); for higher-better, the largest.
+            if lower_better[j]:
                 if max_val > 0:
                     matrix[i, j] = min_val
                 else:
@@ -173,13 +178,13 @@ def pareto_cull_ingredients(ingredients, query, recipe):
             else:
                 matrix[i, j] = min_val
 
-    kept_mask = pareto_filter_ingredients(matrix, req_idx, dura_proj_idx)
+    kept_mask = pareto_filter_ingredients(matrix, lower_better, dura_proj_idx)
 
     return [ingredients[i] for i in range(len(ingredients)) if kept_mask[i]]
 
 
 @njit(cache=True)
-def pareto_filter_ingredients(matrix, req_idx, dura_proj_idx):
+def pareto_filter_ingredients(matrix, lower_better, dura_proj_idx):
 
     n = matrix.shape[0]
     is_kept = np.ones(n, dtype=np.bool_)
@@ -194,7 +199,7 @@ def pareto_filter_ingredients(matrix, req_idx, dura_proj_idx):
             if not is_kept[j]:
                 continue
 
-            cmp = compare_stat_vectors(matrix[i], matrix[j], req_idx, dura_proj_idx)
+            cmp = compare_stat_vectors(matrix[i], matrix[j], lower_better, dura_proj_idx)
 
             if cmp == 1:
                 is_kept[j] = False
@@ -210,7 +215,7 @@ def pareto_filter_ingredients(matrix, req_idx, dura_proj_idx):
 
 
 @njit(cache=True)
-def compare_stat_vectors(a, b, req_idx, dura_i):
+def compare_stat_vectors(a, b, lower_better, dura_i):
     """
     Returns:
         1  if A dominates B
@@ -218,9 +223,12 @@ def compare_stat_vectors(a, b, req_idx, dura_i):
         2  if identical
         0  if incomparable
 
-    `dura_i` is the column of durability/duration (or -1). Dura is
-    non-invertible, so it follows a strict "higher is better" rule and
-    ignores the sign-mismatch incomparability guard.
+    `lower_better[i]` is True iff the user prefers smaller values on stat
+    column i (computed from weight sign / min-max constraints / req-stat
+    fallback in `query.py`). The cull flips its dominance direction along
+    columns where this is True. `dura_i` is the column of durability/
+    duration (or -1) — dura is always strictly higher-is-better and ignores
+    the sign-mismatch incomparability guard.
     """
 
     a_better = False
@@ -246,24 +254,25 @@ def compare_stat_vectors(a, b, req_idx, dura_i):
         if (va > 0 and vb < 0) or (va < 0 and vb > 0):
             return 0
 
-        is_req = i in req_idx
+        lb = lower_better[i]
 
         if va > 0 or vb > 0:
-            # Both >= 0 (with at least one > 0).
-            # For reqs, lower is better → flip direction.
-            if (va > vb) != is_req:
+            # Both >= 0 (with at least one > 0). Higher better unless the
+            # user prefers low values on this stat.
+            if (va > vb) != lb:
                 a_better = True
             else:
                 b_better = True
         else:
             # Both <= 0.
-            # For non-req invertible stats, "0 vs -X" is incomparable:
+            # For higher-better invertible stats, "0 vs -X" is incomparable:
             # the 0 side has no stat at all, while -X is only useful via
-            # -eff inversion for one direction but not the other.
-            if not is_req and (va == 0 or vb == 0):
+            # -eff inversion in one direction but not the other.
+            if not lb and (va == 0 or vb == 0):
                 return 0
-            # Otherwise: further-below-zero = lower req for reqs, and bigger
-            # magnitude for invertible stats with both strictly < 0.
+            # Otherwise: further-below-zero = lower req for lower-better
+            # stats, and bigger magnitude for invertible stats with both
+            # strictly < 0.
             if va < vb: a_better = True
             else:       b_better = True
 

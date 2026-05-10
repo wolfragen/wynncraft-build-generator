@@ -27,7 +27,10 @@ def warm_numba():
 def _warm_meta_set_loader():
     # Small 2-row x 3-col matrix: 1 void-eff column + 2 stat columns.
     mat = np.zeros((2, 3), dtype=np.int32)
-    req_idx = np.full(5, -1, dtype=np.int32)
+    # `_build_cull_matrix` reads lower_better_proj as a bool[num_stats] array;
+    # the per-column bool used by the comparator has the void-eff offset
+    # baked in (length = num_cols).
+    lower_better_proj = np.zeros(1, dtype=np.bool_)
     is_req_col = np.zeros(3, dtype=np.bool_)
 
     msl.compare_vectors(mat[0], mat[1], 1, is_req_col, -1)
@@ -43,27 +46,28 @@ def _warm_meta_set_loader():
     base_min = np.zeros((2, 1), dtype=np.int32)
     base_max = np.zeros((2, 1), dtype=np.int32)
     void_eff = np.zeros((2, 1), dtype=np.int32)
-    msl._build_cull_matrix(base_min, base_max, void_eff, 1, req_idx)
+    msl._build_cull_matrix(base_min, base_max, void_eff, 1, lower_better_proj)
 
     msl.pareto_filter_block(mat, 1, is_req_col, -1, block_size=1)
 
 
 def _warm_ingredient_filter():
     mat = np.zeros((2, 3), dtype=np.int32)
-    req_idx = np.full(5, -1, dtype=np.int32)
-    ingf.compare_stat_vectors(mat[0], mat[1], req_idx, -1)
-    ingf.pareto_filter_ingredients(mat, req_idx, -1)
+    # Comparator bool array is per-column (length = matrix width).
+    lower_better = np.zeros(3, dtype=np.bool_)
+    ingf.compare_stat_vectors(mat[0], mat[1], lower_better, -1)
+    ingf.pareto_filter_ingredients(mat, lower_better, -1)
 
 
 def _warm_search_engine():
     """
     Force the JIT compile of `dfs` and `search_meta_batch` (parallel=True is
-    expensive to compile, 1-2s per process). M=1, k=1, S=31, N=1 — S=31 so the
-    largest spell formula (any spell-mode spell, 31 deps in canonical layout)
-    can read its slots. We invoke each kernel once per formula tag (fixed +
-    every spell) so all branches compile eagerly.
+    expensive to compile, 1-2s per process). M=1, k=1, S=36, N=1 — S=36 so the
+    largest spell formula (any spell-mode spell, 36 deps in canonical layout
+    after adding the SP-req slots) can read its slots. We invoke each kernel
+    once per formula tag (fixed + every spell) so all branches compile eagerly.
     """
-    M, k, S, N = 1, 1, 31, 1
+    M, k, S, N = 1, 1, 36, 1
     ings = np.zeros((M, 6), dtype=np.int32)
     void_eff = np.full((M, k), 100, dtype=np.int32)
     base_min = np.zeros((M, S), dtype=np.int32)
@@ -103,6 +107,15 @@ def _warm_search_engine():
     # compile, not to compute meaningful values.
     round_offset = np.zeros(S, dtype=np.int32)
 
+    # SP-cap-aware scoring metadata. Real Query marks SP stats active and
+    # passes their ctx + corresponding xReq idx; warm-up uses all-inactive
+    # to exercise the non-SP fast path. The req-idx array still needs to
+    # type as int32, hence the explicit dtype.
+    sp_score_active = np.zeros(S, dtype=np.bool_)
+    sp_score_ctx = np.zeros(S, dtype=np.int32)
+    sp_score_req_idx = np.full(S, -1, dtype=np.int32)
+    sp_score_req_base = np.zeros(S, dtype=np.int32)
+
     void_eff_k2 = np.full((M, 2), 100, dtype=np.int32)
 
     # Cover every formula tag (fixed + every spell_id). Each loop iteration
@@ -126,6 +139,7 @@ def _warm_search_engine():
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
             round_offset,
+            sp_score_active, sp_score_ctx, sp_score_req_idx, sp_score_req_base,
         )
 
         # v2 ((m, i_0)-parallel) is the production path for k=3. Compile it
@@ -142,6 +156,7 @@ def _warm_search_engine():
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
             round_offset,
+            sp_score_active, sp_score_ctx, sp_score_req_idx, sp_score_req_base,
         )
 
 
@@ -155,6 +170,7 @@ def _warm_search_engine():
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
             round_offset,
+            sp_score_active, sp_score_ctx, sp_score_req_idx, sp_score_req_base,
         )
 
         se._search_meta_batch_k2(
@@ -167,4 +183,5 @@ def _warm_search_engine():
             comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
             build_ctx,
             round_offset,
+            sp_score_active, sp_score_ctx, sp_score_req_idx, sp_score_req_base,
         )

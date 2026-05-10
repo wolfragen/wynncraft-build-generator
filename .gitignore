@@ -8,3 +8,8 @@ __pycache__/
 *.pyc
 *.nbc
 *.nbi
+
+# Precalc data + caches (regenerable, GB-scale)
+data/precalc/
+data/precalc.zip
+*.cache.npz
