@@ -23,6 +23,13 @@ def filter_raw_ingredients(
 ):
     """
     Takes all ingredients and the user Query, then returns only useful ingredients.
+
+    TODO(level filter): missing — ingredients with `lvl > recipe.lvl` cannot be
+    used in this recipe but currently survive the filter. They get pruned at
+    crafter-validation time, but here they'd be wasting cull / DFS work. Add a
+    `if ing.lvl > recipe.lvl: continue` (or similar bound from RecipeRaw) once
+    the recipe-level field is plumbed through. Cheap fix, modest speedup; see
+    speedup_ideas.md for context.
     """
 
     filtered = []

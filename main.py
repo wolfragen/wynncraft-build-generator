@@ -167,7 +167,7 @@ def main():
         item_type=item_type,
         skill=skill,
         consumable=consumable,
-        fast_cull=True,  # legacy single-representative pareto cull: unsound under inversion (drops valid candidates) but much faster downstream search. Flip to False for the range-aware sound cull.
+        fast_cull=False,  # legacy single-representative pareto cull: unsound under inversion (drops valid candidates) but much faster downstream search. Flip to False for the range-aware sound cull.
     )
 
     # ---------- Load recipes (Materials => Stats) ----------

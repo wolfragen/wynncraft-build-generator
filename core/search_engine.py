@@ -120,39 +120,105 @@ _DFS_SIG = types.void(
     types.float64[::1],       # deps_hi scratch
     types.Array(types.bool_, 1, "C"),  # useful_pos_eff (per ingredient, eff>0)
     types.Array(types.bool_, 1, "C"),  # useful_neg_eff (per ingredient, eff<=0)
+    types.float64[::1],       # score_suffix_ub (per-depth NEW linear UB for non-SP)
 )
 
 
 @njit(cache=True)
 def _compute_useful_masks(
-    db_contrib_pos_mask, db_contrib_neg_mask,
-    has_min_mask, has_max_mask, pos_weight_mask, neg_weight_mask,
+    db_stat_min, db_stat_max,
+    has_min_mask, has_max_mask, weights,
+    comp_count, comp_formula, comp_dep_offset, comp_dep_count,
+    comp_dep_indices, comp_weight, comp_has_min, comp_has_max,
 ):
     """
     Precompute per-(ingredient, sign(eff)) whether the ingredient can affect
-    any constraint or weighted stat. The DFS used to rerun this O(S) scan
-    at every node × every ingredient; the result depends only on (i, eff
-    sign), so hoisting it here cuts an inner loop out of the hot path.
+    any constraint, weighted stat, or active composite. The DFS used to rerun
+    this O(S) scan at every node × every ingredient; the result depends only
+    on (i, eff sign), so hoisting it here cuts an inner loop out of the hot
+    path.
 
     `useful_pos_eff[i]` is True iff some stat s makes ingredient i useful
     when applied to a slot with eff > 0; `useful_neg_eff[i]` is the
-    symmetric mask for eff <= 0 (matching the DFS's `eff_is_positive = eff > 0`).
+    symmetric mask for eff <= 0 (matching the DFS's
+    `eff_is_positive = eff > 0`).
+
+    An ingredient is STRICTLY useless at sign σ iff for EVERY active stat:
+    its reachable contribution at σ matches NO usefulness direction. We err
+    on the side of keeping (correctness over aggressiveness).
+
+    Per-stat direction sources (a stat is "higher-better needed" if any
+    source asks for it, same for "lower-better"):
+      direct constraints/weights: `has_min`, `has_max`, `weights[s]`.
+      composite induction: each active composite (cw != 0 OR
+        comp_has_min OR comp_has_max) propagates its direction to its
+        deps, ASSUMING the composite formula is monotone-increasing in
+        deps. All current composites (raw_to_pct, ehp, ehpr, spells) satisfy
+        this on the regions ingredient rolls actually reach.
+        FORMULA_MUL_DIV_100 is non-monotone (∂(a*b/100)/∂a = b/100 flips
+        sign with b); for that case, mark deps as BOTH directions
+        (conservative — keeps the ingredient).
+
+    Contribution feasibility per sign:
+      σ=+1: positive roll (stat_max > 0) → positive contrib.
+            negative roll (stat_min < 0) → negative contrib.
+      σ=-1: positive roll → negative contrib (eff flips sign).
+            negative roll → positive contrib.
+    Ingredient useful at σ for stat s iff its reachable contribution
+    direction at σ matches the stat's "needed" direction.
     """
-    N = db_contrib_pos_mask.shape[0]
-    S = db_contrib_pos_mask.shape[1]
+    N = db_stat_min.shape[0]
+    S = db_stat_min.shape[1]
+
+    # Per-stat aggregate direction flags. "Higher-better needed" = any user
+    # constraint or composite pushes the stat upward; same for lower.
+    s_higher = np.zeros(S, dtype=np.bool_)
+    s_lower = np.zeros(S, dtype=np.bool_)
+    for s in range(S):
+        if has_min_mask[s] or weights[s] > 0.0:
+            s_higher[s] = True
+        if has_max_mask[s] or weights[s] < 0.0:
+            s_lower[s] = True
+
+    # Composite induction onto deps.
+    for c in range(comp_count):
+        cw = comp_weight[c]
+        ch_min = comp_has_min[c]
+        ch_max = comp_has_max[c]
+        if cw == 0.0 and (not ch_min) and (not ch_max):
+            continue
+        f = comp_formula[c]
+        nonmonotone = (f == FORMULA_MUL_DIV_100)
+        off = comp_dep_offset[c]
+        cnt = comp_dep_count[c]
+        for k in range(cnt):
+            dep_s = comp_dep_indices[off + k]
+            if nonmonotone:
+                # Sign of ∂f/∂dep depends on the OTHER dep — can't decide
+                # globally. Mark both directions so the ingredient survives.
+                s_higher[dep_s] = True
+                s_lower[dep_s] = True
+            else:
+                if cw > 0.0 or ch_min:
+                    s_higher[dep_s] = True
+                if cw < 0.0 or ch_max:
+                    s_lower[dep_s] = True
+
     useful_pos_eff = np.zeros(N, dtype=np.bool_)
     useful_neg_eff = np.zeros(N, dtype=np.bool_)
     for i in range(N):
         for s in range(S):
-            if db_contrib_pos_mask[i, s]:
-                if has_min_mask[s] or pos_weight_mask[s]:
+            can_pos = db_stat_max[i, s] > 0
+            can_neg = db_stat_min[i, s] < 0
+            if can_pos:
+                if s_higher[s]:
                     useful_pos_eff[i] = True
-                if has_max_mask[s] or neg_weight_mask[s]:
+                if s_lower[s]:
                     useful_neg_eff[i] = True
-            if db_contrib_neg_mask[i, s]:
-                if has_max_mask[s] or neg_weight_mask[s]:
+            if can_neg:
+                if s_lower[s]:
                     useful_pos_eff[i] = True
-                if has_min_mask[s] or pos_weight_mask[s]:
+                if s_higher[s]:
                     useful_neg_eff[i] = True
             if useful_pos_eff[i] and useful_neg_eff[i]:
                 break
@@ -750,8 +816,76 @@ def _spell_k2_ub(spell_id, off, di, after, sw, sb, ctx, deps_lo, deps_hi):
 # ============================================================
 
 @njit(cache=True)
+def _compute_slot_best_per_eff(
+    db_stat_min, db_stat_max, distinct_effs,
+    weights, sp_score_active, round_offset, dura_idx,
+):
+    """
+    For each distinct void-slot eff value, compute the max-over-ingredients
+    of the linear NON-SP-cap score contribution a single ingredient can add
+    at a slot with that eff.
+
+    Used by the score-aware BB upper bound. The OLD per-stat-independent UB
+    summed `max_i c_max(i, s, eff)` PER STAT, allowing the bound to assume a
+    different ingredient maximizes each stat in the same slot — which is
+    impossible (one slot, one ingredient). The NEW bound forces a single
+    ingredient per slot by computing each ingredient's TOTAL linear score
+    contribution at this eff and taking the max.
+
+    Per-eff bucketing avoids recomputing this for every meta row: the result
+    only depends on (db, weights, eff), not on the meta row's other slots.
+
+    EXCLUDED from this precompute (still handled per-DFS-node):
+      - SP-cap-aware stats (sp_score_active[s]): their clamp depends on the
+        build's req allocation, which varies per DFS state. Per-slot clamping
+        is sound but loose (k-times overshoot when the leaf clamps the sum
+        instead of each slot). Keeping these in the OLD per-state SP-cap UB.
+      - Composite stats: non-linear in deps; UB requires per-state corner
+        evaluation that's already handled in the DFS body.
+      - Hard constraints (has_min / has_max): feasibility is a separate check
+        on the per-stat future_*_ub/lb arrays; not part of score UB.
+    """
+    N = db_stat_min.shape[0]
+    S = db_stat_min.shape[1]
+    E = distinct_effs.shape[0]
+
+    slot_best_per_eff = np.empty(E, dtype=np.float64)
+
+    for e_idx in range(E):
+        eff = distinct_effs[e_idx]
+        eff_pos = eff >= 0
+        best = -1e18
+        for i in range(N):
+            score_i = 0.0
+            for s in range(S):
+                if sp_score_active[s]:
+                    continue
+                w = weights[s]
+                if w == 0.0:
+                    continue
+                if s == dura_idx:
+                    c_max = db_stat_max[i, s]
+                    c_min = db_stat_min[i, s]
+                else:
+                    ro = round_offset[s]
+                    if eff_pos:
+                        c_max = (db_stat_max[i, s] * eff + ro) // 100
+                        c_min = (db_stat_min[i, s] * eff + ro) // 100
+                    else:
+                        c_max = (db_stat_min[i, s] * eff + ro) // 100
+                        c_min = (db_stat_max[i, s] * eff + ro) // 100
+                score_i += w * (float(c_max) * 0.99 + float(c_min) * 0.01)
+            if score_i > best:
+                best = score_i
+        slot_best_per_eff[e_idx] = best
+
+    return slot_best_per_eff
+
+
+@njit(cache=True)
 def _precompute_bounds(db_stat_min, db_stat_max, meta_void_eff, void_count, dura_idx, round_offset,
-                        future_max_ub, future_min_ub, future_max_lb, future_min_lb):
+                        future_max_ub, future_min_ub, future_max_lb, future_min_lb,
+                        distinct_effs, slot_best_per_eff, score_suffix_ub):
     """
     Build suffix-sum arrays capturing the best/worst additional contribution
     the remaining slots can add to current_max[s] and current_min[s].
@@ -843,6 +977,25 @@ def _precompute_bounds(db_stat_min, db_stat_max, meta_void_eff, void_count, dura
             future_max_lb[d, s] = future_max_lb[d + 1, s] + slot_worst_max
             future_min_lb[d, s] = future_min_lb[d + 1, s] + slot_worst_min
 
+    # ---- score_suffix_ub ---------------------------------------------------
+    # Per-depth upper bound on the linear NON-SP-cap score from remaining
+    # slots. Replaces the OLD per-stat-independent score UB (which allowed a
+    # different ingredient to maximize each stat in the same slot). For each
+    # remaining slot, look up the best-per-eff scalar precomputed across all
+    # ingredients (single-ingredient-per-slot UB) and accumulate.
+    score_suffix_ub[k] = 0.0
+    for d in range(k - 1, -1, -1):
+        eff = meta_void_eff[d]
+        e_idx = -1
+        for j in range(distinct_effs.shape[0]):
+            if distinct_effs[j] == eff:
+                e_idx = j
+                break
+        # Caller guarantees distinct_effs covers every eff in meta_void_eff;
+        # if not, e_idx stays -1 and we'd index out of bounds — that's a bug
+        # in the caller, not something to silently paper over.
+        score_suffix_ub[d] = slot_best_per_eff[e_idx] + score_suffix_ub[d + 1]
+
 
 # ============================================================
 # DFS (numba)
@@ -897,6 +1050,7 @@ def dfs(
     deps_hi,
     useful_pos_eff,
     useful_neg_eff,
+    score_suffix_ub,
 ):
     # Leaf
     if depth == k:
@@ -1063,10 +1217,15 @@ def dfs(
         #   1. Hard feasibility — if even the best-possible suffix can't make
         #      max_v ≥ min_vals (or worst-possible suffix can't keep min_v ≤
         #      max_vals), the entire subtree is infeasible and we skip it
-        #      without bothering with composite UB or recursion. The leaf-only
-        #      check used to catch this much later.
-        #   2. UB score — same as before, optimistic per-stat upper bound on
-        #      the final weighted score.
+        #      without bothering with composite UB or recursion.
+        #   2. UB score — hybrid:
+        #       a. Non-SP-cap linear stats: add CURRENT contribution here;
+        #          future contribution comes from score_suffix_ub[next_depth]
+        #          below (precomputed single-ingredient-per-slot UB, which is
+        #          tighter than summing per-stat-independent best contributions).
+        #       b. SP-cap-aware stats: keep the OLD per-state UB (clamp depends
+        #          on the build's req allocation, which varies per DFS state —
+        #          per-slot widest/narrowest cap would be sound but k× loose).
         ub_score = 0.0
         S = len(current_min)
         feasible = True
@@ -1086,40 +1245,49 @@ def dfs(
                 break
 
             w = weights[s]
-            if w != 0.0:
+            if w == 0.0:
+                continue
+
+            if sp_score_active[s]:
+                # SP-cap-aware UB (OLD). To bound the cap conservatively in
+                # the right direction:
+                #   w>0 → max useful → SMALLEST possible req across all future
+                #         ingredient choices → WIDEST cap.
+                #   w<0 → min useful (max |w|*useful) → LARGEST possible req →
+                #         most-negative lo_cap.
                 if w > 0.0:
                     u_max = cmax + f_max_ub
                     u_min = cmin + f_min_ub
                 else:
                     u_max = cmax + f_max_lb
                     u_min = cmin + f_min_lb
-                if sp_score_active[s]:
-                    # SP-cap-aware UB. To bound the cap conservatively in the
-                    # right direction:
-                    #   w>0 → max useful → use the SMALLEST possible req across
-                    #     all future ingredient choices and rolls.
-                    #   w<0 → min useful (max |w|*useful) → use the LARGEST.
-                    ctx_b = sp_score_ctx[s]
-                    rb = sp_score_req_base[s]
-                    ri = sp_score_req_idx[s]
-                    if w > 0.0:
-                        if ri >= 0:
-                            req_eff = current_min[ri] + future_min_lb[next_depth, ri]
-                        else:
-                            req_eff = 0
+                ctx_b = sp_score_ctx[s]
+                rb = sp_score_req_base[s]
+                ri = sp_score_req_idx[s]
+                if w > 0.0:
+                    if ri >= 0:
+                        req_eff = current_min[ri] + future_min_lb[next_depth, ri]
                     else:
-                        if ri >= 0:
-                            req_eff = current_max[ri] + future_max_ub[next_depth, ri]
-                        else:
-                            req_eff = 0
-                    if rb > req_eff: req_eff = rb
-                    hi_cap = SKP_MAX - ctx_b - req_eff
-                    lo_cap = -ctx_b - req_eff
-                    if u_max > hi_cap: u_max = hi_cap
-                    if u_max < lo_cap: u_max = lo_cap
-                    if u_min > hi_cap: u_min = hi_cap
-                    if u_min < lo_cap: u_min = lo_cap
+                        req_eff = 0
+                else:
+                    if ri >= 0:
+                        req_eff = current_max[ri] + future_max_ub[next_depth, ri]
+                    else:
+                        req_eff = 0
+                if rb > req_eff: req_eff = rb
+                hi_cap = SKP_MAX - ctx_b - req_eff
+                lo_cap = -ctx_b - req_eff
+                if u_max > hi_cap: u_max = hi_cap
+                if u_max < lo_cap: u_max = lo_cap
+                if u_min > hi_cap: u_min = hi_cap
+                if u_min < lo_cap: u_min = lo_cap
                 ub_score += w * (u_max * 0.99 + u_min * 0.01)
+            else:
+                # Non-SP linear stat (NEW bound): contribute the CURRENT state
+                # here; the future contribution comes from score_suffix_ub
+                # added once after the loop. Together they form a tight
+                # single-ingredient-per-slot UB.
+                ub_score += w * (cmax * 0.99 + cmin * 0.01)
 
         if not feasible:
             # Undo and skip — entire subtree can't satisfy hard constraints.
@@ -1136,6 +1304,11 @@ def dfs(
                         current_min[s] -= (db_stat_max[i, s] * eff + ro) // 100
                         current_max[s] -= (db_stat_min[i, s] * eff + ro) // 100
             continue
+
+        # Add the NEW per-slot-best-ingredient suffix UB for non-SP linear
+        # stats. Composite-stat UB is added below using the per-stat
+        # future_*_ub/lb arrays (unchanged).
+        ub_score += score_suffix_ub[next_depth]
 
         # Composite UB: per-formula admissible bound on the final comp value,
         # using the (current_*[s] + future_*_*[next_depth, s]) range for each dep.
@@ -1314,6 +1487,7 @@ def dfs(
             deps_hi,
             useful_pos_eff,
             useful_neg_eff,
+            score_suffix_ub,
         )
 
         # Undo
@@ -1381,6 +1555,16 @@ def _search_meta_batch_k1(
     # Shared best score across prange m's; racy but benign (see search_meta_batch).
     shared_best = np.array([init_best_score], dtype=np.float64)
 
+    # Per-(ingredient, eff sign) usefulness bitmask. Same precompute as the
+    # k>=3 paths — skips ingredients that can't affect ANY active stat or
+    # composite at this slot's eff sign. Sound (only drops if STRICTLY useless).
+    useful_pos_eff, useful_neg_eff = _compute_useful_masks(
+        db_stat_min, db_stat_max,
+        has_min_mask, has_max_mask, weights,
+        comp_count, comp_formula, comp_dep_offset, comp_dep_count,
+        comp_dep_indices, comp_weight, comp_has_min, comp_has_max,
+    )
+
     # Pre-allocate per-m scratch (final_min/max, deps_lo/hi). Each row is at
     # least 64 bytes so adjacent m's don't false-share.
     final_buf = np.empty((M, 2, S), dtype=np.int32)
@@ -1389,6 +1573,10 @@ def _search_meta_batch_k1(
     for m in prange(M):
         eff = void_eff_matrix[m, 0]
         eff_pos = eff >= 0
+        # Mask convention matches the DFS: useful_pos_eff for eff > 0,
+        # useful_neg_eff otherwise (eff == 0 ingredients contribute nothing
+        # anyway, so the mask choice is irrelevant for that case).
+        eff_strictly_pos = eff > 0
         sb_val = shared_best[0]
         local_best = init_best_score
         if sb_val > local_best:
@@ -1404,6 +1592,15 @@ def _search_meta_batch_k1(
         deps_hi = deps_buf[m, 1]
 
         for i in range(db_count):
+
+            # Per-(ingredient, eff sign) usefulness gate — skip strictly useless.
+            if eff_strictly_pos:
+                if not useful_pos_eff[i]:
+                    continue
+            else:
+                if not useful_neg_eff[i]:
+                    continue
+
             feasible = True
             score = 0.0
             for s in range(S):
@@ -1603,6 +1800,26 @@ def _search_meta_batch_k2(
     # Shared best score across prange m's; racy but benign (see search_meta_batch).
     shared_best = np.array([init_best_score], dtype=np.float64)
 
+    # Per-(ingredient, eff sign) usefulness bitmask — same precompute as
+    # k>=3. Skips ingredients that can't affect ANY active stat / composite
+    # at this slot's eff sign.
+    useful_pos_eff, useful_neg_eff = _compute_useful_masks(
+        db_stat_min, db_stat_max,
+        has_min_mask, has_max_mask, weights,
+        comp_count, comp_formula, comp_dep_offset, comp_dep_count,
+        comp_dep_indices, comp_weight, comp_has_min, comp_has_max,
+    )
+
+    # Score-aware UB precompute (NEW): per-eff best-single-ingredient linear
+    # score contribution (non-SP). Used to bound slot 1's contribution after
+    # placing i0 — replaces the per-stat-independent slot1_best/worst score
+    # accumulation (which let a different ingredient maximize each stat).
+    distinct_effs = np.unique(void_eff_matrix.ravel()).astype(np.int32)
+    slot_best_per_eff = _compute_slot_best_per_eff(
+        db_stat_min, db_stat_max, distinct_effs,
+        weights, sp_score_active, round_offset, dura_idx,
+    )
+
     # Pre-allocate slot-1 bounds buffers (4×S int32 per m; ~144 bytes for S=9,
     # well above 64-byte cache lines so adjacent m rows don't share lines).
     slot1_buf = np.empty((M, 4, S), dtype=np.int32)
@@ -1616,6 +1833,10 @@ def _search_meta_batch_k2(
         eff1 = void_eff_matrix[m, 1]
         eff0_pos = eff0 >= 0
         eff1_pos = eff1 >= 0
+        # Mask convention matches the DFS: useful_pos_eff for eff > 0,
+        # useful_neg_eff otherwise.
+        eff0_strictly_pos = eff0 > 0
+        eff1_strictly_pos = eff1 > 0
         same_eff = (eff0 == eff1)
 
         # ---- Precompute slot-1 per-stat bounds (one-time O(N*S) per m).
@@ -1680,6 +1901,15 @@ def _search_meta_batch_k2(
         local_best_i1 = -1
         local_searched = 0
 
+        # Lookup eff1's best-single-ingredient linear score contribution for
+        # the NEW score UB. eff1 is fixed for this m, so the lookup is once.
+        eff1_idx = -1
+        for j in range(distinct_effs.shape[0]):
+            if distinct_effs[j] == eff1:
+                eff1_idx = j
+                break
+        slot1_score_ub_non_sp = slot_best_per_eff[eff1_idx]
+
         # Per-i0 after-state, needed again for composite UB.
         after_min_arr = state_buf[m, 0]
         after_max_arr = state_buf[m, 1]
@@ -1691,8 +1921,20 @@ def _search_meta_batch_k2(
         deps_hi = deps_buf[m, 1]
 
         for i0 in range(db_count):
+
+            # Per-(ingredient, eff sign) usefulness gate for slot 0.
+            if eff0_strictly_pos:
+                if not useful_pos_eff[i0]:
+                    continue
+            else:
+                if not useful_neg_eff[i0]:
+                    continue
+
             # Apply i0: running state after placing first ingredient.
-            # Compute UB on final score assuming slot 1 takes the best-possible ingredient.
+            # Compute UB on final score assuming slot 1 takes the best-possible
+            # ingredient. Hybrid: non-SP linear stats use the NEW
+            # slot1_score_ub_non_sp scalar (single-ingredient-per-slot bound),
+            # SP stats keep the per-state SP-cap UB.
             ub_score = 0.0
             for s in range(S):
                 if s == dura_idx:
@@ -1711,51 +1953,55 @@ def _search_meta_batch_k2(
                 after_max_arr[s] = after_max
 
                 w = weights[s]
-                if w != 0.0:
+                if w == 0.0:
+                    continue
+
+                if sp_score_active[s]:
                     if w > 0.0:
                         u_max = after_max + slot1_best_max[s]
                         u_min = after_min + slot1_best_min[s]
                     else:
                         u_max = after_max + slot1_worst_max[s]
                         u_min = after_min + slot1_worst_min[s]
-                    if sp_score_active[s]:
-                        # SP-cap-aware UB. Need bounds on the OTHER slot's
-                        # contribution to req. We don't have after_*[ri] yet
-                        # (the loop just stores `after_*` for stat s), but
-                        # base + db slot0's contribution is known. For slot 1,
-                        # use slot1_best/worst on the req. For w>0 (max useful):
-                        # use the SMALLEST possible req at slot 1; for w<0:
-                        # use the LARGEST. Recompute slot 0's req inline.
-                        ctx_b = sp_score_ctx[s]
-                        rb = sp_score_req_base[s]
-                        ri = sp_score_req_idx[s]
-                        if ri >= 0:
-                            # Slot-0 (i0) contribution to req at this m.
-                            if ri == dura_idx:
-                                req_after_min = base_min_matrix[m, ri] + db_stat_min[i0, ri]
-                                req_after_max = base_max_matrix[m, ri] + db_stat_max[i0, ri]
-                            else:
-                                ro_r = round_offset[ri]
-                                if eff0_pos:
-                                    req_after_min = base_min_matrix[m, ri] + (db_stat_min[i0, ri] * eff0 + ro_r) // 100
-                                    req_after_max = base_max_matrix[m, ri] + (db_stat_max[i0, ri] * eff0 + ro_r) // 100
-                                else:
-                                    req_after_min = base_min_matrix[m, ri] + (db_stat_max[i0, ri] * eff0 + ro_r) // 100
-                                    req_after_max = base_max_matrix[m, ri] + (db_stat_min[i0, ri] * eff0 + ro_r) // 100
-                            if w > 0.0:
-                                req_eff = req_after_min + slot1_worst_min[ri]
-                            else:
-                                req_eff = req_after_max + slot1_best_max[ri]
+                    # SP-cap-aware UB (OLD, per-state).
+                    ctx_b = sp_score_ctx[s]
+                    rb = sp_score_req_base[s]
+                    ri = sp_score_req_idx[s]
+                    if ri >= 0:
+                        # Slot-0 (i0) contribution to req at this m.
+                        if ri == dura_idx:
+                            req_after_min = base_min_matrix[m, ri] + db_stat_min[i0, ri]
+                            req_after_max = base_max_matrix[m, ri] + db_stat_max[i0, ri]
                         else:
-                            req_eff = 0
-                        if rb > req_eff: req_eff = rb
-                        hi_cap = SKP_MAX - ctx_b - req_eff
-                        lo_cap = -ctx_b - req_eff
-                        if u_max > hi_cap: u_max = hi_cap
-                        if u_max < lo_cap: u_max = lo_cap
-                        if u_min > hi_cap: u_min = hi_cap
-                        if u_min < lo_cap: u_min = lo_cap
+                            ro_r = round_offset[ri]
+                            if eff0_pos:
+                                req_after_min = base_min_matrix[m, ri] + (db_stat_min[i0, ri] * eff0 + ro_r) // 100
+                                req_after_max = base_max_matrix[m, ri] + (db_stat_max[i0, ri] * eff0 + ro_r) // 100
+                            else:
+                                req_after_min = base_min_matrix[m, ri] + (db_stat_max[i0, ri] * eff0 + ro_r) // 100
+                                req_after_max = base_max_matrix[m, ri] + (db_stat_min[i0, ri] * eff0 + ro_r) // 100
+                        if w > 0.0:
+                            req_eff = req_after_min + slot1_worst_min[ri]
+                        else:
+                            req_eff = req_after_max + slot1_best_max[ri]
+                    else:
+                        req_eff = 0
+                    if rb > req_eff: req_eff = rb
+                    hi_cap = SKP_MAX - ctx_b - req_eff
+                    lo_cap = -ctx_b - req_eff
+                    if u_max > hi_cap: u_max = hi_cap
+                    if u_max < lo_cap: u_max = lo_cap
+                    if u_min > hi_cap: u_min = hi_cap
+                    if u_min < lo_cap: u_min = lo_cap
                     ub_score += w * (u_max * 0.99 + u_min * 0.01)
+                else:
+                    # Non-SP linear (NEW): contribute current state here; the
+                    # slot-1 contribution is added once below via
+                    # slot1_score_ub_non_sp.
+                    ub_score += w * (after_max * 0.99 + after_min * 0.01)
+
+            # NEW: slot-1 non-SP linear UB (single-ingredient-per-slot).
+            ub_score += slot1_score_ub_non_sp
 
             # Composite UB: per-formula bound on [after_* + slot1_{worst,best}_*] rectangle.
             for c in range(comp_count):
@@ -1864,6 +2110,15 @@ def _search_meta_batch_k2(
             # i1 loop — eff == eff constraint drops permutation duplicates.
             start_i1 = i0 if same_eff else 0
             for i1 in range(start_i1, db_count):
+
+                # Per-(ingredient, eff sign) usefulness gate for slot 1.
+                if eff1_strictly_pos:
+                    if not useful_pos_eff[i1]:
+                        continue
+                else:
+                    if not useful_neg_eff[i1]:
+                        continue
+
                 feasible = True
                 score = 0.0
                 for s in range(S):
@@ -2095,8 +2350,21 @@ def search_meta_batch(
     # Per-(ingredient, eff sign) "useful" bitmask. Doesn't depend on m or
     # depth — same for every DFS call in this batch.
     useful_pos_eff, useful_neg_eff = _compute_useful_masks(
-        db_contrib_pos_mask, db_contrib_neg_mask,
-        has_min_mask, has_max_mask, pos_weight_mask, neg_weight_mask,
+        db_stat_min, db_stat_max,
+        has_min_mask, has_max_mask, weights,
+        comp_count, comp_formula, comp_dep_offset, comp_dep_count,
+        comp_dep_indices, comp_weight, comp_has_min, comp_has_max,
+    )
+
+    # Score-aware UB precompute: enumerate distinct slot effs across all
+    # rows and, for each, the score contribution of the best single
+    # ingredient. Lets the per-m precompute below build a tight suffix UB
+    # in O(k) per row instead of recomputing the per-ingredient max for
+    # every (m, d).
+    distinct_effs = np.unique(void_eff_matrix.ravel()).astype(np.int32)
+    slot_best_per_eff = _compute_slot_best_per_eff(
+        db_stat_min, db_stat_max, distinct_effs,
+        weights, sp_score_active, round_offset, dura_idx,
     )
 
     # Pre-allocate the bounds tensor (single big alloc instead of M×4 small
@@ -2104,6 +2372,9 @@ def search_meta_batch(
     # — well above 64-byte cache lines, so adjacent m's land on distinct lines
     # and false-sharing is not a concern.
     bounds_buf = np.zeros((M, 4, k + 1, S), dtype=np.int32)
+    # Per-m, per-depth NEW score UB suffix (non-SP linear). One float per
+    # depth, much smaller than bounds_buf.
+    score_suffix_buf = np.zeros((M, k + 1), dtype=np.float64)
 
     for m in prange(M):
         ingredients = np.zeros(k, dtype=np.int32)
@@ -2122,9 +2393,11 @@ def search_meta_batch(
         future_min_ub = bounds_buf[m, 1]
         future_max_lb = bounds_buf[m, 2]
         future_min_lb = bounds_buf[m, 3]
+        score_suffix_ub = score_suffix_buf[m]
         _precompute_bounds(
             db_stat_min, db_stat_max, void_eff_matrix[m], k, dura_idx, round_offset,
             future_max_ub, future_min_ub, future_max_lb, future_min_lb,
+            distinct_effs, slot_best_per_eff, score_suffix_ub,
         )
 
         # Spell-eval scratch reused across every spell helper call inside
@@ -2180,6 +2453,7 @@ def search_meta_batch(
             deps_hi,
             useful_pos_eff,
             useful_neg_eff,
+            score_suffix_ub,
         )
 
         if best_score_ref[0] > seed_score:
@@ -2278,14 +2552,24 @@ def search_meta_batch_v2(
 
     # Per-(ingredient, eff sign) "useful" bitmask — same precompute as v1.
     useful_pos_eff, useful_neg_eff = _compute_useful_masks(
-        db_contrib_pos_mask, db_contrib_neg_mask,
-        has_min_mask, has_max_mask, pos_weight_mask, neg_weight_mask,
+        db_stat_min, db_stat_max,
+        has_min_mask, has_max_mask, weights,
+        comp_count, comp_formula, comp_dep_offset, comp_dep_count,
+        comp_dep_indices, comp_weight, comp_has_min, comp_has_max,
+    )
+
+    # Score-aware UB precompute (NEW). See the v1 sibling for the rationale.
+    distinct_effs = np.unique(void_eff_matrix.ravel()).astype(np.int32)
+    slot_best_per_eff = _compute_slot_best_per_eff(
+        db_stat_min, db_stat_max, distinct_effs,
+        weights, sp_score_active, round_offset, dura_idx,
     )
 
     # Pre-allocate the bounds tensor once. Phase 1 fills bounds_buf[m] in a
     # parallel m-loop; Phase 2's (m, i_0) workers all read bounds_buf[m] but
     # only the slice for their m, so no false-sharing concerns.
     bounds_buf = np.zeros((M, 4, k + 1, S), dtype=np.int32)
+    score_suffix_buf = np.zeros((M, k + 1), dtype=np.float64)
 
     # Phase 1: precompute bounds for each m.
     for m in prange(M):
@@ -2293,9 +2577,11 @@ def search_meta_batch_v2(
         future_min_ub_m = bounds_buf[m, 1]
         future_max_lb_m = bounds_buf[m, 2]
         future_min_lb_m = bounds_buf[m, 3]
+        score_suffix_m = score_suffix_buf[m]
         _precompute_bounds(
             db_stat_min, db_stat_max, void_eff_matrix[m], k, dura_idx, round_offset,
             future_max_ub_m, future_min_ub_m, future_max_lb_m, future_min_lb_m,
+            distinct_effs, slot_best_per_eff, score_suffix_m,
         )
 
     # Phase 2: (m, i_0) parallel DFS.
@@ -2322,6 +2608,7 @@ def search_meta_batch_v2(
         future_min_ub = bounds_buf[m, 1]
         future_max_lb = bounds_buf[m, 2]
         future_min_lb = bounds_buf[m, 3]
+        score_suffix_ub = score_suffix_buf[m]
 
         deps_lo = np.empty(36, dtype=np.float64)
         deps_hi = np.empty(36, dtype=np.float64)
@@ -2363,14 +2650,14 @@ def search_meta_batch_v2(
 
         # UB check at depth 1 (next_depth = 1) — fused with hard feasibility
         # so we skip the (composite UB + recurse) work for infeasible builds.
+        # Hybrid bound: non-SP linear stats use the score_suffix_ub precompute
+        # (single-ingredient-per-slot), SP stats keep the per-state SP-cap UB.
         ub_score = 0.0
         feasible = True
         for s in range(S):
             cmax = current_max[s]
             cmin = current_min[s]
             f_max_ub = future_max_ub[1, s]
-            f_min_ub = future_min_ub[1, s]
-            f_max_lb = future_max_lb[1, s]
             f_min_lb = future_min_lb[1, s]
 
             if has_min_mask[s] and cmax + f_max_ub < min_vals[s]:
@@ -2381,41 +2668,49 @@ def search_meta_batch_v2(
                 break
 
             w = weights[s]
-            if w != 0.0:
+            if w == 0.0:
+                continue
+
+            if sp_score_active[s]:
+                f_min_ub = future_min_ub[1, s]
+                f_max_lb = future_max_lb[1, s]
                 if w > 0.0:
                     u_max = cmax + f_max_ub
                     u_min = cmin + f_min_ub
                 else:
                     u_max = cmax + f_max_lb
                     u_min = cmin + f_min_lb
-                if sp_score_active[s]:
-                    # SP-cap-aware UB at depth 1 — same logic as the dfs UB,
-                    # but with the literal `1` (we're past slot 0, looking at
-                    # the suffix from slot 1 onward).
-                    ctx_b = sp_score_ctx[s]
-                    rb = sp_score_req_base[s]
-                    ri = sp_score_req_idx[s]
-                    if w > 0.0:
-                        if ri >= 0:
-                            req_eff = current_min[ri] + future_min_lb[1, ri]
-                        else:
-                            req_eff = 0
+                ctx_b = sp_score_ctx[s]
+                rb = sp_score_req_base[s]
+                ri = sp_score_req_idx[s]
+                if w > 0.0:
+                    if ri >= 0:
+                        req_eff = current_min[ri] + future_min_lb[1, ri]
                     else:
-                        if ri >= 0:
-                            req_eff = current_max[ri] + future_max_ub[1, ri]
-                        else:
-                            req_eff = 0
-                    if rb > req_eff: req_eff = rb
-                    hi_cap = SKP_MAX - ctx_b - req_eff
-                    lo_cap = -ctx_b - req_eff
-                    if u_max > hi_cap: u_max = hi_cap
-                    if u_max < lo_cap: u_max = lo_cap
-                    if u_min > hi_cap: u_min = hi_cap
-                    if u_min < lo_cap: u_min = lo_cap
+                        req_eff = 0
+                else:
+                    if ri >= 0:
+                        req_eff = current_max[ri] + future_max_ub[1, ri]
+                    else:
+                        req_eff = 0
+                if rb > req_eff: req_eff = rb
+                hi_cap = SKP_MAX - ctx_b - req_eff
+                lo_cap = -ctx_b - req_eff
+                if u_max > hi_cap: u_max = hi_cap
+                if u_max < lo_cap: u_max = lo_cap
+                if u_min > hi_cap: u_min = hi_cap
+                if u_min < lo_cap: u_min = lo_cap
                 ub_score += w * (u_max * 0.99 + u_min * 0.01)
+            else:
+                # Non-SP linear: current contribution here; the suffix is
+                # added once after the loop.
+                ub_score += w * (cmax * 0.99 + cmin * 0.01)
 
         if not feasible:
             continue
+
+        # NEW per-slot-best-ingredient suffix UB for non-SP linear stats.
+        ub_score += score_suffix_ub[1]
 
         # Composite UB at depth 1 (mirrors the dfs composite UB block)
         for c in range(comp_count):
@@ -2577,6 +2872,7 @@ def search_meta_batch_v2(
             deps_hi,
             useful_pos_eff,
             useful_neg_eff,
+            score_suffix_ub,
         )
 
         # No undo of i_0 needed — current_min/max are this iteration's local copies.
