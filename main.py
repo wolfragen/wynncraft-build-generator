@@ -15,6 +15,57 @@ from time import time
 import cProfile
 import pstats
 
+# w7w7w7 Revolution
+
+dps = 792
+pctW = 1000
+def raw(pct, dps=dps) : return 10*pct/dps 
+def is_null(val, epsilon=0.6) : return abs(val) < epsilon
+
+nScale = 0.75
+eScale = 0
+tScale = 0
+wScale = 0.25
+fScale = 0
+aScale = 0
+
+nDmgWeaponMin = 0
+nDmgWeaponMax = 0
+eDmgWeaponMin = 210
+eDmgWeaponMax = 250
+tDmgWeaponMin = 0
+tDmgWeaponMax = 0
+wDmgWeaponMin = 403
+wDmgWeaponMax = 585
+fDmgWeaponMin = 0
+fDmgWeaponMax = 0
+aDmgWeaponMin = 160
+aDmgWeaponMax = 300
+
+nWeaponAvg = nDmgWeaponMin + ((nDmgWeaponMax - nDmgWeaponMin) / 2)
+eWeaponAvg = eDmgWeaponMin + ((eDmgWeaponMax - eDmgWeaponMin) / 2)
+tWeaponAvg = tDmgWeaponMin + ((tDmgWeaponMax - tDmgWeaponMin) / 2)
+wWeaponAvg = wDmgWeaponMin + ((wDmgWeaponMax - wDmgWeaponMin) / 2)
+fWeaponAvg = fDmgWeaponMin + ((fDmgWeaponMax - fDmgWeaponMin) / 2)
+aWeaponAvg = aDmgWeaponMin + ((aDmgWeaponMax - aDmgWeaponMin) / 2)
+
+nDmg = nWeaponAvg * nScale
+eDmg = eWeaponAvg * nScale + nWeaponAvg * eScale + eWeaponAvg * eScale + tWeaponAvg * eScale + wWeaponAvg * eScale + fWeaponAvg * eScale + aWeaponAvg * eScale
+tDmg = tWeaponAvg * nScale + nWeaponAvg * tScale + eWeaponAvg * tScale + tWeaponAvg * tScale + wWeaponAvg * tScale + fWeaponAvg * tScale + aWeaponAvg * tScale
+wDmg = wWeaponAvg * nScale + nWeaponAvg * wScale + eWeaponAvg * wScale + tWeaponAvg * wScale + wWeaponAvg * wScale + fWeaponAvg * wScale + aWeaponAvg * wScale
+fDmg = fWeaponAvg * nScale + nWeaponAvg * fScale + eWeaponAvg * fScale + tWeaponAvg * fScale + wWeaponAvg * fScale + fWeaponAvg * fScale + aWeaponAvg * fScale
+aDmg = aWeaponAvg * nScale + nWeaponAvg * aScale + eWeaponAvg * aScale + tWeaponAvg * aScale + wWeaponAvg * aScale + fWeaponAvg * aScale + aWeaponAvg * aScale
+
+totalDmg = nDmg + eDmg + tDmg + wDmg + fDmg + aDmg
+if (totalDmg == 0):
+    totalScale = 1
+nWeight = pctW * nDmg / totalDmg
+eWeight = pctW * eDmg / totalDmg
+tWeight = pctW * tDmg / totalDmg
+wWeight = pctW * wDmg / totalDmg
+fWeight = pctW * fDmg / totalDmg
+aWeight = pctW * aDmg / totalDmg
+
 
 
 def main():
@@ -28,13 +79,85 @@ def main():
     ingredients_raw = load_ingredients("data/ingreds_compress.json")
 
     # ---------- Build User Query ----------
+
     user_query = {
-        "intReq":        {"ingredient_filter": True, "weight": 100000},
-        "durability": {"min": 60, "weight": 1},
+        # ===== General Damage =====
+        "damPct":   {"ingredient_filter": False if is_null(pctW) else True, "weight": pctW},
+        "damRaw":   {"ingredient_filter": False if is_null(pctW) else True, "weight": raw(pctW)},
+        "sdPct":    {"ingredient_filter": False if is_null(pctW) else True, "weight": pctW},
+        "sdRaw":    {"ingredient_filter": False if is_null(pctW) else True, "weight": raw(pctW)},
+
+        # ===== Neutral =====
+        "nDamPct":  {"ingredient_filter": False if is_null(nWeight) else True, "weight": nWeight},
+        "nDamRaw":  {"ingredient_filter": False if is_null(nWeight) else True, "weight": raw(nWeight)},
+
+        # ===== Earth =====
+        "eDamPct":  {"ingredient_filter": False if is_null(eWeight) else True, "weight": eWeight},
+        "eDamRaw":  {"ingredient_filter": False if is_null(eWeight) else True, "weight": raw(eWeight)},
+        "eSdPct":   {"ingredient_filter": False if is_null(eWeight) else True, "weight": eWeight},
+        "eSdRaw":   {"ingredient_filter": False if is_null(eWeight) else True, "weight": raw(eWeight)},
+
+        # ===== Thunder =====
+        "tDamPct":  {"ingredient_filter": False if is_null(tWeight) else True, "weight": tWeight},
+        "tDamRaw":  {"ingredient_filter": False if is_null(tWeight) else True, "weight": raw(tWeight)},
+        "tSdPct":   {"ingredient_filter": False if is_null(tWeight) else True, "weight": tWeight},
+        "tSdRaw":   {"ingredient_filter": False if is_null(tWeight) else True, "weight": raw(tWeight)},
+
+        # ===== Water =====
+        "wDamPct":  {"ingredient_filter": False if is_null(wWeight) else True, "weight": wWeight},
+        "wDamRaw":  {"ingredient_filter": False if is_null(wWeight) else True, "weight": raw(wWeight)},
+        "wSdPct":   {"ingredient_filter": False if is_null(wWeight) else True, "weight": wWeight},
+        "wSdRaw":   {"ingredient_filter": False if is_null(wWeight) else True, "weight": raw(wWeight)},
+
+        # ===== Fire =====
+        "fDamPct":  {"ingredient_filter": False if is_null(fWeight) else True, "weight": fWeight},
+        "fDamRaw":  {"ingredient_filter": False if is_null(fWeight) else True, "weight": raw(fWeight)},
+        "fSdPct":   {"ingredient_filter": False if is_null(fWeight) else True, "weight": fWeight},
+        "fSdRaw":   {"ingredient_filter": False if is_null(fWeight) else True, "weight": raw(fWeight)},
+
+        # ===== Air =====
+        "aDamPct":  {"ingredient_filter": False if is_null(aWeight) else True, "weight": aWeight},
+        "aDamRaw":  {"ingredient_filter": False if is_null(aWeight) else True, "weight": raw(aWeight)},
+        "aSdPct":   {"ingredient_filter": False if is_null(aWeight) else True, "weight": aWeight},
+        "aSdRaw":   {"ingredient_filter": False if is_null(aWeight) else True, "weight": raw(aWeight)},
+
+        # ===== Rainbow ===== // BE CAREFUL IF NEUTRAL WEAPON (RARE)
+        "rDamPct":  {"ingredient_filter": False if is_null(pctW) else True, "weight": pctW},
+        "rDamRaw":  {"ingredient_filter": False if is_null(pctW) else True, "weight": raw(pctW)},
+        "rSdPct":   {"ingredient_filter": False if is_null(pctW) else True, "weight": pctW},
+        "rSdRaw":   {"ingredient_filter": False if is_null(pctW) else True, "weight": raw(pctW)},
+
+
+        # ===== Skill points =====
+        #"str": {"min": 0, "weight":1.5*pctW},
+        "dex": {"min": 0, "weight":1.5*pctW},
+        #"int": {"min": 0, "weight":pctW},
+        #"def": {"min": 0, "weight":pctW},
+        "agi": {"min": 0, "weight":pctW},
+
+        # ===== Sustain =====
+        "mr": {"min": 0, "weight":0},
+        "ms": {"min": 0, "weight":0},
+
+        "hpBonus": {"min": 1500, "ingredient_filter":True},
+
+        # ===== Requirements =====
+        "strReq": {"max": 60},
+        "dexReq": {"max": 20},
+        "intReq": {"max": 55},
+        "defReq": {"max": 0},
+        "agiReq": {"max": 65},
+
+        # ===== Usability =====
+        "durability": {"min": 25, "weight": 1},
+        # "duration": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "charges":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
     }
 
     skill = "ARMOURING"
-    item_type = "CHESTPLATE"
+    dico = {"WEAPONSMITHING":"DAGGER", "WOODWORKING":"BOW", "TAILORING":"LEGGINGS", "ARMOURING":"CHESTPLATE", "JEWELING":"RING", "COOKING":"FOOD", "SCRIBING":"SCROLL", "ALCHEMISM":"POTION"}
+    item_type = dico[skill] 
+
     consumable = skill in CONSU_SKILLS
     
     # ---------- Build Query Object ----------
@@ -44,6 +167,7 @@ def main():
         item_type=item_type,
         skill=skill,
         consumable=consumable,
+        fast_cull=True,  # legacy single-representative pareto cull: unsound under inversion (drops valid candidates) but much faster downstream search. Flip to False for the range-aware sound cull.
     )
 
     # ---------- Load recipes (Materials => Stats) ----------
@@ -125,29 +249,3 @@ if __name__ == "__main__":
         main()
     
     print(f"Elapsed time: {time()-start_time:.0f}s")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

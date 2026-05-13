@@ -52,11 +52,20 @@ def _warm_meta_set_loader():
 
 
 def _warm_ingredient_filter():
-    mat = np.zeros((2, 3), dtype=np.int32)
+    mat_min = np.zeros((2, 3), dtype=np.int32)
+    mat_max = np.zeros((2, 3), dtype=np.int32)
     # Comparator bool array is per-column (length = matrix width).
     lower_better = np.zeros(3, dtype=np.bool_)
-    ingf.compare_stat_vectors(mat[0], mat[1], lower_better, -1)
-    ingf.pareto_filter_ingredients(mat, lower_better, -1)
+    # Exact (range-aware) cull — both search_inv branches.
+    for search_inv in (True, False):
+        ingf.compare_stat_vectors(
+            mat_min[0], mat_max[0], mat_min[1], mat_max[1],
+            lower_better, -1, search_inv,
+        )
+        ingf.pareto_filter_ingredients(mat_min, mat_max, lower_better, -1, search_inv)
+    # Legacy fast cull (used when query.fast_cull=True).
+    ingf.compare_stat_vectors_fast(mat_min[0], mat_min[1], lower_better, -1)
+    ingf.pareto_filter_ingredients_fast(mat_min, lower_better, -1)
 
 
 def _warm_search_engine():
