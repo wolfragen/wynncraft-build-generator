@@ -201,6 +201,16 @@ class Query(NamedTuple):
     consumable: bool
     suggested_max_cull: int
 
+    # When True, the ingredient pareto cull uses the legacy single-representative
+    # comparator: each (ingredient, stat) cell stores one "best-roll" value
+    # picked along the user's preferred direction. Faster (fewer surviving
+    # ingredients → smaller search space) but unsound under
+    # `search_for_inversion=True`, where slot eff can flip the sign of every
+    # contribution and the "other" bound becomes load-bearing. The default
+    # (False) uses range-containment dominance, which is correct in both
+    # inversion modes but more conservative.
+    fast_cull: bool
+
     # Projected-space index of durability (crafted) or duration (consumable).
     # -1 if neither is active — search will abort in that case.
     dura_proj_idx: int
@@ -254,6 +264,7 @@ def build_query(
     item_type: Optional[str] = None,
     skill: Optional[str] = None,
     consumable: bool = False,
+    fast_cull: bool = False,
 ) -> Query:
     """
     Parse user query.
@@ -662,6 +673,7 @@ def build_query(
         round_offset_proj=round_offset_proj,
         consumable=consumable,
         suggested_max_cull=suggested_max_cull,
+        fast_cull=fast_cull,
         dura_proj_idx=dura_proj_idx,
         build_ctx=build_ctx_arr,
         sp_score_active_proj=sp_score_active_proj,

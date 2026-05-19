@@ -129,22 +129,22 @@ def main():
 
 
         # ===== Skill points =====
-        "str": {"min": 0, "weight":1.5*pctW},
+        #"str": {"min": 0, "weight":1.5*pctW},
         "dex": {"min": 0, "weight":1.5*pctW},
         #"int": {"min": 0, "weight":pctW},
         #"def": {"min": 0, "weight":pctW},
         "agi": {"min": 0, "weight":pctW},
 
         # ===== Sustain =====
-        "mr": {"min": 4, "weight":pctW},
-        #"ms": {"min": 0, "weight":pctW},
+        "mr": {"min": 0, "weight":0},
+        "ms": {"min": 0, "weight":0},
 
-        "hpBonus": {"min": 0, "ingredient_filter": False},
+        "hpBonus": {"min": 1500, "ingredient_filter":True},
 
         # ===== Requirements =====
         "strReq": {"max": 60},
         "dexReq": {"max": 20},
-        "intReq": {"max": 80},
+        "intReq": {"max": 55},
         "defReq": {"max": 0},
         "agiReq": {"max": 65},
 
@@ -167,6 +167,7 @@ def main():
         item_type=item_type,
         skill=skill,
         consumable=consumable,
+        fast_cull=True,  # legacy single-representative pareto cull: unsound under inversion (drops valid candidates) but much faster downstream search. Flip to False for the range-aware sound cull.
     )
 
     # ---------- Load recipes (Materials => Stats) ----------
@@ -248,29 +249,3 @@ if __name__ == "__main__":
         main()
     
     print(f"Elapsed time: {time()-start_time:.0f}s")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
