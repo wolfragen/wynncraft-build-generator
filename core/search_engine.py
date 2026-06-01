@@ -19,6 +19,11 @@ from data.skillpoint_lookup import (
 )
 from data.spells import SPELL_MULTS, SPELL_USE_SPELL, SPELL_IGNORE_SPEED, SPELL_TOTAL_CONVERT
 
+# Reused by the optional `full_meta` pass to recompute effectiveness + stats of
+# a complete 6-meta-ingredient grid exactly the way the precalc does (so the
+# generated 6-sets are represented identically to the precomputed META rows).
+from precalc_fast import _grid_kernel, _TARGETS, _COUNTS
+
 # Numba captures module-level numpy arrays as constants (read-only refs); the
 # table is precomputed once at import time and never mutated, so this is safe
 # even with cache=True.
@@ -3087,6 +3092,306 @@ def search(all_meta_sets, db, query):
 
 
 # ============================================================
+# Optional "full meta" pass — complete 6-meta-ingredient builds
+# ============================================================
+# The normal pipeline searches META_1..5 (n fixed meta ingredients + ≥1 void
+# slot filled by a normal ingredient). It therefore can NEVER produce a build
+# whose 6 slots are ALL meta ingredients (a "META_6"), because a 6th meta
+# ingredient cannot go in a void slot — its posMods reshape its neighbours'
+# effectiveness, which the precomputed META rows don't model.
+#
+# This pass reconstructs those builds soundly: it takes the surviving META_5
+# rows (5 fixed meta ingredients + 1 void) and, for each, drops every meta
+# ingredient into the void slot, RECOMPUTING the full grid (all six slots'
+# effectiveness and all stats) from scratch via the precalc `_grid_kernel`.
+# Using the surviving (culled) META_5 rows is enough to reach every optimal
+# 6-set whose best 5-ingredient base survived the META_5 cull; the count of
+# evaluated 6-sets and the wall-clock are logged so the trade-off is visible.
+
+
+@njit(cache=True)
+def _gen_full_meta_batch(
+    grids5,            # (R, 6) int32 — FILTERED ingredient index per slot, void slot = -1
+    void_slot,         # (R,) int32 — which slot is the void (gets the 6th meta ingredient)
+    F,                 # number of meta ingredients
+    ing_pos_mods, ing_ingred_eff, ing_stat_idx, ing_stat_min, ing_stat_max,
+    ing_stat_scalable, ing_stat_count, TARGETS, COUNTS, G,
+    out_eff,           # (R*F, 6) int32   — per-slot eff of each generated 6-set
+    out_stat_min,      # (R*F, G) int32   — global-stat-indexed totals (OLD eff convention)
+    out_stat_max,      # (R*F, G) int32
+    out_ings_fidx,     # (R*F, 6) int32   — filtered ingredient index per slot
+):
+    """Generate every (surviving 5-set) × (meta ingredient in the void slot)
+    6-set, recomputing effs + stats per grid. Output rows are laid out as
+    row = r*F + x. Returns the number of rows written (== R*F)."""
+    R = grids5.shape[0]
+    keys = np.empty(G, dtype=np.int32)     # scratch for _grid_kernel
+    seen = np.empty(G, dtype=np.bool_)     # scratch for _grid_kernel
+    grid = np.empty(6, dtype=np.int32)
+    row = 0
+    for r in range(R):
+        v = void_slot[r]
+        for s in range(6):
+            grid[s] = grids5[r, s]
+        for x in range(F):
+            grid[v] = x
+            _grid_kernel(
+                grid, ing_pos_mods, ing_ingred_eff, ing_stat_idx,
+                ing_stat_min, ing_stat_max, ing_stat_scalable, ing_stat_count,
+                TARGETS, COUNTS, G,
+                out_eff[row], keys, out_stat_min[row], out_stat_max[row], seen,
+            )
+            for s in range(6):
+                out_ings_fidx[row, s] = grid[s]
+            row += 1
+    return row
+
+
+@njit(cache=True)
+def _score_full_meta_rows(
+    base_min, base_max,   # (M, S) int32 — complete build's projected reachable min/max
+    has_min_mask, has_max_mask, min_vals, max_vals, weights,
+    sp_score_active, sp_score_ctx, sp_score_req_idx, sp_score_req_base,
+    comp_count, comp_formula, comp_dep_offset, comp_dep_count, comp_dep_indices,
+    comp_min, comp_max, comp_has_min, comp_has_max, comp_weight, build_ctx,
+    deps_lo, deps_hi,
+):
+    """Leaf-score each complete (zero-void) build. Mirrors the `depth == k`
+    leaf block of `dfs` exactly so full-meta scores are directly comparable to
+    the normal search's scores. Returns (best_score, best_row)."""
+    M = base_min.shape[0]
+    S = base_min.shape[1]
+    best_score = -1e30
+    best_row = -1
+
+    for m in range(M):
+        cur_min = base_min[m]
+        cur_max = base_max[m]
+
+        feasible = True
+        score = 0.0
+        for s in range(S):
+            min_v = cur_min[s]
+            max_v = cur_max[s]
+            if has_min_mask[s] and max_v < min_vals[s]:
+                feasible = False
+                break
+            if has_max_mask[s] and min_v > max_vals[s]:
+                feasible = False
+                break
+            sm = max_v
+            sn = min_v
+            if sp_score_active[s]:
+                ctx_b = sp_score_ctx[s]
+                rb = sp_score_req_base[s]
+                ri = sp_score_req_idx[s]
+                if ri >= 0:
+                    req_lo = cur_min[ri]
+                    req_hi = cur_max[ri]
+                else:
+                    req_lo = 0
+                    req_hi = 0
+                if rb > req_lo: req_lo = rb
+                if rb > req_hi: req_hi = rb
+                hi_for_max = SKP_MAX - ctx_b - req_lo
+                lo_for_max = -ctx_b - req_lo
+                hi_for_min = SKP_MAX - ctx_b - req_hi
+                lo_for_min = -ctx_b - req_hi
+                if sm > hi_for_max: sm = hi_for_max
+                if sm < lo_for_max: sm = lo_for_max
+                if sn > hi_for_min: sn = hi_for_min
+                if sn < lo_for_min: sn = lo_for_min
+            score += weights[s] * sm * 0.99
+            score += weights[s] * sn * 0.01
+
+        if not feasible:
+            continue
+
+        ok = True
+        for c in range(comp_count):
+            off = comp_dep_offset[c]
+            f = comp_formula[c]
+            if f == FORMULA_MUL_DIV_100:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
+                cmax = (np.int64(cur_max[a]) * np.int64(cur_max[b])) // 100
+                cmin = (np.int64(cur_min[a]) * np.int64(cur_min[b])) // 100
+            elif f == FORMULA_RAW_TO_PCT:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
+                cmax = _raw_to_pct(cur_max[a], cur_max[b])
+                cmin = _raw_to_pct(cur_min[a], cur_min[b])
+            elif f == FORMULA_EHP:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
+                cc = comp_dep_indices[off + 2]
+                cmin, cmax = _ehp_bounds(
+                    cur_min[a], cur_max[a],
+                    cur_min[b], cur_max[b],
+                    cur_min[cc], cur_max[cc],
+                )
+            elif f == FORMULA_EHPR:
+                a = comp_dep_indices[off]
+                b = comp_dep_indices[off + 1]
+                cc = comp_dep_indices[off + 2]
+                dd = comp_dep_indices[off + 3]
+                cmin, cmax = _ehpr_bounds(
+                    cur_min[a], cur_max[a],
+                    cur_min[b], cur_max[b],
+                    cur_min[cc], cur_max[cc],
+                    cur_min[dd], cur_max[dd],
+                )
+            else:  # spell composite
+                spell_id = f - FORMULA_SPELL_DAMAGE_BASE
+                cmin, cmax = _spell_leaf(
+                    spell_id, off, comp_dep_indices,
+                    cur_min, cur_max, build_ctx,
+                    deps_lo, deps_hi,
+                )
+
+            if comp_has_min[c] and cmax < comp_min[c]:
+                ok = False
+                break
+            if comp_has_max[c] and cmin > comp_max[c]:
+                ok = False
+                break
+            score += comp_weight[c] * (cmax * 0.99 + cmin * 0.01)
+
+        if not ok:
+            continue
+
+        if score > best_score:
+            best_score = score
+            best_row = m
+
+    return best_score, best_row
+
+
+def _search_full_meta(skill, query, recipe, base_path, chunk_rows=4000):
+    """Run the full-meta extension pass. Returns (best_score, best_solution_ids,
+    n_evaluated). `best_solution_ids` is a list of 6 ingredient ids, or None."""
+    import json as _json
+    from precalc_fast import _filter_and_pack
+    from data.meta_set_loader import (
+        _load_cached_arrays, _apply_inversion_correction, _refine_batch,
+    )
+    from data.stats import CONSU_SKILLS
+
+    dura_str = "duration" if skill in CONSU_SKILLS else "durability"
+
+    # Meta-ingredient table — SAME selection criterion the precalc uses to
+    # build the META sets (posMods / ingredEff / charges / +dura), so every
+    # fixed ingredient in a META_5 row is present here.
+    with open("data/ingreds_compress.json", "r", encoding="utf-8") as f:
+        all_ingreds = _json.load(f)
+    arrays = _filter_and_pack(all_ingreds, skill, include_dura=True, dura_str=dura_str)
+    F = arrays.F
+    G = arrays.num_global_stats
+    if F == 0 or G == 0:
+        return -1e18, None, 0
+
+    stat_names_arr = np.array(arrays.stat_names, dtype="U32")
+
+    # id -> filtered index
+    max_id = int(arrays.ing_ids.max())
+    id_to_fidx = np.full(max_id + 1, -1, dtype=np.int32)
+    for f in range(F):
+        id_to_fidx[int(arrays.ing_ids[f])] = f
+
+    # Surviving (culled) META_5 rows: 5 fixed meta ingredients + 1 void slot.
+    ings5, _eff5, _sn5, _smin5, _smax5 = _load_cached_arrays(skill, 5, base_path)
+    R5 = int(ings5.shape[0])
+    if R5 == 0:
+        return -1e18, None, 0
+
+    grids5 = np.full((R5, 6), -1, dtype=np.int32)
+    void_slot = np.zeros(R5, dtype=np.int32)
+    valid = np.ones(R5, dtype=np.bool_)
+    for r in range(R5):
+        vfound = -1
+        for s in range(6):
+            iid = int(ings5[r, s])
+            if iid == -1:
+                vfound = s
+            elif iid <= max_id and id_to_fidx[iid] >= 0:
+                grids5[r, s] = id_to_fidx[iid]
+            else:
+                valid[r] = False
+        if vfound < 0:
+            valid[r] = False
+        void_slot[r] = vfound if vfound >= 0 else 0
+    if not valid.all():
+        keep = np.nonzero(valid)[0]
+        grids5 = np.ascontiguousarray(grids5[keep])
+        void_slot = np.ascontiguousarray(void_slot[keep])
+        R5 = int(grids5.shape[0])
+    if R5 == 0:
+        return -1e18, None, 0
+
+    deps_lo = np.zeros(40, dtype=np.float64)
+    deps_hi = np.zeros(40, dtype=np.float64)
+
+    best_score = -1e30
+    best_sol = None
+    n_eval = 0
+
+    for cstart in range(0, R5, chunk_rows):
+        cend = min(cstart + chunk_rows, R5)
+        Rc = cend - cstart
+        M = Rc * F
+
+        out_eff = np.zeros((M, 6), dtype=np.int32)
+        out_stat_min = np.zeros((M, G), dtype=np.int32)
+        out_stat_max = np.zeros((M, G), dtype=np.int32)
+        out_ings_fidx = np.zeros((M, 6), dtype=np.int32)
+
+        _gen_full_meta_batch(
+            np.ascontiguousarray(grids5[cstart:cend]),
+            np.ascontiguousarray(void_slot[cstart:cend]),
+            F,
+            arrays.ing_pos_mods, arrays.ing_ingred_eff, arrays.ing_stat_idx,
+            arrays.ing_stat_min, arrays.ing_stat_max, arrays.ing_stat_scalable,
+            arrays.ing_stat_count, _TARGETS, _COUNTS, G,
+            out_eff, out_stat_min, out_stat_max, out_ings_fidx,
+        )
+        n_eval += M
+
+        out_ings_ids = arrays.ing_ids[out_ings_fidx].astype(np.int32)
+
+        # Eff-sign-aware correction (matches the cache-build path), then project
+        # into active stat space + apply the recipe shift. void_count == 0.
+        _apply_inversion_correction(
+            out_ings_ids, out_eff, out_stat_min, out_stat_max, stat_names_arr
+        )
+        batch = _refine_batch(
+            out_ings_ids, out_eff, stat_names_arr, out_stat_min, out_stat_max,
+            query, recipe, culling=False,
+        )
+        bm = batch.base_min_matrix
+        bx = batch.base_max_matrix
+        if bm.shape[0] == 0:
+            continue
+
+        score, row = _score_full_meta_rows(
+            bm, bx,
+            query.has_min_mask_proj, query.has_max_mask_proj,
+            query.min_proj, query.max_proj, query.weights_proj,
+            query.sp_score_active_proj, query.sp_score_ctx_proj,
+            query.sp_score_req_idx_proj, query.sp_score_req_base_proj,
+            query.comp_count, query.comp_formula, query.comp_dep_offset,
+            query.comp_dep_count, query.comp_dep_indices,
+            query.comp_min, query.comp_max, query.comp_has_min,
+            query.comp_has_max, query.comp_weight, query.build_ctx,
+            deps_lo, deps_hi,
+        )
+        if row >= 0 and score > best_score:
+            best_score = score
+            best_sol = [int(x) for x in out_ings_ids[row]]
+
+    return best_score, best_sol, n_eval
+
+
+# ============================================================
 # Pipelined load + search (background loader thread)
 # ============================================================
 
@@ -3289,4 +3594,25 @@ def search_pipelined(
             f"    META_{n}: read={rd*1000:.0f}ms prep={pr*1000:.0f}ms "
             f"cull={cu*1000:.0f}ms ({ri:,} -> {ro:,})"
         )
+
+    # ---- optional full-meta pass (complete 6-meta-ingredient builds) ----
+    if getattr(query, "full_meta", False):
+        print()
+        print("[full_meta] extending surviving META_5 rows with every meta ingredient...")
+        t_fm = time()
+        fm_score, fm_sol, fm_count = _search_full_meta(skill, query, recipe, base_path)
+        fm_dt = time() - t_fm
+        print(f"[full_meta] evaluated {fm_count:,} complete 6-meta builds in {fm_dt:.2f}s")
+        if fm_sol is not None:
+            print(f"[full_meta] best full-meta score : {fm_score:.2f}")
+            print(f"[full_meta] normal search score  : {best_score:.2f}")
+            if fm_score > best_score:
+                print(f"[full_meta] >>> full-meta build WINS (+{fm_score - best_score:.2f})")
+                best_score = fm_score
+                best_full_slots = fm_sol
+            else:
+                print("[full_meta] normal search build remains optimal")
+        else:
+            print("[full_meta] no feasible full-meta build found")
+
     return best_full_slots

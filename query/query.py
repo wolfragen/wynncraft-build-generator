@@ -211,6 +211,17 @@ class Query(NamedTuple):
     # inversion modes but more conservative.
     fast_cull: bool
 
+    # When True, after the normal meta-set search the engine runs an EXTRA
+    # "full meta" pass: it takes the surviving META_5 rows (5 fixed meta
+    # ingredients + 1 void slot) and, for each, fills the void slot with every
+    # meta ingredient — producing complete 6-meta-ingredient builds that the
+    # normal pipeline (META_1..5 + normal void-fill) can never reach. Each
+    # generated 6-set has its effectiveness AND stats fully recomputed (the
+    # added ingredient's posMods reshape every neighbour slot). The best
+    # full-meta build is compared against the normal optimum; timing and the
+    # number of 6-sets evaluated are logged. See search_engine._search_full_meta.
+    full_meta: bool
+
     # Projected-space index of durability (crafted) or duration (consumable).
     # -1 if neither is active — search will abort in that case.
     dura_proj_idx: int
@@ -265,6 +276,7 @@ def build_query(
     skill: Optional[str] = None,
     consumable: bool = False,
     fast_cull: bool = False,
+    full_meta: bool = False,
 ) -> Query:
     """
     Parse user query.
@@ -674,6 +686,7 @@ def build_query(
         consumable=consumable,
         suggested_max_cull=suggested_max_cull,
         fast_cull=fast_cull,
+        full_meta=full_meta,
         dura_proj_idx=dura_proj_idx,
         build_ctx=build_ctx_arr,
         sp_score_active_proj=sp_score_active_proj,

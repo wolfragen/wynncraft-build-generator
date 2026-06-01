@@ -81,80 +81,15 @@ def main():
     # ---------- Build User Query ----------
 
     user_query = {
-        # ===== General Damage =====
-        "damPct":   {"ingredient_filter": False if is_null(pctW) else True, "weight": pctW},
-        "damRaw":   {"ingredient_filter": False if is_null(pctW) else True, "weight": raw(pctW)},
-        "sdPct":    {"ingredient_filter": False if is_null(pctW) else True, "weight": pctW},
-        "sdRaw":    {"ingredient_filter": False if is_null(pctW) else True, "weight": raw(pctW)},
-
-        # ===== Neutral =====
-        "nDamPct":  {"ingredient_filter": False if is_null(nWeight) else True, "weight": nWeight},
-        "nDamRaw":  {"ingredient_filter": False if is_null(nWeight) else True, "weight": raw(nWeight)},
-
-        # ===== Earth =====
-        "eDamPct":  {"ingredient_filter": False if is_null(eWeight) else True, "weight": eWeight},
-        "eDamRaw":  {"ingredient_filter": False if is_null(eWeight) else True, "weight": raw(eWeight)},
-        "eSdPct":   {"ingredient_filter": False if is_null(eWeight) else True, "weight": eWeight},
-        "eSdRaw":   {"ingredient_filter": False if is_null(eWeight) else True, "weight": raw(eWeight)},
-
-        # ===== Thunder =====
-        "tDamPct":  {"ingredient_filter": False if is_null(tWeight) else True, "weight": tWeight},
-        "tDamRaw":  {"ingredient_filter": False if is_null(tWeight) else True, "weight": raw(tWeight)},
-        "tSdPct":   {"ingredient_filter": False if is_null(tWeight) else True, "weight": tWeight},
-        "tSdRaw":   {"ingredient_filter": False if is_null(tWeight) else True, "weight": raw(tWeight)},
-
-        # ===== Water =====
-        "wDamPct":  {"ingredient_filter": False if is_null(wWeight) else True, "weight": wWeight},
-        "wDamRaw":  {"ingredient_filter": False if is_null(wWeight) else True, "weight": raw(wWeight)},
-        "wSdPct":   {"ingredient_filter": False if is_null(wWeight) else True, "weight": wWeight},
-        "wSdRaw":   {"ingredient_filter": False if is_null(wWeight) else True, "weight": raw(wWeight)},
-
-        # ===== Fire =====
-        "fDamPct":  {"ingredient_filter": False if is_null(fWeight) else True, "weight": fWeight},
-        "fDamRaw":  {"ingredient_filter": False if is_null(fWeight) else True, "weight": raw(fWeight)},
-        "fSdPct":   {"ingredient_filter": False if is_null(fWeight) else True, "weight": fWeight},
-        "fSdRaw":   {"ingredient_filter": False if is_null(fWeight) else True, "weight": raw(fWeight)},
-
-        # ===== Air =====
-        "aDamPct":  {"ingredient_filter": False if is_null(aWeight) else True, "weight": aWeight},
-        "aDamRaw":  {"ingredient_filter": False if is_null(aWeight) else True, "weight": raw(aWeight)},
-        "aSdPct":   {"ingredient_filter": False if is_null(aWeight) else True, "weight": aWeight},
-        "aSdRaw":   {"ingredient_filter": False if is_null(aWeight) else True, "weight": raw(aWeight)},
-
-        # ===== Rainbow ===== // BE CAREFUL IF NEUTRAL WEAPON (RARE)
-        "rDamPct":  {"ingredient_filter": False if is_null(pctW) else True, "weight": pctW},
-        "rDamRaw":  {"ingredient_filter": False if is_null(pctW) else True, "weight": raw(pctW)},
-        "rSdPct":   {"ingredient_filter": False if is_null(pctW) else True, "weight": pctW},
-        "rSdRaw":   {"ingredient_filter": False if is_null(pctW) else True, "weight": raw(pctW)},
-
-
-        # ===== Skill points =====
-        #"str": {"min": 0, "weight":1.5*pctW},
-        "dex": {"min": 0, "weight":1.5*pctW},
-        #"int": {"min": 0, "weight":pctW},
-        #"def": {"min": 0, "weight":pctW},
-        "agi": {"min": 0, "weight":pctW},
-
-        # ===== Sustain =====
-        "mr": {"min": 0, "weight":0},
-        "ms": {"min": 0, "weight":0},
-
-        "hpBonus": {"min": 1500, "ingredient_filter":True},
-
-        # ===== Requirements =====
-        "strReq": {"max": 60},
-        "dexReq": {"max": 20},
-        "intReq": {"max": 55},
-        "defReq": {"max": 0},
-        "agiReq": {"max": 65},
-
-        # ===== Usability =====
-        "durability": {"min": 25, "weight": 1},
-        # "duration": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
-        # "charges":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        "strReq": {"max": 0, "ingredient_filter": True},
+        "dexReq": {"max": 0, "ingredient_filter": True},
+        "intReq": {"max": 0, "ingredient_filter": True},
+        "defReq": {"max": 115, "ingredient_filter": True},
+        "agiReq": {"max": 85, "ingredient_filter": True},
+        "mr":       {"min": 0, "ingredient_filter": True, "weight": 1150},
+        "durability": {"min": 100, "weight": 1},
     }
-
-    skill = "ARMOURING"
+    skill = "JEWELING"
     dico = {"WEAPONSMITHING":"DAGGER", "WOODWORKING":"BOW", "TAILORING":"LEGGINGS", "ARMOURING":"CHESTPLATE", "JEWELING":"RING", "COOKING":"FOOD", "SCRIBING":"SCROLL", "ALCHEMISM":"POTION"}
     item_type = dico[skill] 
 
@@ -168,6 +103,7 @@ def main():
         skill=skill,
         consumable=consumable,
         fast_cull=False,  # legacy single-representative pareto cull: unsound under inversion (drops valid candidates) but much faster downstream search. Flip to False for the range-aware sound cull.
+        full_meta=True,   # extra pass: complete 6-meta-ingredient builds (extends surviving META_5 rows). See search_engine._search_full_meta.
     )
 
     # ---------- Load recipes (Materials => Stats) ----------
