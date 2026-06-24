@@ -9,7 +9,9 @@ adapted to dense stat vectors.
 Effectiveness filtering removed.
 """
 
-from data.stats import STAT_INDEX, IDX_DURABILITY, IDX_DURATION, IDX_CHARGES
+from data.stats import (
+    STAT_INDEX, IDX_DURABILITY, IDX_DURATION, IDX_CHARGES, FORMULA_MUL_DIV_100,
+)
 from data.ingredient_loader import SKILL_INDEX
 
 import numpy as np
@@ -20,9 +22,16 @@ def filter_raw_ingredients(
     ingredients_raw,
     query,
     recipe,
+    cull=True,
 ):
     """
     Takes all ingredients and the user Query, then returns only useful ingredients.
+
+    `cull=True` (default) returns the keep-filtered list after the legacy
+    range-aware pareto cull (back-compat for pareto_search and single-DB callers).
+    `cull=False` returns the keep-filtered list WITHOUT culling — callers that
+    build the per-eff-sign dual databases pass this and then call
+    `split_and_cull_by_sign`, which culls each sign with a sound directional rule.
 
     TODO(level filter): missing — ingredients with `lvl > recipe.lvl` cannot be
     used in this recipe but currently survive the filter. They get pruned at
@@ -135,10 +144,14 @@ def filter_raw_ingredients(
 
         if keep:
             filtered.append(ing)
+
+    if not cull:
+        return filtered
+
     n_filtered = len(filtered)
     filtered = pareto_cull_ingredients(filtered, query, recipe)
     n_culled = len(filtered)
-    
+
     pct = (n_culled / n_filtered * 100) if n_filtered else 0.0
     print(f"Ingredient culling: {n_filtered} => {n_culled}, {pct:.2f}% left")
     return filtered
@@ -152,6 +165,107 @@ def pareto_cull_ingredients(ingredients, query, recipe):
     if query.fast_cull:
         return _pareto_cull_fast(ingredients, query, recipe)
     return _pareto_cull_exact(ingredients, query, recipe)
+
+
+# ----------------------------------------------------------------------
+# Per-effectiveness-sign split + sound directional cull (the "dual database")
+# ----------------------------------------------------------------------
+#
+# WHY: the legacy `_pareto_cull_exact` `search_inv=True` branch uses
+# range-containment dominance, which is UNSOUND vs the leaf's
+# `0.99*max + 0.01*min` blend under inversion (a wide range [3,8] wrongly
+# "dominates" a tight high range [7,8], dropping the optimal negative-eff
+# filler). An ingredient's per-stat value is a V-shape in slot effectiveness:
+# one ray for eff>0, one for eff<0, so two ingredients can each win on a
+# different eff sign — genuinely incomparable on one shared list.
+#
+# FIX: split candidates into two databases by eff sign. Within a fixed sign the
+# value is MONOTONE, so the plain (non-inversion) directional dual-bound
+# dominance is sound. Each DB keeps only ingredients useful at that sign.
+#   - positive-eff DB: cull direction = query.lower_better_proj (as-is)
+#   - negative-eff DB: direction flipped (eff<0 inverts roll->contribution).
+#     Durability is added raw (never eff-scaled); the cull special-cases
+#     dura_proj_idx and ignores its lower_better entry, so flipping it is moot.
+
+
+def split_and_cull_by_sign(ingredients, query, recipe):
+    """
+    Split keep-filtered ingredients into the positive-eff and negative-eff
+    candidate lists (membership = "useful at that eff sign for the query") and
+    cull each with the sound directional dominance for that sign.
+
+    Returns (list_pos, list_neg) of RawIngredient. An ingredient useful at both
+    signs appears in both lists and is culled independently in each.
+    """
+    n = len(ingredients)
+    if n == 0:
+        return [], []
+
+    active = query.active_indices
+    stat_count = query.stat_count
+
+    mat_min = np.empty((n, stat_count), dtype=np.int32)
+    mat_max = np.empty((n, stat_count), dtype=np.int32)
+    for i, ing in enumerate(ingredients):
+        mat_min[i] = ing.stats_min[active]
+        mat_max[i] = ing.stats_max[active]
+
+    useful_pos, useful_neg = _useful_masks_split(
+        mat_min, mat_max,
+        query.has_min_mask_proj, query.has_max_mask_proj, query.weights_proj,
+        query.comp_count, query.comp_formula, query.comp_dep_offset,
+        query.comp_dep_count, query.comp_dep_indices, query.comp_weight,
+        query.comp_has_min, query.comp_has_max,
+        query.dura_proj_idx,
+    )
+
+    list_pos = [ingredients[i] for i in range(n) if useful_pos[i]]
+    list_neg = [ingredients[i] for i in range(n) if useful_neg[i]]
+
+    lb_pos = np.ascontiguousarray(query.lower_better_proj)
+    lb_neg = np.ascontiguousarray(np.logical_not(query.lower_better_proj))
+
+    pos_culled = _cull_signed(list_pos, query, recipe, lb_pos)
+    neg_culled = _cull_signed(list_neg, query, recipe, lb_neg)
+
+    print(
+        f"Dual-DB cull: filtered {n} => pos {len(list_pos)}->{len(pos_culled)}, "
+        f"neg {len(list_neg)}->{len(neg_culled)}"
+    )
+    return pos_culled, neg_culled
+
+
+def _cull_signed(ingredients, query, recipe, lower_better):
+    """
+    Directional pareto cull for ONE eff sign. Uses the (sound) non-inversion
+    dual-bound dominance with the supplied per-stat `lower_better` direction.
+    """
+    if len(ingredients) <= 1:
+        return ingredients
+
+    active = query.active_indices
+    stat_count = query.stat_count
+    dura_proj_idx = query.dura_proj_idx
+    dur_idx = IDX_DURATION if query.consumable else IDX_DURABILITY
+
+    matrix_min = np.zeros((len(ingredients), stat_count), dtype=np.int32)
+    matrix_max = np.zeros((len(ingredients), stat_count), dtype=np.int32)
+
+    for i, ing in enumerate(ingredients):
+        for j, stat_idx in enumerate(active):
+            min_val = int(ing.stats_min[stat_idx])
+            max_val = int(ing.stats_max[stat_idx])
+            if stat_idx == dur_idx:
+                min_val += recipe.scaled_dura_min
+                max_val += recipe.scaled_dura_max
+            matrix_min[i, j] = min_val
+            matrix_max[i, j] = max_val
+
+    # search_inv=False -> the sound directional dual-bound dominance branch.
+    kept_mask = pareto_filter_ingredients(
+        matrix_min, matrix_max, lower_better, dura_proj_idx, False,
+    )
+    return [ingredients[i] for i in range(len(ingredients)) if kept_mask[i]]
 
 
 def _pareto_cull_exact(ingredients, query, recipe):
@@ -461,3 +575,79 @@ def compare_stat_vectors_fast(a, b, lower_better, dura_i):
         return -1
 
     return 2
+
+
+# ----------------------------------------------------------------------
+# Membership helper for the dual-database split.
+# ----------------------------------------------------------------------
+
+@njit(cache=True)
+def _useful_masks_split(
+    db_stat_min, db_stat_max,
+    has_min_mask, has_max_mask, weights,
+    comp_count, comp_formula, comp_dep_offset, comp_dep_count,
+    comp_dep_indices, comp_weight, comp_has_min, comp_has_max,
+    dura_idx,
+):
+    """
+    Per-(ingredient, eff sign) usefulness, over PROJECTED stats. Mirrors
+    `core.search_engine._compute_useful_masks` but skips the durability/duration
+    column (`dura_idx`) so a stat that is never effectiveness-scaled cannot push
+    an ingredient into a sign-database where it has no eff-scaled use.
+
+    `useful_pos[i]` True iff ingredient i can help some active stat/composite at
+    eff > 0; `useful_neg[i]` symmetric for eff < 0.
+    """
+    N = db_stat_min.shape[0]
+    S = db_stat_min.shape[1]
+
+    s_higher = np.zeros(S, dtype=np.bool_)
+    s_lower = np.zeros(S, dtype=np.bool_)
+    for s in range(S):
+        if has_min_mask[s] or weights[s] > 0.0:
+            s_higher[s] = True
+        if has_max_mask[s] or weights[s] < 0.0:
+            s_lower[s] = True
+
+    for c in range(comp_count):
+        cw = comp_weight[c]
+        ch_min = comp_has_min[c]
+        ch_max = comp_has_max[c]
+        if cw == 0.0 and (not ch_min) and (not ch_max):
+            continue
+        f = comp_formula[c]
+        nonmonotone = (f == FORMULA_MUL_DIV_100)
+        off = comp_dep_offset[c]
+        cnt = comp_dep_count[c]
+        for k in range(cnt):
+            dep_s = comp_dep_indices[off + k]
+            if nonmonotone:
+                s_higher[dep_s] = True
+                s_lower[dep_s] = True
+            else:
+                if cw > 0.0 or ch_min:
+                    s_higher[dep_s] = True
+                if cw < 0.0 or ch_max:
+                    s_lower[dep_s] = True
+
+    useful_pos = np.zeros(N, dtype=np.bool_)
+    useful_neg = np.zeros(N, dtype=np.bool_)
+    for i in range(N):
+        for s in range(S):
+            if s == dura_idx:
+                continue
+            can_pos = db_stat_max[i, s] > 0
+            can_neg = db_stat_min[i, s] < 0
+            if can_pos:
+                if s_higher[s]:
+                    useful_pos[i] = True
+                if s_lower[s]:
+                    useful_neg[i] = True
+            if can_neg:
+                if s_lower[s]:
+                    useful_pos[i] = True
+                if s_higher[s]:
+                    useful_neg[i] = True
+            if useful_pos[i] and useful_neg[i]:
+                break
+    return useful_pos, useful_neg

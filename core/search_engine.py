@@ -91,6 +91,7 @@ _DFS_SIG = types.void(
     types.Array(types.bool_, 2, "C"),  # db_contrib_pos_mask
     types.Array(types.bool_, 2, "C"),  # db_contrib_neg_mask
     types.int64,              # db_count
+    types.int64,              # pos_count (rows [0,pos_count)=pos-eff DB, rest=neg-eff DB)
     types.int32[::1],         # meta_void_eff
     types.int64,              # dura_idx
     types.Array(types.bool_, 1, "C"),  # has_min_mask
@@ -1021,6 +1022,7 @@ def dfs(
     db_contrib_pos_mask,
     db_contrib_neg_mask,
     db_count,
+    pos_count,
     meta_void_eff,
     dura_idx,
     has_min_mask,
@@ -1176,12 +1178,27 @@ def dfs(
     # Bind the right precomputed bitmask once per depth (eff sign is fixed
     # for this DFS frame). Inner loop becomes one bool lookup per ingredient
     # instead of an O(S) per-stat scan.
+    # Dual-database: a positive-eff slot fills from the pos-eff region
+    # [0, pos_count); a non-positive slot from the neg-eff region
+    # [pos_count, db_count). Each region was culled with the sound directional
+    # dominance for its sign. `start_index` (permutation kill) is clamped into
+    # the region; when it crosses signs the parent reset it to 0, so max() lands
+    # on the region start. The `useful_for_eff` skip below is now redundant
+    # (each region is already sign-useful) but kept as a cheap safety net.
     if eff_is_positive:
         useful_for_eff = useful_pos_eff
+        lo = 0
+        hi = pos_count
     else:
         useful_for_eff = useful_neg_eff
+        lo = pos_count
+        hi = db_count
 
-    for i in range(start_index, db_count):
+    start = start_index
+    if start < lo:
+        start = lo
+
+    for i in range(start, hi):
 
         # ============================================================
         # PRUNING
@@ -1458,6 +1475,7 @@ def dfs(
             db_contrib_pos_mask,
             db_contrib_neg_mask,
             db_count,
+            pos_count,
             meta_void_eff,
             dura_idx,
             has_min_mask,
@@ -1526,6 +1544,7 @@ def _search_meta_batch_k1(
     db_stat_min,
     db_stat_max,
     db_count,
+    pos_count,
     dura_idx,
     has_min_mask,
     has_max_mask,
@@ -1582,6 +1601,13 @@ def _search_meta_batch_k1(
         # useful_neg_eff otherwise (eff == 0 ingredients contribute nothing
         # anyway, so the mask choice is irrelevant for that case).
         eff_strictly_pos = eff > 0
+        # Dual-DB region for this single void slot (see dfs).
+        if eff_strictly_pos:
+            lo = 0
+            hi = pos_count
+        else:
+            lo = pos_count
+            hi = db_count
         sb_val = shared_best[0]
         local_best = init_best_score
         if sb_val > local_best:
@@ -1596,9 +1622,10 @@ def _search_meta_batch_k1(
         deps_lo = deps_buf[m, 0]
         deps_hi = deps_buf[m, 1]
 
-        for i in range(db_count):
+        for i in range(lo, hi):
 
-            # Per-(ingredient, eff sign) usefulness gate — skip strictly useless.
+            # Per-(ingredient, eff sign) usefulness gate — redundant now that the
+            # region is sign-filtered, but a cheap safety net.
             if eff_strictly_pos:
                 if not useful_pos_eff[i]:
                     continue
@@ -1771,6 +1798,7 @@ def _search_meta_batch_k2(
     db_stat_min,
     db_stat_max,
     db_count,
+    pos_count,
     dura_idx,
     has_min_mask,
     has_max_mask,
@@ -1843,6 +1871,20 @@ def _search_meta_batch_k2(
         eff0_strictly_pos = eff0 > 0
         eff1_strictly_pos = eff1 > 0
         same_eff = (eff0 == eff1)
+
+        # Dual-DB regions per slot (see dfs). [0,pos_count)=pos-eff DB.
+        if eff0_strictly_pos:
+            lo0 = 0
+            hi0 = pos_count
+        else:
+            lo0 = pos_count
+            hi0 = db_count
+        if eff1_strictly_pos:
+            lo1 = 0
+            hi1 = pos_count
+        else:
+            lo1 = pos_count
+            hi1 = db_count
 
         # ---- Precompute slot-1 per-stat bounds (one-time O(N*S) per m).
         # Convention (eff-sign-aware):
@@ -1925,9 +1967,10 @@ def _search_meta_batch_k2(
         deps_lo = deps_buf[m, 0]
         deps_hi = deps_buf[m, 1]
 
-        for i0 in range(db_count):
+        for i0 in range(lo0, hi0):
 
-            # Per-(ingredient, eff sign) usefulness gate for slot 0.
+            # Per-(ingredient, eff sign) usefulness gate for slot 0 (redundant
+            # with the region restriction, kept as a cheap safety net).
             if eff0_strictly_pos:
                 if not useful_pos_eff[i0]:
                     continue
@@ -2113,8 +2156,12 @@ def _search_meta_batch_k2(
                 continue
 
             # i1 loop — eff == eff constraint drops permutation duplicates.
+            # Clamp the permutation-kill start into slot 1's region (same_eff =>
+            # same region, so start_i1=i0 is already >= lo1).
             start_i1 = i0 if same_eff else 0
-            for i1 in range(start_i1, db_count):
+            if start_i1 < lo1:
+                start_i1 = lo1
+            for i1 in range(start_i1, hi1):
 
                 # Per-(ingredient, eff sign) usefulness gate for slot 1.
                 if eff1_strictly_pos:
@@ -2295,6 +2342,14 @@ def _search_meta_batch_k2(
 # ============================================================
 # Search One Meta Batch (numba)
 # ============================================================
+#
+# DEPRECATED / UNUSED. `search_meta_batch` (v1) is no longer called anywhere —
+# production routes k=1/k=2 to the specialized kernels and k>=3 to
+# `search_meta_batch_v2`, and warmup no longer compiles v1. It still calls `dfs`
+# with the PRE-dual-database signature (no `pos_count`), so it would fail to
+# compile if reinstated. Before any reuse, add the `pos_count` param + per-slot
+# region selection exactly like `search_meta_batch_v2`. Kept only as the
+# single-axis (parallel-over-m) reference.
 
 @njit(parallel=True, cache=True)
 def search_meta_batch(
@@ -2514,6 +2569,7 @@ def search_meta_batch_v2(
     db_contrib_pos_mask,
     db_contrib_neg_mask,
     db_count,
+    pos_count,
     dura_idx,
     has_min_mask,
     has_max_mask,
@@ -2624,7 +2680,17 @@ def search_meta_batch_v2(
 
         # ----- Inlined depth=0 body of dfs (only for ingredient i = i_0) -----
 
-        # Useful check via precomputed bitmask (was an O(S) scan per i_0).
+        # Dual-DB region for slot 0: i_0 must come from the pos-eff region
+        # [0,pos_count) when eff>0, else the neg-eff region [pos_count,N).
+        # i_0 spans [0,N) here, so skip out-of-region candidates.
+        if eff_0_is_positive:
+            if i_0 >= pos_count:
+                continue
+        else:
+            if i_0 < pos_count:
+                continue
+
+        # Useful check via precomputed bitmask (redundant with the region skip).
         if eff_0_is_positive:
             if not useful_pos_eff[i_0]:
                 continue
@@ -2843,6 +2909,7 @@ def search_meta_batch_v2(
             db_contrib_pos_mask,
             db_contrib_neg_mask,
             db_count,
+            pos_count,
             void_eff_matrix[m],
             dura_idx,
             has_min_mask,
@@ -2925,6 +2992,7 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             db.stat_min_matrix,
             db.stat_max_matrix,
             db.count,
+            db.pos_count,
             dura_idx,
             query.has_min_mask_proj,
             query.has_max_mask_proj,
@@ -2960,6 +3028,7 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
             db.stat_min_matrix,
             db.stat_max_matrix,
             db.count,
+            db.pos_count,
             dura_idx,
             query.has_min_mask_proj,
             query.has_max_mask_proj,
@@ -3002,6 +3071,7 @@ def _dispatch_search(meta_batch, db, query, dura_idx, total_searched, best_score
         db.contrib_pos_mask,
         db.contrib_neg_mask,
         db.count,
+        db.pos_count,
         dura_idx,
         query.has_min_mask_proj,
         query.has_max_mask_proj,

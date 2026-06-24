@@ -576,32 +576,135 @@ def decode_and_report(url, user_query=None,
 
 # ============================================================
 
+dps = 497
+pctW = 1000
+def raw(pct, dps=dps) : return 10*pct/dps 
+def is_null(val, epsilon=0.6) : return abs(val) < epsilon
+
+nScale = 396
+eScale = 80
+tScale = 0
+wScale = 0
+fScale = 0
+aScale = 28
+
+nDmgWeaponMin = 0
+nDmgWeaponMax = 0
+eDmgWeaponMin = 0
+eDmgWeaponMax = 0
+tDmgWeaponMin = 0
+tDmgWeaponMax = 0
+wDmgWeaponMin = 0
+wDmgWeaponMax = 0
+fDmgWeaponMin = 0
+fDmgWeaponMax = 0
+aDmgWeaponMin = 209
+aDmgWeaponMax = 275
+
+nWeaponAvg = nDmgWeaponMin + ((nDmgWeaponMax - nDmgWeaponMin) / 2)
+eWeaponAvg = eDmgWeaponMin + ((eDmgWeaponMax - eDmgWeaponMin) / 2)
+tWeaponAvg = tDmgWeaponMin + ((tDmgWeaponMax - tDmgWeaponMin) / 2)
+wWeaponAvg = wDmgWeaponMin + ((wDmgWeaponMax - wDmgWeaponMin) / 2)
+fWeaponAvg = fDmgWeaponMin + ((fDmgWeaponMax - fDmgWeaponMin) / 2)
+aWeaponAvg = aDmgWeaponMin + ((aDmgWeaponMax - aDmgWeaponMin) / 2)
+
+nDmg = nWeaponAvg * nScale
+eDmg = eWeaponAvg * nScale + nWeaponAvg * eScale + eWeaponAvg * eScale + tWeaponAvg * eScale + wWeaponAvg * eScale + fWeaponAvg * eScale + aWeaponAvg * eScale
+tDmg = tWeaponAvg * nScale + nWeaponAvg * tScale + eWeaponAvg * tScale + tWeaponAvg * tScale + wWeaponAvg * tScale + fWeaponAvg * tScale + aWeaponAvg * tScale
+wDmg = wWeaponAvg * nScale + nWeaponAvg * wScale + eWeaponAvg * wScale + tWeaponAvg * wScale + wWeaponAvg * wScale + fWeaponAvg * wScale + aWeaponAvg * wScale
+fDmg = fWeaponAvg * nScale + nWeaponAvg * fScale + eWeaponAvg * fScale + tWeaponAvg * fScale + wWeaponAvg * fScale + fWeaponAvg * fScale + aWeaponAvg * fScale
+aDmg = aWeaponAvg * nScale + nWeaponAvg * aScale + eWeaponAvg * aScale + tWeaponAvg * aScale + wWeaponAvg * aScale + fWeaponAvg * aScale + aWeaponAvg * aScale
+
+totalDmg = nDmg + eDmg + tDmg + wDmg + fDmg + aDmg
+if (totalDmg == 0):
+    totalScale = 1
+nWeight = pctW * nDmg / totalDmg
+eWeight = pctW * eDmg / totalDmg
+tWeight = pctW * tDmg / totalDmg
+wWeight = pctW * wDmg / totalDmg
+fWeight = pctW * fDmg / totalDmg
+aWeight = pctW * aDmg / totalDmg
+
 if __name__ == "__main__":
 
-    URL = "https://wynnbuilder-beta.github.io/crafter/#4OayaWn0n8Q8t4e81"
+    URL = "https://wynnbuilder-beta.github.io/crafter/#4utKUGQut4muc4e81"
 
     # Same shape as main.py's user_query — set USER_QUERY = None to skip scoring.
-    pctW = 1000
-    rawW = pctW / 10.8
     USER_QUERY = {
-        "dex":      {"weight": pctW + 250},
-        "strReq":   {"max": 100},
-        "dexReq":   {"max": 21},
-        "intReq":   {"max": 60},
-        "defReq":   {"max": 25},
-        "agiReq":   {"max": 0},
-        "hpBonus":  {"min": 4000},
-        "hprRaw":   {"min": 235},
-        "mr":       {"min": -1},
-        "damPct":   {"weight": pctW},
-        "damRaw":   {"weight": rawW},
-        "sdPct":    {"weight": pctW},
-        "sdRaw":    {"weight": rawW},
-        "eDamPct":  {"weight": pctW},
-        "eDamRaw":  {"weight": rawW},
-        "eSdPct":   {"weight": pctW},
-        "eSdRaw":   {"weight": rawW},
-        "durability": {"min": 160, "weight": 1},
+        # ===== General Damage =====
+        "damPct":   {"ingredient_filter": False if is_null(pctW) else True, "weight": pctW},
+        "damRaw":   {"ingredient_filter": False if is_null(pctW) else True, "weight": raw(pctW)},
+        "sdPct":    {"ingredient_filter": False if is_null(pctW) else True, "weight": pctW},
+        "sdRaw":    {"ingredient_filter": False if is_null(pctW) else True, "weight": raw(pctW)},
+
+        # ===== Neutral =====
+        "nDamPct":  {"ingredient_filter": False if is_null(nWeight) else True, "weight": nWeight},
+        "nDamRaw":  {"ingredient_filter": False if is_null(nWeight) else True, "weight": raw(nWeight)},
+
+        # ===== Earth =====
+        "eDamPct":  {"ingredient_filter": False if is_null(eWeight) else True, "weight": eWeight},
+        "eDamRaw":  {"ingredient_filter": False if is_null(eWeight) else True, "weight": raw(eWeight)},
+        "eSdPct":   {"ingredient_filter": False if is_null(eWeight) else True, "weight": eWeight},
+        "eSdRaw":   {"ingredient_filter": False if is_null(eWeight) else True, "weight": raw(eWeight)},
+
+        # ===== Thunder =====
+        "tDamPct":  {"ingredient_filter": False if is_null(tWeight) else True, "weight": tWeight},
+        "tDamRaw":  {"ingredient_filter": False if is_null(tWeight) else True, "weight": raw(tWeight)},
+        "tSdPct":   {"ingredient_filter": False if is_null(tWeight) else True, "weight": tWeight},
+        "tSdRaw":   {"ingredient_filter": False if is_null(tWeight) else True, "weight": raw(tWeight)},
+
+        # ===== Water =====
+        "wDamPct":  {"ingredient_filter": False if is_null(wWeight) else True, "weight": wWeight},
+        "wDamRaw":  {"ingredient_filter": False if is_null(wWeight) else True, "weight": raw(wWeight)},
+        "wSdPct":   {"ingredient_filter": False if is_null(wWeight) else True, "weight": wWeight},
+        "wSdRaw":   {"ingredient_filter": False if is_null(wWeight) else True, "weight": raw(wWeight)},
+
+        # ===== Fire =====
+        "fDamPct":  {"ingredient_filter": False if is_null(fWeight) else True, "weight": fWeight},
+        "fDamRaw":  {"ingredient_filter": False if is_null(fWeight) else True, "weight": raw(fWeight)},
+        "fSdPct":   {"ingredient_filter": False if is_null(fWeight) else True, "weight": fWeight},
+        "fSdRaw":   {"ingredient_filter": False if is_null(fWeight) else True, "weight": raw(fWeight)},
+
+        # ===== Air =====
+        "aDamPct":  {"ingredient_filter": False if is_null(aWeight) else True, "weight": aWeight},
+        "aDamRaw":  {"ingredient_filter": False if is_null(aWeight) else True, "weight": raw(aWeight)},
+        "aSdPct":   {"ingredient_filter": False if is_null(aWeight) else True, "weight": aWeight},
+        "aSdRaw":   {"ingredient_filter": False if is_null(aWeight) else True, "weight": raw(aWeight)},
+
+        # ===== Rainbow ===== // BE CAREFUL IF NEUTRAL WEAPON (RARE)
+        "rDamPct":  {"ingredient_filter": False if is_null(pctW) else True, "weight": pctW},
+        "rDamRaw":  {"ingredient_filter": False if is_null(pctW) else True, "weight": raw(pctW)},
+        "rSdPct":   {"ingredient_filter": False if is_null(pctW) else True, "weight": pctW},
+        "rSdRaw":   {"ingredient_filter": False if is_null(pctW) else True, "weight": raw(pctW)},
+
+
+        # ===== Skill points =====
+        "str": {"min": 0, "weight":1.5*pctW, "ingredient_filter":False},
+        "dex": {"min": 0, "weight":1.5*pctW, "ingredient_filter":False},
+        "int": {"min": 0, "weight":pctW, "ingredient_filter":False},
+        "def": {"min": 0, "weight":pctW, "ingredient_filter":False},
+        "agi": {"min": 0, "weight":0, "ingredient_filter":False},
+
+        # ===== Sustain =====
+        "mr": {"min": 0, "weight":1*pctW},
+        #"ms": {"min": 0, "weight":0},
+        
+        #"hprRaw": {"min": -200, "ingredient_filter":False},
+        #"hpBonus": {"min": 2000, "ingredient_filter":False},
+
+        # ===== Requirements =====
+        "strReq": {"max": 45, "ingredient_filter":False},
+        "dexReq": {"max": 45, "ingredient_filter":False},
+        "intReq": {"max": 45, "ingredient_filter":False},
+        "defReq": {"max": 15, "ingredient_filter":False},
+        "agiReq": {"max": 125, "ingredient_filter":True},
+
+        # ===== Usability =====
+        #"spd": {"min": 0, "weight": 0.5},
+
+        "durability": {"min": 75, "weight": 1},
+        # "duration": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
+        # "charges":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
     }
 
     decode_and_report(URL, USER_QUERY)

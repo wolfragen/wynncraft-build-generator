@@ -136,27 +136,14 @@ def _warm_search_engine():
     for tag in fixed_tags + spell_tags:
         comp_formula = np.array([tag], dtype=np.int32)
 
-        se.search_meta_batch(
-            ings, k, void_eff, base_min, base_max,
-            db_stat_min, db_stat_max, db_contrib_pos_mask, db_contrib_neg_mask,
-            N, 0,
-            has_min_mask, has_max_mask, pos_weight_mask, neg_weight_mask,
-            min_vals, max_vals, weights, total_searched,
-            -1e18,
-            comp_count, comp_formula,
-            comp_dep_offset, comp_dep_count, comp_dep_indices,
-            comp_min, comp_max, comp_has_min, comp_has_max, comp_weight,
-            build_ctx,
-            round_offset,
-            sp_score_active, sp_score_ctx, sp_score_req_idx, sp_score_req_base,
-        )
-
-        # v2 ((m, i_0)-parallel) is the production path for k=3. Compile it
+        # v2 ((m, i_0)-parallel) is the production path for k>=3. Compile it
         # eagerly here so the first real batch doesn't pay the parallel-jit cost.
+        # (The legacy v1 `search_meta_batch` is no longer warmed/used — production
+        # routes k=1/k=2 to the specialized kernels and k>=3 to v2.)
         se.search_meta_batch_v2(
             ings, k, void_eff, base_min, base_max,
             db_stat_min, db_stat_max, db_contrib_pos_mask, db_contrib_neg_mask,
-            N, 0,
+            N, N, 0,
             has_min_mask, has_max_mask, pos_weight_mask, neg_weight_mask,
             min_vals, max_vals, weights, total_searched,
             -1e18,
@@ -171,7 +158,7 @@ def _warm_search_engine():
 
         se._search_meta_batch_k1(
             void_eff, base_min, base_max,
-            db_stat_min, db_stat_max, N, 0,
+            db_stat_min, db_stat_max, N, N, 0,
             has_min_mask, has_max_mask, min_vals, max_vals, weights,
             -1e18,
             comp_count, comp_formula,
@@ -184,7 +171,7 @@ def _warm_search_engine():
 
         se._search_meta_batch_k2(
             void_eff_k2, base_min, base_max,
-            db_stat_min, db_stat_max, N, 0,
+            db_stat_min, db_stat_max, N, N, 0,
             has_min_mask, has_max_mask, min_vals, max_vals, weights,
             -1e18,
             comp_count, comp_formula,
