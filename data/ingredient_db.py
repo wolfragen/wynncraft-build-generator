@@ -108,3 +108,38 @@ class IngredientDB:
 
     def __len__(self):
         return self.count
+
+
+def build_dual_db(pos_list, neg_list, query):
+    """
+    Build ONE search DB whose rows are the positive-eff candidates (indices
+    [0, pos_count)) followed by the negative-eff candidates ([pos_count, count)).
+    Each region is an independent score-sorted `IngredientDB`, so a void slot can
+    iterate only the region matching its effectiveness sign (see search_engine).
+
+    The concatenated `json_ids` map void-fill indices straight back to ingredient
+    ids with no per-sign bookkeeping in `_update_best`.
+
+    Returns an `IngredientDB`-shaped object exposing `.pos_count` plus the usual
+    `stat_min_matrix / stat_max_matrix / json_ids / count / contrib_* masks`.
+    """
+    db_pos = IngredientDB(pos_list, query)
+    db_neg = IngredientDB(neg_list, query)
+
+    db = IngredientDB.__new__(IngredientDB)
+    db.stat_count = query.stat_count
+    db.pos_count = db_pos.count
+    db.count = db_pos.count + db_neg.count
+
+    db.stat_min_matrix = np.ascontiguousarray(
+        np.vstack((db_pos.stat_min_matrix, db_neg.stat_min_matrix))
+    )
+    db.stat_max_matrix = np.ascontiguousarray(
+        np.vstack((db_pos.stat_max_matrix, db_neg.stat_max_matrix))
+    )
+    db.json_ids = np.ascontiguousarray(
+        np.concatenate((db_pos.json_ids, db_neg.json_ids))
+    )
+    db.contrib_pos_mask = db.stat_max_matrix > 0
+    db.contrib_neg_mask = db.stat_min_matrix < 0
+    return db
