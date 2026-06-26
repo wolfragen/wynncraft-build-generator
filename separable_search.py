@@ -23,14 +23,20 @@ is what a single global Lagrangian gets wrong.
 
 ## Scope (exact within this, else use the DFS)
 
-- Composite stats (spell/EHP/EHPR/HPR) break separability -> rejected here
-  (`comp_count > 0`); use main.py / the DFS for those.
-- Skill-point cap scoring is treated linearly. Exact when no `_context` skill-point
-  base is set (the cap 150-req never binds); for high base-SP `_context` it is an
+- Composite stats break per-slot separability, but a SINGLE monotone composite is
+  handled exactly via a composite-aware per-row solve (track the composite's dep roll
+  totals, evaluate it at the leaf, prune with a node-local upper bound that tightens
+  as deps are fixed): HPR = rawToPct, EHP/EHPR = numerator / D(def,agi), and spell /
+  melee average damage (reusing the engine's corner evaluators; monotone non-
+  decreasing in every dep). Multiple composites still fall back to the DFS.
+- Skill-point cap scoring is treated linearly for the LINEAR objective part. Exact
+  when no `_context` skill-point base is set; for high base-SP `_context` it is an
   approximation — validate against the DFS.
 
 Bit-exactness: the per-slot marginal uses the same `(stat*eff + round_offset)//100`
-floor, 0.99/0.01 blend, raw durability and eff<0 swap as the DFS leaf.
+floor, 0.99/0.01 blend, raw durability and eff<0 swap as the DFS leaf; the composite
+leaf/bound formulas mirror core/search_engine exactly (the spell path calls the very
+same njit corner functions, so it shares the DFS's monotonicity assumption).
 """
 
 from time import time
@@ -45,16 +51,20 @@ from query.query import build_query
 from query.ingredient_filter import filter_raw_ingredients
 from data.meta_set_loader import load_meta_sets
 from data.skillpoint_lookup import SKP_HEADLINE_PCT, SKP_DEF, SKP_AGI, SKP_MAX
+from data.spells import SPELL_USE_SPELL, get_spell_deps
+from core.search_engine import (_eval_spell_corner_spell, _eval_spell_corner_melee,
+                                _BCTX_WD_N)
 
 # Skill-point -> headline % rows for the EHP/EHPR denominator (mirror search_engine).
 _SKP_DEF_ROW = np.ascontiguousarray(SKP_HEADLINE_PCT[SKP_DEF])   # (151,) float64
 _SKP_AGI_ROW = np.ascontiguousarray(SKP_HEADLINE_PCT[SKP_AGI])
 _SKP_MAX = int(SKP_MAX)
 
-# Composite type codes (the supported, non-spell composites).
+# Composite type codes.
 _C_HPR = 0    # rawToPct(hprRaw, hprPct)
 _C_EHP = 1    # max(5,hpBonus) / D(def,agi)
 _C_EHPR = 2   # rawToPct(hprRaw,hprPct) / D(def,agi)
+_C_SPELL = 3  # average spell/melee damage (monotone in every dep) — variable arity
 
 
 class UnsupportedQueryError(Exception):
@@ -365,6 +375,134 @@ def _solve_row_comp(void_eidx, base_score, base_cval, base_dmin, base_dmax,
     return best_loc, choice
 
 
+# ---------------------------------------------------------------------------
+# Composite support: SPELL (average spell/melee damage).
+#
+# The engine's average-damage corner (core/search_engine._eval_spell_corner_*)
+# is monotone non-decreasing in every dep (positive weapon/SP/raw contributions,
+# non-negative mults & total_convert, SP clamps preserve monotonicity). So:
+#   leaf  cmax = corner(deps_max_roll),  cmin = corner(deps_min_roll)
+#   node-local UB = corner(cum_dmax[j] + favourable_max_suffix)  (max side only)
+# We reuse the engine corner fns verbatim (numba can call njit from njit) — never
+# re-derive the spell formula. ND = 36 (spell) or 32 (melee).
+# ---------------------------------------------------------------------------
+@njit(cache=True)
+def _spell_corner(deps, use_spell, spell_id, ctx):
+    """Dispatch one corner to the right engine evaluator (static branch for numba)."""
+    if use_spell:
+        return _eval_spell_corner_spell(deps, spell_id, ctx)
+    return _eval_spell_corner_melee(deps, spell_id, ctx)
+
+
+@njit(cache=True)
+def _spell_bounds_all(d_hi, spell_id, use_spell, ctx):
+    """
+    Per-row favourable spell value: d_hi is (M, ND) (the favourable max-roll dep
+    total per row); evaluate the (monotone) corner for each row -> (M,) float64.
+    """
+    M = d_hi.shape[0]
+    ND = d_hi.shape[1]
+    out = np.zeros(M)
+    deps = np.empty(ND)
+    for m in range(M):
+        for d in range(ND):
+            deps[d] = d_hi[m, d]
+        out[m] = _spell_corner(deps, use_spell, spell_id, ctx)
+    return out
+
+
+@njit(cache=True)
+def _solve_row_spell(void_eidx, base_score, base_cval, base_dmin, base_dmax,
+                     score_sorted, cmarg_sorted, dmin_s, dmax_s, dmax_emax,
+                     ND, spell_id, use_spell, ctx, best_score_per_eff, thr, sign,
+                     w_comp, has_cmin, cmin_thr, has_cmax, cmax_thr, best_global):
+    """
+    Exact per-row constrained void-fill WITH the (monotone) spell composite.
+
+    Same explicit-stack void-slot DFS as _solve_row_comp, but the dep totals are
+    width ND (32/36) instead of 4, evaluated through the engine corner fns:
+      leaf  cmx = corner(cum_dmax[k]),  cmn = corner(cum_dmin[k])  -> w*(0.99cmx+0.01cmn)
+      node  comp_ub_node[j] = w * corner(cum_dmax[j] + sufhi[:, j])   (max side only)
+    sufhi (ND, k+1) are favourable-max suffix sums; no suflo (monotone increasing).
+    Dep order is canonical get_spell_deps(spell_id) (== comp["deps"]).
+    """
+    k = void_eidx.shape[0]; C = thr.shape[0]; N = score_sorted.shape[1]
+    suf = np.zeros(k + 1)
+    sufhi = np.zeros((ND, k + 1))
+    for j in range(k - 1, -1, -1):
+        ei = void_eidx[j]
+        suf[j] = suf[j + 1] + best_score_per_eff[ei]
+        for d in range(ND):
+            sufhi[d, j] = sufhi[d, j + 1] + dmax_emax[d, ei]
+    best_loc = best_global
+    choice = np.full(k, -1, np.int64)
+    cur_choice = np.full(k, -1, np.int64)
+    stack_r = np.zeros(k, np.int64)
+    cum_score = np.zeros(k + 1)
+    cum_cval = np.zeros((k + 1, C))
+    cum_dmin = np.zeros((k + 1, ND)); cum_dmax = np.zeros((k + 1, ND))
+    comp_ub_node = np.zeros(k + 1)
+    deps_hi = np.empty(ND); deps_lo = np.empty(ND); deps_nd = np.empty(ND)
+    cum_cval[0] = base_cval; cum_score[0] = base_score
+    for dd in range(ND):
+        cum_dmin[0, dd] = base_dmin[dd]; cum_dmax[0, dd] = base_dmax[dd]
+    j = 0
+    if k > 0:
+        stack_r[0] = 0
+        for dd in range(ND):
+            deps_nd[dd] = cum_dmax[0, dd] + sufhi[dd, 0]
+        comp_ub_node[0] = w_comp * _spell_corner(deps_nd, use_spell, spell_id, ctx)
+    while j >= 0:
+        if j == k:
+            for dd in range(ND):
+                deps_hi[dd] = cum_dmax[k, dd]; deps_lo[dd] = cum_dmin[k, dd]
+            cmx = _spell_corner(deps_hi, use_spell, spell_id, ctx)
+            cmn = _spell_corner(deps_lo, use_spell, spell_id, ctx)
+            ok = True
+            if has_cmin and cmx < cmin_thr:
+                ok = False
+            if has_cmax and cmn > cmax_thr:
+                ok = False
+            if ok:
+                for c in range(C):
+                    if sign[c] > 0:
+                        if cum_cval[k, c] < thr[c]:
+                            ok = False; break
+                    else:
+                        if cum_cval[k, c] > thr[c]:
+                            ok = False; break
+            if ok:
+                total = cum_score[k] + w_comp * (0.99 * cmx + 0.01 * cmn)
+                if total > best_loc:
+                    best_loc = total
+                    for jj in range(k):
+                        choice[jj] = cur_choice[jj]
+            j -= 1
+            if j >= 0:
+                stack_r[j] += 1
+            continue
+        ei = void_eidx[j]; r = stack_r[j]
+        if r >= N or cum_score[j] + score_sorted[ei, r] + suf[j + 1] + comp_ub_node[j] <= best_loc:
+            j -= 1
+            if j >= 0:
+                stack_r[j] += 1
+            continue
+        cur_choice[j] = r
+        cum_score[j + 1] = cum_score[j] + score_sorted[ei, r]
+        for c in range(C):
+            cum_cval[j + 1, c] = cum_cval[j, c] + cmarg_sorted[c, ei, r]
+        for dd in range(ND):
+            cum_dmin[j + 1, dd] = cum_dmin[j, dd] + dmin_s[dd, ei, r]
+            cum_dmax[j + 1, dd] = cum_dmax[j, dd] + dmax_s[dd, ei, r]
+        j += 1
+        if j < k:
+            stack_r[j] = 0
+            for dd in range(ND):
+                deps_nd[dd] = cum_dmax[j, dd] + sufhi[dd, j]
+            comp_ub_node[j] = w_comp * _spell_corner(deps_nd, use_spell, spell_id, ctx)
+    return best_loc, choice
+
+
 def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
                     search_for_inversion=True, base_path="data/precalc/generic_cull",
                     consumable=False, ingredients_raw=None, recipes=None, verbose=False):
@@ -381,12 +519,13 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
 
     Raises UnsupportedQueryError for composite queries.
     """
-    from data.stats import FORMULA_RAW_TO_PCT, FORMULA_EHP, FORMULA_EHPR
+    from data.stats import (FORMULA_RAW_TO_PCT, FORMULA_EHP, FORMULA_EHPR,
+                            FORMULA_SPELL_DAMAGE_BASE)
     q = build_query(user_json=user_query, search_for_inversion=search_for_inversion,
                     item_type=item_type, skill=skill, consumable=consumable)
-    # Composite support: a single monotone composite (HPR / EHP / EHPR) is handled
-    # exactly via the meta-row B&B + composite-aware per-row solve. Dep order mirrors
-    # the engine leaf. Anything else (spell, multiple composites) falls back to the DFS.
+    # Composite support: a single monotone composite (HPR / EHP / EHPR / SPELL) is
+    # handled exactly via the meta-row B&B + composite-aware per-row solve. Dep order
+    # mirrors the engine leaf. Anything else (multiple composites) falls back to the DFS.
     _CTYPE = {FORMULA_RAW_TO_PCT: (_C_HPR, 2), FORMULA_EHP: (_C_EHP, 3),
               FORMULA_EHPR: (_C_EHPR, 4)}
     comp = None
@@ -400,9 +539,19 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
                     "w": float(q.comp_weight[0]),
                     "has_min": bool(q.comp_has_min[0]), "min": float(q.comp_min[0]),
                     "has_max": bool(q.comp_has_max[0]), "max": float(q.comp_max[0])}
+        elif q.comp_count == 1 and f0 >= FORMULA_SPELL_DAMAGE_BASE:
+            sid = f0 - FORMULA_SPELL_DAMAGE_BASE
+            ndeps = int(q.comp_dep_count[0])
+            off = int(q.comp_dep_offset[0])
+            comp = {"type": _C_SPELL, "spell_id": sid,
+                    "use_spell": bool(SPELL_USE_SPELL[sid]), "n": ndeps,
+                    "deps": [int(q.comp_dep_indices[off + i]) for i in range(ndeps)],
+                    "w": float(q.comp_weight[0]),
+                    "has_min": bool(q.comp_has_min[0]), "min": float(q.comp_min[0]),
+                    "has_max": bool(q.comp_has_max[0]), "max": float(q.comp_max[0])}
         else:
             raise UnsupportedQueryError(
-                f"Only a single HPR/EHP/EHPR composite is supported so far "
+                f"Only a single HPR/EHP/EHPR/SPELL composite is supported so far "
                 f"(query defines {q.comp_count}, formula {f0}). Use the DFS (main.py).")
 
     if ingredients_raw is None:
@@ -412,6 +561,16 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
     recipe_raw = find_recipe(recipes=recipes, item_type=item_type, skill=skill,
                              lvl_min=lvl_min, lvl_max=lvl_max)
     rec = build_recipe(recipe_raw, q, tier=tier)
+
+    # Spell composite: overlay the weapon recipe's neutral damage onto the build
+    # ctx (mirrors core/search_engine.search_pipelined ~3506-3516) so the spell
+    # kernel scales the right intrinsic weapon damage instead of seeing WD_N=0.
+    is_spell = comp is not None and comp["type"] == _C_SPELL
+    spell_ctx = None
+    if is_spell:
+        spell_ctx = np.array(q.build_ctx, np.float64).copy()
+        if rec.weapon_dam_neutral and (rec.weapon_dam_neutral[0] or rec.weapon_dam_neutral[1]):
+            spell_ctx[_BCTX_WD_N] = (rec.weapon_dam_neutral[0] + rec.weapon_dam_neutral[1]) / 2.0
 
     normals = filter_raw_ingredients(ingredients_raw, q, rec, cull=False)
     db = IngredientDB(normals, q)
@@ -473,15 +632,20 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
     dmax_s = dmin_s = None
     dmax_emax = dmin_emin = None
     if comp is not None:
-        # length-4 (kernel signature is fixed-width); deps 0..nd-1 used.
-        dmax_s = np.zeros((4, E, N)); dmin_s = np.zeros((4, E, N))
+        # Dep-tracking width: the simple composites (HPR/EHP/EHPR) keep the fixed
+        # width 4 expected by _solve_row_comp/_node_ub; the spell composite uses its
+        # actual dep count (32/36) consumed by _solve_row_spell.
+        W = nd if is_spell else 4
+        dmax_s = np.zeros((W, E, N)); dmin_s = np.zeros((W, E, N))
         for d in range(nd):
             dmax_s[d] = np.take_along_axis(dmax_e[d], order, axis=1)
             dmin_s[d] = np.take_along_axis(dmin_e[d], order, axis=1)
         dmax_s = np.ascontiguousarray(dmax_s); dmin_s = np.ascontiguousarray(dmin_s)
         # per-eff favourable extremes (max of each dep's max-roll marginal, min of each
         # dep's min-roll marginal) — drive both the per-row bound and the node-local UB.
-        dmax_emax = np.zeros((4, E)); dmin_emin = np.zeros((4, E))
+        # Spell is monotone increasing so only dmax_emax matters there; dmin_emin is
+        # still built (unused by the spell kernel but harmless / kept for symmetry).
+        dmax_emax = np.zeros((W, E)); dmin_emin = np.zeros((W, E))
         dmax_emax[:nd] = dmax_e.max(2); dmin_emin[:nd] = dmin_e.min(2)
         dmax_emax = np.ascontiguousarray(dmax_emax); dmin_emin = np.ascontiguousarray(dmin_emin)
 
@@ -526,10 +690,13 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
                 cub = _rtp_np(d_hi[0], d_hi[1]).astype(np.float64)
             elif comp["type"] == _C_EHP:
                 cub = np.maximum(5.0, d_hi[0]) / _denom_min_np(d_hi[1], d_lo[2])
-            else:  # EHPR
+            elif comp["type"] == _C_EHPR:
                 num_hi = _rtp_np(d_hi[0], d_hi[1]).astype(np.float64)
                 cub = np.maximum(num_hi / _denom_min_np(d_hi[2], d_lo[3]),
                                  num_hi / _denom_max_np(d_lo[2], d_hi[3]))
+            else:  # SPELL — evaluate the (monotone) corner at the favourable max box
+                cub = _spell_bounds_all(np.ascontiguousarray(d_hi.T),
+                                        comp["spell_id"], comp["use_spell"], spell_ctx)
             comp_ub = comp["w"] * cub
             bound = bound + comp_ub
         pre.append((M, base_score, imax, imin, veidx, comp_ub))
@@ -555,6 +722,18 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
             sc, choice = _solve_row(veidx[m], float(base_score[m]), base_cval,
                                     score_sorted, cmarg_sorted, best_score_per_eff,
                                     thr, sign, best)
+        elif is_spell:
+            ND = comp["n"]
+            base_dmax = np.zeros(ND); base_dmin = np.zeros(ND)
+            for d in range(ND):
+                sidx = comp["deps"][d]
+                base_dmax[d] = float(imax[m, sidx]); base_dmin[d] = float(imin[m, sidx])
+            sc, choice = _solve_row_spell(
+                veidx[m], float(base_score[m]), base_cval, base_dmin, base_dmax,
+                score_sorted, cmarg_sorted, dmin_s, dmax_s, dmax_emax,
+                ND, comp["spell_id"], comp["use_spell"], spell_ctx,
+                best_score_per_eff, thr, sign, comp["w"],
+                comp["has_min"], comp["min"], comp["has_max"], comp["max"], best)
         else:
             base_dmax = np.zeros(4); base_dmin = np.zeros(4)
             for d in range(comp["n"]):

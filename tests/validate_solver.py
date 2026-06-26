@@ -36,9 +36,14 @@ from data.recipe import build_recipe
 from query.query import build_query
 from query.ingredient_filter import filter_raw_ingredients, split_and_cull_by_sign
 from data.stats import CONSU_SKILLS
-from core.search_engine import search_pipelined, _ehp_bounds, _ehpr_bounds
+from core.search_engine import (search_pipelined, _ehp_bounds, _ehpr_bounds,
+                                _eval_spell_corner_spell, _eval_spell_corner_melee,
+                                _BCTX_WD_N)
 from core.warmup import warm_numba
 from data.stats import DERIVED_FORMULA
+import numpy as np
+import data.spells
+from data.spells import SPELL_INDEX, SPELL_USE_SPELL, get_spell_deps
 from main_decode import (_index_ingredients, compute_effectiveness,
                          compute_crafted_stats, score_query)
 from separable_search import solve_separable
@@ -180,6 +185,11 @@ CASES = [
     ("jew_ehpr", "JEWELING", "RING", 117, 119,
      {"ehpr": {"weight": 1000}, "mr": {"weight": 200}, "hprRaw": {"weight": 20},
       "durability": {"min": 30, "weight": 1}}),
+    # ---- composite: SPELL = average melee/spell damage (monotone in every dep) ----
+    # assassin_spin_attack is melee-mode spell_id 7; DAGGER weapon_dam_neutral=(337,340).
+    ("wea_spell_comp", "WEAPONSMITHING", "DAGGER", 117, 119,
+     {"assassin_spin_attack": {"weight": 1}, "mr": {"weight": 100},
+      "durability": {"min": 50, "weight": 1}}),
 ]
 
 
@@ -196,13 +206,15 @@ def run_dfs(ings, recipes, skill, item_type, tier, lmn, lmx, query):
     return [int(i) for i in best]
 
 
-def _composite_extra(stats, query):
+def _composite_extra(stats, query, spell_ctx=None):
     """
-    Engine-faithful score for the composites score_query SKIPS (ehp/ehpr need build
-    context). Uses the ENGINE's own _ehp_bounds/_ehpr_bounds on the build's crafted
-    stats — independent of the solver under test, so both the DFS and the solver get
-    compared on linear + composite. Returns (extra_score, composite_valid). HPR
-    (raw_to_pct) is already scored by score_query, so it is not re-added here.
+    Engine-faithful score for the composites score_query SKIPS (ehp/ehpr/spell need
+    build context). Uses the ENGINE's own _ehp_bounds/_ehpr_bounds and spell corner
+    fns on the build's crafted stats — independent of the solver under test, so both
+    the DFS and the solver get compared on linear + composite. Returns
+    (extra_score, composite_valid). HPR (raw_to_pct) is already scored by score_query,
+    so it is not re-added here. `spell_ctx` is the build ctx (with WD_N overlaid) —
+    required to score any spell composite present in the query.
     """
     def mm(name):
         e = stats.get(name)
@@ -217,9 +229,22 @@ def _composite_extra(stats, query):
         elif f == "ehpr":
             r = mm("hprRaw"); p = mm("hprPct"); df = mm("def"); ag = mm("agi")
             cmin, cmax = _ehpr_bounds(r[0], r[1], p[0], p[1], df[0], df[1], ag[0], ag[1])
+        elif name in SPELL_INDEX:
+            # Spell composite: assemble the canonical dep box and call the engine
+            # corner fns (cmax at the max-roll corner, cmin at the min-roll corner).
+            sid = SPELL_INDEX[name]
+            layout = get_spell_deps(sid)
+            deps_hi = np.zeros(len(layout)); deps_lo = np.zeros(len(layout))
+            for i, dn in enumerate(layout):
+                lo, hi = mm(dn)
+                deps_hi[i] = hi; deps_lo[i] = lo
+            corner = _eval_spell_corner_spell if SPELL_USE_SPELL[sid] else _eval_spell_corner_melee
+            cmax = corner(deps_hi, sid, spell_ctx)
+            cmin = corner(deps_lo, sid, spell_ctx)
         else:
             continue
-        cmin = int(cmin); cmax = int(cmax)
+        if name not in SPELL_INDEX:
+            cmin = int(cmin); cmax = int(cmax)
         if cfg.get("min") is not None and cmax < cfg["min"]:
             valid = False
         if cfg.get("max") is not None and cmin > cfg["max"]:
@@ -230,12 +255,28 @@ def _composite_extra(stats, query):
     return extra, valid
 
 
-def oracle(build, recipe_raw, tier, query, ibid):
+def _build_spell_ctx(recipe_raw, tier, query, skill, item_type):
+    """Build the spell build-ctx (WD_N overlaid from the weapon recipe), mirroring
+    the engine pipeline. Returns None when the query has no spell composite."""
+    if not any(name in SPELL_INDEX for name in query):
+        return None
+    consumable = skill in CONSU_SKILLS
+    q = build_query(user_json=query, search_for_inversion=True, item_type=item_type,
+                    skill=skill, consumable=consumable)
+    rec = build_recipe(recipe_raw, q, tier=tier)
+    ctx = np.array(q.build_ctx, np.float64).copy()
+    if rec.weapon_dam_neutral and (rec.weapon_dam_neutral[0] or rec.weapon_dam_neutral[1]):
+        ctx[_BCTX_WD_N] = (rec.weapon_dam_neutral[0] + rec.weapon_dam_neutral[1]) / 2.0
+    return ctx
+
+
+def oracle(build, recipe_raw, tier, query, ibid, skill, item_type):
     entries = [ibid[i] for i in build]
     eff = compute_effectiveness(entries)
     crafted = compute_crafted_stats(recipe_raw.data, tier, entries, eff)
     r = score_query(crafted, query)
-    extra, cvalid = _composite_extra(crafted["stats"], query)
+    spell_ctx = _build_spell_ctx(recipe_raw, tier, query, skill, item_type)
+    extra, cvalid = _composite_extra(crafted["stats"], query, spell_ctx)
     return r["score"] + extra, (r["valid"] and cvalid)
 
 
@@ -278,7 +319,7 @@ def main():
                               "skill": skill, "item_type": itype}
             with open(FIXTURES, "w", encoding="utf-8") as f:
                 json.dump(fixtures, f, indent=2)
-        dfs_sc, dfs_v = oracle(dfs_build, rr, tier, query, ibid)
+        dfs_sc, dfs_v = oracle(dfs_build, rr, tier, query, ibid, skill, itype)
 
         # solver under test (wall-clock timed, generic). Tolerate a solver that
         # can't handle a case yet (e.g. composites not implemented) so the DFS
@@ -290,7 +331,7 @@ def main():
         except Exception as ex:
             sol_build, sol_err = None, f"{type(ex).__name__}"
         sol_t = time() - t
-        sol_sc, sol_v = oracle(sol_build, rr, tier, query, ibid) if sol_build else (float("-inf"), False)
+        sol_sc, sol_v = oracle(sol_build, rr, tier, query, ibid, skill, itype) if sol_build else (float("-inf"), False)
 
         delta = sol_sc - dfs_sc
         ok = (sol_err is None) and sol_v and abs(delta) < 1e-6

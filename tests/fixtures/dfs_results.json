@@ -23,7 +23,7 @@
           569
         ],
         "score": 617324.4,
-        "time": 2.48,
+        "time": 2.51,
         "valid": true,
         "matches_dfs": true
       }
@@ -53,7 +53,7 @@
           622
         ],
         "score": 98611.6,
-        "time": 5.655,
+        "time": 5.781,
         "valid": true,
         "matches_dfs": true
       }
@@ -83,7 +83,7 @@
           569
         ],
         "score": 91542.3,
-        "time": 5.752,
+        "time": 5.804,
         "valid": true,
         "matches_dfs": true
       }
@@ -113,7 +113,7 @@
           591
         ],
         "score": 594020.9,
-        "time": 0.704,
+        "time": 0.712,
         "valid": true,
         "matches_dfs": true
       }
@@ -173,7 +173,7 @@
           909
         ],
         "score": 78776.9,
-        "time": 0.016,
+        "time": 0.028,
         "valid": true,
         "matches_dfs": true
       }
@@ -203,7 +203,7 @@
           569
         ],
         "score": 1234573.9,
-        "time": 2.382,
+        "time": 2.513,
         "valid": true,
         "matches_dfs": true
       }
@@ -233,7 +233,7 @@
           752
         ],
         "score": 153945.9,
-        "time": 0.21,
+        "time": 0.214,
         "valid": true,
         "matches_dfs": true
       }
@@ -263,7 +263,7 @@
           614
         ],
         "score": 21063.9,
-        "time": 0.016,
+        "time": 0.027,
         "valid": true,
         "matches_dfs": true
       }
@@ -293,7 +293,7 @@
           570
         ],
         "score": 84117.9,
-        "time": 2.413,
+        "time": 2.475,
         "valid": true,
         "matches_dfs": true
       }
@@ -323,7 +323,7 @@
           591
         ],
         "score": 119786.9,
-        "time": 0.798,
+        "time": 0.819,
         "valid": true,
         "matches_dfs": true
       }
@@ -353,7 +353,7 @@
           909
         ],
         "score": 78776.9,
-        "time": 0.03,
+        "time": 0.016,
         "valid": true,
         "matches_dfs": true
       }
@@ -383,7 +383,7 @@
           634
         ],
         "score": 286425.9,
-        "time": 2.731,
+        "time": 2.849,
         "valid": true,
         "matches_dfs": true
       }
@@ -413,7 +413,7 @@
           569
         ],
         "score": 790866.4,
-        "time": 0.801,
+        "time": 0.84,
         "valid": true,
         "matches_dfs": true
       }
@@ -443,7 +443,7 @@
           756
         ],
         "score": 341417.9,
-        "time": 0.028,
+        "time": 0.043,
         "valid": true,
         "matches_dfs": true
       }
@@ -473,7 +473,7 @@
           793
         ],
         "score": 10066470.9,
-        "time": 2.963,
+        "time": 3.056,
         "valid": true,
         "matches_dfs": true
       }
@@ -503,7 +503,7 @@
           588
         ],
         "score": 12381727.7,
-        "time": 0.822,
+        "time": 0.819,
         "valid": true,
         "matches_dfs": true
       }
@@ -533,7 +533,7 @@
           614
         ],
         "score": 9263.9,
-        "time": 0.02,
+        "time": 0.032,
         "valid": true,
         "matches_dfs": true
       }
@@ -563,7 +563,7 @@
           634
         ],
         "score": 289731.9,
-        "time": 3.39,
+        "time": 3.402,
         "valid": true,
         "matches_dfs": true
       }
@@ -593,7 +593,7 @@
           632
         ],
         "score": 16497.9,
-        "time": 0.866,
+        "time": 0.891,
         "valid": true,
         "matches_dfs": true
       }
@@ -623,7 +623,37 @@
           907
         ],
         "score": 463583.5,
-        "time": 0.03,
+        "time": 0.039,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
+  },
+  "wea_spell_comp": {
+    "build": [
+      563,
+      627,
+      591,
+      796,
+      627,
+      563
+    ],
+    "time": 0.35868215560913086,
+    "skill": "WEAPONSMITHING",
+    "item_type": "DAGGER",
+    "dfs_score": 7458.3,
+    "solvers": {
+      "separable": {
+        "build": [
+          563,
+          627,
+          591,
+          796,
+          627,
+          563
+        ],
+        "score": 7458.3,
+        "time": 0.756,
         "valid": true,
         "matches_dfs": true
       }
