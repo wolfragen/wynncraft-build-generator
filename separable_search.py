@@ -214,16 +214,16 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
         # matmul-then-blend: reduce (M,K) to (M,) BEFORE the float blend (avoids the
         # (M,K) float64 intermediate that dominated prep).
         base_score = (imax @ w) * 0.99 + (imin @ w) * 0.01
-        # constrained-stat base: gather only the C needed columns (min-constraint uses
-        # max-roll base, max-constraint uses min-roll base).
-        base_cval = np.where(cstat_max[None, :], imax[:, cstat_idx], imin[:, cstat_idx]).astype(np.float64)
+        # NOTE: the per-row constrained-stat base (base_cval) is computed LAZILY in the
+        # solve loop below — only ~thousands of rows survive bound-pruning and get
+        # solved, so materialising it for all ~6M rows here was pure waste (~0.9s).
         veidx = np.zeros((M, b.void_count), np.int64)
         bound = base_score.copy()
         for j in range(b.void_count):
             ix = np.searchsorted(all_effs, b.void_eff_matrix[:, j])
             veidx[:, j] = ix
             bound += best_score_per_eff[ix]
-        pre.append((M, base_score, base_cval, veidx))
+        pre.append((M, base_score, imax, imin, veidx))
         all_bounds.append(bound)
         all_n.append(np.full(M, n, np.int64))
         all_m.append(np.arange(M, dtype=np.int64))
@@ -238,9 +238,11 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
         if bounds_all[oi] <= best:
             break
         n = int(n_all[oi]); m = int(m_all[oi])
-        _, base_score, base_cval, veidx = pre[n]
-        sc, choice = _solve_row(veidx[m], float(base_score[m]),
-                                np.ascontiguousarray(base_cval[m]),
+        _, base_score, imax, imin, veidx = pre[n]
+        # constrained-stat base for THIS row only (min-constraint uses max-roll base,
+        # max-constraint uses min-roll base).
+        base_cval = np.where(cstat_max, imax[m, cstat_idx], imin[m, cstat_idx]).astype(np.float64)
+        sc, choice = _solve_row(veidx[m], float(base_score[m]), base_cval,
                                 score_sorted, cmarg_sorted, best_score_per_eff,
                                 thr, sign, best)
         solved += 1
