@@ -1,0 +1,9 @@
+# MILP solver track dependencies (isolated from the DFS/main.py path).
+# The heuristic DFS pipeline (main.py) needs none of these — keep them separate
+# so `main.py` stays installable without a MILP solver. See milp/README.md §1.
+#
+# ortools>=9.10 is the first line declaring numpy 2.x compatibility; prefer the
+# latest 9.x. Install with pip (official PyPI wheels), NOT conda — conda-forge
+# or-tools lags and can pull a mismatched numpy/abseil.
+ortools>=9.10
+numpy>=2.0

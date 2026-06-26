@@ -23,6 +23,8 @@ def filter_raw_ingredients(
     query,
     recipe,
     cull=True,
+    include_meta=False,
+    recipe_lvl=None,
 ):
     """
     Takes all ingredients and the user Query, then returns only useful ingredients.
@@ -32,6 +34,17 @@ def filter_raw_ingredients(
     `cull=False` returns the keep-filtered list WITHOUT culling — callers that
     build the per-eff-sign dual databases pass this and then call
     `split_and_cull_by_sign`, which culls each sign with a sound directional rule.
+
+    `include_meta=True` switches to MILP-candidate mode: return EVERY legal
+    ingredient — meta ingredients (non-zero posMods, positive durability) included
+    — applying ONLY the legality gates (skill, and level if `recipe_lvl` is given).
+    It bypasses the posMods exclusion, the positive-durability exclusion, the
+    usefulness `keep` filter, and the cull, all of which are DFS-only optimisations
+    that would drop ingredients an exact MILP needs for a provable optimum. The
+    DFS path is unaffected: the flag defaults to False and existing callers never
+    pass it. `recipe_lvl` (e.g. `RawRecipe.lvl_max`) gates over-level ingredients
+    so a "proven optimal" pick is actually craftable; only consulted when
+    `include_meta=True`.
 
     TODO(level filter): missing — ingredients with `lvl > recipe.lvl` cannot be
     used in this recipe but currently survive the filter. They get pruned at
@@ -58,6 +71,17 @@ def filter_raw_ingredients(
             return []
     else:
         skill_index = None
+
+    # MILP-candidate mode: legality gates only, every ingredient kept (meta too).
+    if include_meta:
+        out = []
+        for ing in ingredients_raw:
+            if skill_index is not None and not ing.skills[skill_index]:
+                continue
+            if recipe_lvl is not None and ing.lvl > recipe_lvl:
+                continue
+            out.append(ing)
+        return out
 
     for ing in ingredients_raw:
 
