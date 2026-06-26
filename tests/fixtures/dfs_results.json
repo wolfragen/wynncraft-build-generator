@@ -23,7 +23,7 @@
           569
         ],
         "score": 617324.4,
-        "time": 2.568,
+        "time": 4.508,
         "valid": true,
         "matches_dfs": true
       }
@@ -53,7 +53,7 @@
           622
         ],
         "score": 98611.6,
-        "time": 5.708,
+        "time": 6.537,
         "valid": true,
         "matches_dfs": true
       }
@@ -83,7 +83,7 @@
           569
         ],
         "score": 91542.3,
-        "time": 6.127,
+        "time": 6.588,
         "valid": true,
         "matches_dfs": true
       }
@@ -143,7 +143,7 @@
           757
         ],
         "score": 143930.9,
-        "time": 0.205,
+        "time": 0.197,
         "valid": true,
         "matches_dfs": true
       }
@@ -173,7 +173,7 @@
           909
         ],
         "score": 78776.9,
-        "time": 0.029,
+        "time": 0.028,
         "valid": true,
         "matches_dfs": true
       }
@@ -203,7 +203,7 @@
           569
         ],
         "score": 1234573.9,
-        "time": 2.45,
+        "time": 2.515,
         "valid": true,
         "matches_dfs": true
       }
@@ -233,7 +233,7 @@
           752
         ],
         "score": 153945.9,
-        "time": 0.224,
+        "time": 0.212,
         "valid": true,
         "matches_dfs": true
       }
@@ -263,7 +263,7 @@
           614
         ],
         "score": 21063.9,
-        "time": 0.027,
+        "time": 0.026,
         "valid": true,
         "matches_dfs": true
       }
@@ -293,7 +293,7 @@
           570
         ],
         "score": 84117.9,
-        "time": 2.655,
+        "time": 2.571,
         "valid": true,
         "matches_dfs": true
       }
@@ -323,7 +323,7 @@
           591
         ],
         "score": 119786.9,
-        "time": 0.864,
+        "time": 0.848,
         "valid": true,
         "matches_dfs": true
       }
@@ -353,7 +353,97 @@
           909
         ],
         "score": 78776.9,
-        "time": 0.032,
+        "time": 0.033,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
+  },
+  "arm_hpr": {
+    "build": [
+      765,
+      622,
+      765,
+      622,
+      617,
+      634
+    ],
+    "time": 1.843454360961914,
+    "skill": "ARMOURING",
+    "item_type": "CHESTPLATE",
+    "dfs_score": 286425.9,
+    "solvers": {
+      "separable": {
+        "build": [
+          765,
+          622,
+          765,
+          622,
+          617,
+          634
+        ],
+        "score": 286425.9,
+        "time": 4.092,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
+  },
+  "tai_hpr": {
+    "build": [
+      618,
+      618,
+      792,
+      618,
+      582,
+      569
+    ],
+    "time": 0.5178894996643066,
+    "skill": "TAILORING",
+    "item_type": "LEGGINGS",
+    "dfs_score": 790866.4,
+    "solvers": {
+      "separable": {
+        "build": [
+          618,
+          618,
+          792,
+          618,
+          582,
+          569
+        ],
+        "score": 790866.4,
+        "time": 1.496,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
+  },
+  "jew_hpr": {
+    "build": [
+      569,
+      391,
+      756,
+      756,
+      760,
+      756
+    ],
+    "time": 0.024976015090942383,
+    "skill": "JEWELING",
+    "item_type": "RING",
+    "dfs_score": 341417.9,
+    "solvers": {
+      "separable": {
+        "build": [
+          569,
+          391,
+          756,
+          756,
+          760,
+          756
+        ],
+        "score": 341417.9,
+        "time": 0.041,
         "valid": true,
         "matches_dfs": true
       }

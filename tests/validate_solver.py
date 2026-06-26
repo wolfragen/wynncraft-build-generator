@@ -155,6 +155,14 @@ CASES = [
      {"mr": {"weight": 1000}, "ms": {"weight": 500}, "spd": {"weight": 300},
       "hpBonus": {"weight": 50}, "int": {"min": 0, "weight": 800}, "intReq": {"max": 30},
       "durability": {"min": 30, "weight": 1}}),
+    # ---- composite: HPR = rawToPct(hprRaw, hprPct) (bilinear) ----
+    ("arm_hpr", "ARMOURING", "CHESTPLATE", 117, 119,
+     {"hpr": {"weight": 1000}, "mr": {"weight": 300}, "durability": {"min": 75, "weight": 1}}),
+    ("tai_hpr", "TAILORING", "LEGGINGS", 117, 119,
+     {"hpr": {"weight": 1000}, "mr": {"weight": 300}, "hpBonus": {"weight": 50},
+      "durability": {"min": 50, "weight": 1}}),
+    ("jew_hpr", "JEWELING", "RING", 117, 119,
+     {"hpr": {"weight": 1000}, "mr": {"weight": 300}, "durability": {"min": 30, "weight": 1}}),
 ]
 
 
@@ -219,41 +227,54 @@ def main():
                 json.dump(fixtures, f, indent=2)
         dfs_sc, dfs_v = oracle(dfs_build, rr, tier, query, ibid)
 
-        # solver under test (wall-clock timed, generic)
+        # solver under test (wall-clock timed, generic). Tolerate a solver that
+        # can't handle a case yet (e.g. composites not implemented) so the DFS
+        # ground truth still gets recorded for every case.
         t = time()
-        sol_build = solver(query, skill, itype, tier, lmn, lmx, ings, recipes)
+        try:
+            sol_build = solver(query, skill, itype, tier, lmn, lmx, ings, recipes)
+            sol_err = None
+        except Exception as ex:
+            sol_build, sol_err = None, f"{type(ex).__name__}"
         sol_t = time() - t
         sol_sc, sol_v = oracle(sol_build, rr, tier, query, ibid) if sol_build else (float("-inf"), False)
 
         delta = sol_sc - dfs_sc
-        ok = sol_v and abs(delta) < 1e-6
+        ok = (sol_err is None) and sol_v and abs(delta) < 1e-6
 
         # Persist the solver's result alongside the DFS ground truth, so the
         # fixtures hold a comparison record for every registered solver.
         fixtures[name]["dfs_score"] = round(dfs_sc, 1)
-        fixtures[name].setdefault("solvers", {})[solver_name] = {
+        rec = {"error": sol_err} if sol_build is None else {
             "build": sol_build, "score": round(sol_sc, 1),
-            "time": round(sol_t, 3), "valid": bool(sol_v), "matches_dfs": bool(ok),
-        }
+            "time": round(sol_t, 3), "valid": bool(sol_v), "matches_dfs": bool(ok)}
+        fixtures[name].setdefault("solvers", {})[solver_name] = rec
         with open(FIXTURES, "w", encoding="utf-8") as f:
             json.dump(fixtures, f, indent=2)
 
         passed += ok; failed += (not ok)
         speedup = (dfs_time / sol_t) if sol_t > 0 else float("inf")
 
+        status = "PASS" if ok else (f"ERR:{sol_err}" if sol_err else ("INVALID" if not sol_v else "FAIL"))
         print("=" * 72)
-        print(f"{name}   [{'PASS' if ok else 'FAIL'}{'' if sol_v else ' INVALID'}]   Δscore={delta:+.1f}")
+        print(f"{name}   [{status}]   Δscore={delta:+.1f}")
         print(f"  DFS        score={dfs_sc:>11.1f}  time={dfs_time:>7.1f}s  build={dfs_build}")
-        print(f"  {solver_name:<9} score={sol_sc:>11.1f}  time={sol_t:>7.1f}s  build={sol_build}")
-        print(f"  speedup    {speedup:>6.1f}x")
-        summary.append((name, dfs_sc, sol_sc, delta, dfs_time, sol_t, speedup, ok, sol_v))
+        if sol_build is None:
+            print(f"  {solver_name:<9} (no result: {sol_err})  time={sol_t:>5.1f}s")
+        else:
+            print(f"  {solver_name:<9} score={sol_sc:>11.1f}  time={sol_t:>7.1f}s  build={sol_build}")
+            print(f"  speedup    {speedup:>6.1f}x")
+        summary.append((name, dfs_sc, sol_sc, delta, dfs_time, sol_t, speedup, ok, sol_v, sol_err))
 
     print("=" * 72)
     print(f"{'case':<14}{'DFS score':>12}{'sol score':>12}{'Δ':>9}{'DFS t':>8}{'sol t':>8}{'speedup':>9}  res")
     print("-" * 72)
-    for nm, dsc, ssc, d, dt, st, sp, ok, sv in summary:
-        print(f"{nm:<14}{dsc:>12.1f}{ssc:>12.1f}{d:>9.1f}{dt:>7.1f}s{st:>7.1f}s{sp:>8.1f}x  "
-              f"{'PASS' if ok else 'FAIL'}{'' if sv else ' INVALID'}")
+    for nm, dsc, ssc, d, dt, st, sp, ok, sv, err in summary:
+        res = "PASS" if ok else (f"ERR:{err}" if err else ("INVALID" if not sv else "FAIL"))
+        ssc_s = "      n/a" if err else f"{ssc:>12.1f}"
+        d_s = "      -" if err else f"{d:>9.1f}"
+        sp_s = "     -" if err else f"{sp:>8.1f}x"
+        print(f"{nm:<14}{dsc:>12.1f}{ssc_s}{d_s}{dt:>7.1f}s{st:>7.1f}s{sp_s}  {res}")
     print("-" * 72)
     print(f"solver={solver_name}: {passed} passed, {failed} failed  (fixtures: {FIXTURES})")
     return failed == 0

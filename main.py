@@ -10,7 +10,7 @@ from data.meta_set_loader import load_meta_sets
 
 from core.search_engine import search, search_pipelined
 from core.warmup import warm_numba
-from separable_search import solve_separable
+from separable_search import solve_separable, UnsupportedQueryError
 
 from time import time
 import cProfile
@@ -188,10 +188,10 @@ def main():
     )
 
     # ---------- Choose solver ----------
-    # The separable solver is exact and ~30x faster, but only for LINEAR queries.
-    # Composite stats (spell damage / EHP / EHPR / HPR) break per-slot separability,
-    # so any query that defines one falls back to the branch-and-bound DFS.
-    if query.comp_count == 0:
+    # Try the exact separable solver first (linear queries + supported composites,
+    # currently HPR). It raises UnsupportedQueryError for composites it can't handle
+    # yet (spell damage / EHP / EHPR), which fall back to the branch-and-bound DFS.
+    try:
         res = solve_separable(
             user_query, skill, item_type, tier=3, lvl_min=117, lvl_max=119,
             search_for_inversion=True, consumable=consumable,
@@ -204,8 +204,8 @@ def main():
               + (f"  score={sc:.1f}" if sc is not None else ""))
         print(f"  timing: load {tm['load']:.1f}s + prep {tm['prep']:.2f}s "
               f"+ search {tm['search']:.2f}s")
-    else:
-        print(f"Solver: DFS  (composite stats present: comp_count={query.comp_count})")
+    except UnsupportedQueryError as ex:
+        print(f"Solver: DFS  ({ex})")
         t_warm = time()
         warm_numba()
         print(f"Numba warm-up: {time() - t_warm:.1f}s")

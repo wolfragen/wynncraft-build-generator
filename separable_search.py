@@ -122,6 +122,118 @@ def _solve_row(void_eidx, base_score, base_cval, score_sorted, cmarg_sorted,
     return best_loc, choice
 
 
+# ---------------------------------------------------------------------------
+# Composite support: HPR = rawToPct(hprRaw, hprPct) — see solve_separable.
+# ---------------------------------------------------------------------------
+@njit(cache=True)
+def _rtp(r, d):
+    """rawToPct, matching core/search_engine._raw_to_pct and the oracle."""
+    if r > 0:
+        return (r * (100 + d)) // 100
+    if r < 0:
+        v = (r * (100 - d)) // 100
+        return v if v < 0 else 0
+    return 0
+
+
+def _rtp_np(r, d):
+    """Vectorised rawToPct over int arrays."""
+    r = r.astype(np.int64); d = d.astype(np.int64)
+    out = np.zeros(r.shape, np.int64)
+    pos = r > 0
+    out[pos] = (r[pos] * (100 + d[pos])) // 100
+    neg = r < 0
+    if neg.any():
+        out[neg] = np.minimum((r[neg] * (100 - d[neg])) // 100, 0)
+    return out
+
+
+def _rtp_max_np(rlo, rhi, plo, phi):
+    """Max of rawToPct over the box [rlo,rhi]x[plo,phi] (4 corners)."""
+    return np.maximum.reduce([_rtp_np(rlo, plo), _rtp_np(rlo, phi),
+                              _rtp_np(rhi, plo), _rtp_np(rhi, phi)])
+
+
+@njit(cache=True)
+def _solve_row_hpr(void_eidx, base_score, base_cval, base_rmax, base_rmin, base_pmax, base_pmin,
+                   score_sorted, cmarg_sorted, hrmax_s, hrmin_s, hpmax_s, hpmin_s,
+                   best_score_per_eff, thr, sign, w_hpr,
+                   has_cmin, cmin_thr, has_cmax, cmax_thr, row_comp_ub, best_global):
+    """
+    Exact per-row constrained void-fill WITH the HPR composite. Same explicit-stack
+    DFS as _solve_row, but it also accumulates the hprRaw/hprPct roll totals and adds
+    w_hpr*(0.99*cmax + 0.01*cmin) at the leaf (cmax/cmin = rawToPct at the two roll
+    corners). Pruning uses the linear suffix bound plus a CONSTANT composite upper
+    bound for the row (`row_comp_ub`), which is sound because it over-estimates the
+    composite gain regardless of which ranks remain.
+    """
+    k = void_eidx.shape[0]; C = thr.shape[0]; N = score_sorted.shape[1]
+    suf = np.zeros(k + 1)
+    for j in range(k - 1, -1, -1):
+        suf[j] = suf[j + 1] + best_score_per_eff[void_eidx[j]]
+    best_loc = best_global
+    choice = np.full(k, -1, np.int64)
+    cur_choice = np.full(k, -1, np.int64)
+    stack_r = np.zeros(k, np.int64)
+    cum_score = np.zeros(k + 1)
+    cum_cval = np.zeros((k + 1, C))
+    cum_rmax = np.zeros(k + 1); cum_rmin = np.zeros(k + 1)
+    cum_pmax = np.zeros(k + 1); cum_pmin = np.zeros(k + 1)
+    cum_cval[0] = base_cval; cum_score[0] = base_score
+    cum_rmax[0] = base_rmax; cum_rmin[0] = base_rmin
+    cum_pmax[0] = base_pmax; cum_pmin[0] = base_pmin
+    j = 0
+    if k > 0:
+        stack_r[0] = 0
+    while j >= 0:
+        if j == k:
+            ca = _rtp(np.int64(cum_rmin[k]), np.int64(cum_pmin[k]))
+            cb = _rtp(np.int64(cum_rmax[k]), np.int64(cum_pmax[k]))
+            cmn = ca if ca < cb else cb        # match oracle: sort the corner pair
+            cmx = cb if ca < cb else ca
+            ok = True
+            if has_cmin and cmx < cmin_thr:
+                ok = False
+            if has_cmax and cmn > cmax_thr:
+                ok = False
+            if ok:
+                for c in range(C):
+                    if sign[c] > 0:
+                        if cum_cval[k, c] < thr[c]:
+                            ok = False; break
+                    else:
+                        if cum_cval[k, c] > thr[c]:
+                            ok = False; break
+            if ok:
+                total = cum_score[k] + w_hpr * (0.99 * cmx + 0.01 * cmn)
+                if total > best_loc:
+                    best_loc = total
+                    for jj in range(k):
+                        choice[jj] = cur_choice[jj]
+            j -= 1
+            if j >= 0:
+                stack_r[j] += 1
+            continue
+        ei = void_eidx[j]; r = stack_r[j]
+        if r >= N or cum_score[j] + score_sorted[ei, r] + suf[j + 1] + row_comp_ub <= best_loc:
+            j -= 1
+            if j >= 0:
+                stack_r[j] += 1
+            continue
+        cur_choice[j] = r
+        cum_score[j + 1] = cum_score[j] + score_sorted[ei, r]
+        for c in range(C):
+            cum_cval[j + 1, c] = cum_cval[j, c] + cmarg_sorted[c, ei, r]
+        cum_rmax[j + 1] = cum_rmax[j] + hrmax_s[ei, r]
+        cum_rmin[j + 1] = cum_rmin[j] + hrmin_s[ei, r]
+        cum_pmax[j + 1] = cum_pmax[j] + hpmax_s[ei, r]
+        cum_pmin[j + 1] = cum_pmin[j] + hpmin_s[ei, r]
+        j += 1
+        if j < k:
+            stack_r[j] = 0
+    return best_loc, choice
+
+
 def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
                     search_for_inversion=True, base_path="data/precalc/generic_cull",
                     consumable=False, ingredients_raw=None, recipes=None, verbose=False):
@@ -138,12 +250,23 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
 
     Raises UnsupportedQueryError for composite queries.
     """
+    from data.stats import FORMULA_RAW_TO_PCT
     q = build_query(user_json=user_query, search_for_inversion=search_for_inversion,
                     item_type=item_type, skill=skill, consumable=consumable)
+    # Composite support: a single HPR (rawToPct) composite is handled exactly via the
+    # meta-row B&B + composite-aware per-row solve. Anything else falls back to the DFS.
+    hpr = None
     if q.comp_count > 0:
-        raise UnsupportedQueryError(
-            f"Composite stats are outside the separable solver's exact scope "
-            f"(query defines {q.comp_count}). Use the DFS (main.py).")
+        if q.comp_count == 1 and int(q.comp_formula[0]) == FORMULA_RAW_TO_PCT:
+            off = int(q.comp_dep_offset[0])
+            hpr = {"raw": int(q.comp_dep_indices[off]), "pct": int(q.comp_dep_indices[off + 1]),
+                   "w": float(q.comp_weight[0]),
+                   "has_min": bool(q.comp_has_min[0]), "min": float(q.comp_min[0]),
+                   "has_max": bool(q.comp_has_max[0]), "max": float(q.comp_max[0])}
+        else:
+            raise UnsupportedQueryError(
+                f"Only a single HPR (rawToPct) composite is supported so far "
+                f"(query defines {q.comp_count}). Use the DFS (main.py).")
 
     if ingredients_raw is None:
         ingredients_raw = load_ingredients("data/ingreds_compress.json")
@@ -182,6 +305,11 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
 
     score_eff = np.zeros((E, N))
     cmarg = np.zeros((C, E, N))
+    # HPR composite: per-eff roll contributions of the two deps (hprRaw, hprPct).
+    hrmax = hrmin = hpmax = hpmin = None
+    if hpr is not None:
+        hrmax = np.zeros((E, N)); hrmin = np.zeros((E, N))
+        hpmax = np.zeros((E, N)); hpmin = np.zeros((E, N))
     for ei, eff in enumerate(all_effs):
         eff = int(eff)
         if eff >= 0:
@@ -193,6 +321,9 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
         score_eff[ei] = (cmax * 0.99 + cmin * 0.01) @ w
         for ci, (s, sg, _) in enumerate(cons):
             cmarg[ci, ei] = cmax[:, s] if sg > 0 else cmin[:, s]
+        if hpr is not None:
+            hrmax[ei] = cmax[:, hpr["raw"]]; hrmin[ei] = cmin[:, hpr["raw"]]
+            hpmax[ei] = cmax[:, hpr["pct"]]; hpmin[ei] = cmin[:, hpr["pct"]]
 
     order = np.argsort(-score_eff, axis=1)
     score_sorted = np.ascontiguousarray(np.take_along_axis(score_eff, order, axis=1))
@@ -201,6 +332,17 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
         cmarg_sorted[ci] = np.take_along_axis(cmarg[ci], order, axis=1)
     cmarg_sorted = np.ascontiguousarray(cmarg_sorted)
     best_score_per_eff = np.ascontiguousarray(score_sorted[:, 0].copy())
+
+    if hpr is not None:
+        hrmax_s = np.ascontiguousarray(np.take_along_axis(hrmax, order, axis=1))
+        hrmin_s = np.ascontiguousarray(np.take_along_axis(hrmin, order, axis=1))
+        hpmax_s = np.ascontiguousarray(np.take_along_axis(hpmax, order, axis=1))
+        hpmin_s = np.ascontiguousarray(np.take_along_axis(hpmin, order, axis=1))
+        # per-eff min/max of each dep marginal (for the per-row composite upper bound)
+        hr_x = (hrmax.max(1).astype(np.int64), hrmax.min(1).astype(np.int64))   # (max,min) of hprRaw-max
+        hr_n = (hrmin.max(1).astype(np.int64), hrmin.min(1).astype(np.int64))   # hprRaw-min
+        hp_x = (hpmax.max(1).astype(np.int64), hpmax.min(1).astype(np.int64))   # hprPct-max
+        hp_n = (hpmin.max(1).astype(np.int64), hpmin.min(1).astype(np.int64))   # hprPct-min
 
     cstat_idx = np.array([c[0] for c in cons], np.int64)
     cstat_max = sign > 0    # True -> use base_max column, else base_min
@@ -223,7 +365,25 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
             ix = np.searchsorted(all_effs, b.void_eff_matrix[:, j])
             veidx[:, j] = ix
             bound += best_score_per_eff[ix]
-        pre.append((M, base_score, imax, imin, veidx))
+        comp_ub = None
+        if hpr is not None:
+            # Per-row composite upper bound: max rawToPct over the reachable dep-total
+            # box (base + Σ_void [min..max] dep marginal), for both roll corners. Valid
+            # (monotone, independent maxima overestimate) — sound for B&B pruning.
+            Rxlo = imax[:, hpr["raw"]].astype(np.int64).copy(); Rxhi = Rxlo.copy()
+            Rnlo = imin[:, hpr["raw"]].astype(np.int64).copy(); Rnhi = Rnlo.copy()
+            Pxlo = imax[:, hpr["pct"]].astype(np.int64).copy(); Pxhi = Pxlo.copy()
+            Pnlo = imin[:, hpr["pct"]].astype(np.int64).copy(); Pnhi = Pnlo.copy()
+            for j in range(b.void_count):
+                ix = veidx[:, j]
+                Rxhi += hr_x[0][ix]; Rxlo += hr_x[1][ix]
+                Rnhi += hr_n[0][ix]; Rnlo += hr_n[1][ix]
+                Pxhi += hp_x[0][ix]; Pxlo += hp_x[1][ix]
+                Pnhi += hp_n[0][ix]; Pnlo += hp_n[1][ix]
+            comp_ub = hpr["w"] * np.maximum(_rtp_max_np(Rxlo, Rxhi, Pxlo, Pxhi),
+                                            _rtp_max_np(Rnlo, Rnhi, Pnlo, Pnhi))
+            bound = bound + comp_ub
+        pre.append((M, base_score, imax, imin, veidx, comp_ub))
         all_bounds.append(bound)
         all_n.append(np.full(M, n, np.int64))
         all_m.append(np.arange(M, dtype=np.int64))
@@ -238,13 +398,23 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
         if bounds_all[oi] <= best:
             break
         n = int(n_all[oi]); m = int(m_all[oi])
-        _, base_score, imax, imin, veidx = pre[n]
+        _, base_score, imax, imin, veidx, comp_ub = pre[n]
         # constrained-stat base for THIS row only (min-constraint uses max-roll base,
         # max-constraint uses min-roll base).
         base_cval = np.where(cstat_max, imax[m, cstat_idx], imin[m, cstat_idx]).astype(np.float64)
-        sc, choice = _solve_row(veidx[m], float(base_score[m]), base_cval,
-                                score_sorted, cmarg_sorted, best_score_per_eff,
-                                thr, sign, best)
+        if hpr is None:
+            sc, choice = _solve_row(veidx[m], float(base_score[m]), base_cval,
+                                    score_sorted, cmarg_sorted, best_score_per_eff,
+                                    thr, sign, best)
+        else:
+            sc, choice = _solve_row_hpr(
+                veidx[m], float(base_score[m]), base_cval,
+                float(imax[m, hpr["raw"]]), float(imin[m, hpr["raw"]]),
+                float(imax[m, hpr["pct"]]), float(imin[m, hpr["pct"]]),
+                score_sorted, cmarg_sorted, hrmax_s, hrmin_s, hpmax_s, hpmin_s,
+                best_score_per_eff, thr, sign, hpr["w"],
+                hpr["has_min"], hpr["min"], hpr["has_max"], hpr["max"],
+                float(comp_ub[m]), best)
         solved += 1
         if sc > best:
             best = sc; best_rc = choice.copy(); best_n = n; best_m = m
