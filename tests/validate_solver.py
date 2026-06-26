@@ -36,8 +36,9 @@ from data.recipe import build_recipe
 from query.query import build_query
 from query.ingredient_filter import filter_raw_ingredients, split_and_cull_by_sign
 from data.stats import CONSU_SKILLS
-from core.search_engine import search_pipelined
+from core.search_engine import search_pipelined, _ehp_bounds, _ehpr_bounds
 from core.warmup import warm_numba
+from data.stats import DERIVED_FORMULA
 from main_decode import (_index_ingredients, compute_effectiveness,
                          compute_crafted_stats, score_query)
 from separable_search import solve_separable
@@ -163,6 +164,14 @@ CASES = [
       "durability": {"min": 50, "weight": 1}}),
     ("jew_hpr", "JEWELING", "RING", 117, 119,
      {"hpr": {"weight": 1000}, "mr": {"weight": 300}, "durability": {"min": 30, "weight": 1}}),
+    # ---- composite: EHP = max(5,hpBonus) / (1-(1-agi%)*def%) (SP-denominator) ----
+    ("arm_ehp", "ARMOURING", "CHESTPLATE", 117, 119,
+     {"ehp": {"weight": 1000}, "mr": {"weight": 200}, "durability": {"min": 75, "weight": 1}}),
+    ("tai_ehp", "TAILORING", "LEGGINGS", 117, 119,
+     {"ehp": {"weight": 1000}, "mr": {"weight": 200}, "hpBonus": {"weight": 30},
+      "durability": {"min": 50, "weight": 1}}),
+    ("jew_ehp", "JEWELING", "RING", 117, 119,
+     {"ehp": {"weight": 1000}, "mr": {"weight": 200}, "durability": {"min": 30, "weight": 1}}),
 ]
 
 
@@ -179,11 +188,47 @@ def run_dfs(ings, recipes, skill, item_type, tier, lmn, lmx, query):
     return [int(i) for i in best]
 
 
+def _composite_extra(stats, query):
+    """
+    Engine-faithful score for the composites score_query SKIPS (ehp/ehpr need build
+    context). Uses the ENGINE's own _ehp_bounds/_ehpr_bounds on the build's crafted
+    stats — independent of the solver under test, so both the DFS and the solver get
+    compared on linear + composite. Returns (extra_score, composite_valid). HPR
+    (raw_to_pct) is already scored by score_query, so it is not re-added here.
+    """
+    def mm(name):
+        e = stats.get(name)
+        return (int(e["min"]), int(e["max"])) if e else (0, 0)
+
+    extra = 0.0; valid = True
+    for name, cfg in query.items():
+        f = DERIVED_FORMULA.get(name)
+        if f == "ehp":
+            hp = mm("hpBonus"); df = mm("def"); ag = mm("agi")
+            cmin, cmax = _ehp_bounds(hp[0], hp[1], df[0], df[1], ag[0], ag[1])
+        elif f == "ehpr":
+            r = mm("hprRaw"); p = mm("hprPct"); df = mm("def"); ag = mm("agi")
+            cmin, cmax = _ehpr_bounds(r[0], r[1], p[0], p[1], df[0], df[1], ag[0], ag[1])
+        else:
+            continue
+        cmin = int(cmin); cmax = int(cmax)
+        if cfg.get("min") is not None and cmax < cfg["min"]:
+            valid = False
+        if cfg.get("max") is not None and cmin > cfg["max"]:
+            valid = False
+        w = cfg.get("weight", 0) or 0
+        if w:
+            extra += w * (cmax * 0.99 + cmin * 0.01)
+    return extra, valid
+
+
 def oracle(build, recipe_raw, tier, query, ibid):
     entries = [ibid[i] for i in build]
     eff = compute_effectiveness(entries)
-    r = score_query(compute_crafted_stats(recipe_raw.data, tier, entries, eff), query)
-    return r["score"], r["valid"]
+    crafted = compute_crafted_stats(recipe_raw.data, tier, entries, eff)
+    r = score_query(crafted, query)
+    extra, cvalid = _composite_extra(crafted["stats"], query)
+    return r["score"] + extra, (r["valid"] and cvalid)
 
 
 def main():

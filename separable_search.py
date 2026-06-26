@@ -44,6 +44,17 @@ from data.recipe import build_recipe
 from query.query import build_query
 from query.ingredient_filter import filter_raw_ingredients
 from data.meta_set_loader import load_meta_sets
+from data.skillpoint_lookup import SKP_HEADLINE_PCT, SKP_DEF, SKP_AGI, SKP_MAX
+
+# Skill-point -> headline % rows for the EHP/EHPR denominator (mirror search_engine).
+_SKP_DEF_ROW = np.ascontiguousarray(SKP_HEADLINE_PCT[SKP_DEF])   # (151,) float64
+_SKP_AGI_ROW = np.ascontiguousarray(SKP_HEADLINE_PCT[SKP_AGI])
+_SKP_MAX = int(SKP_MAX)
+
+# Composite type codes (the supported, non-spell composites).
+_C_HPR = 0    # rawToPct(hprRaw, hprPct)
+_C_EHP = 1    # max(5,hpBonus) / D(def,agi)
+_C_EHPR = 2   # rawToPct(hprRaw,hprPct) / D(def,agi)
 
 
 class UnsupportedQueryError(Exception):
@@ -123,7 +134,8 @@ def _solve_row(void_eidx, base_score, base_cval, score_sorted, cmarg_sorted,
 
 
 # ---------------------------------------------------------------------------
-# Composite support: HPR = rawToPct(hprRaw, hprPct) — see solve_separable.
+# Composite support: HPR / EHP / EHPR (the monotone, non-spell composites).
+# All leaf/bound formulas mirror core/search_engine bit-for-bit.
 # ---------------------------------------------------------------------------
 @njit(cache=True)
 def _rtp(r, d):
@@ -136,8 +148,73 @@ def _rtp(r, d):
     return 0
 
 
+@njit(cache=True)
+def _clamp_skp(c):
+    if c < 0:
+        return np.int64(0)
+    if c > _SKP_MAX:
+        return np.int64(_SKP_MAX)
+    return np.int64(c)
+
+
+@njit(cache=True)
+def _denom(def_lo, def_hi, agi_lo, agi_hi):
+    """Range of D = 1 - (1-agi_pct)*def_pct over the def/agi count ranges."""
+    dl = _clamp_skp(def_lo); dh = _clamp_skp(def_hi)
+    al = _clamp_skp(agi_lo); ah = _clamp_skp(agi_hi)
+    d_min = 1.0 - (1.0 - _SKP_AGI_ROW[al]) * _SKP_DEF_ROW[dh]
+    d_max = 1.0 - (1.0 - _SKP_AGI_ROW[ah]) * _SKP_DEF_ROW[dl]
+    return d_min, d_max
+
+
+@njit(cache=True)
+def _ehp_bounds(hp_lo, hp_hi, def_lo, def_hi, agi_lo, agi_hi):
+    if hp_lo < 5: hp_lo = 5
+    if hp_hi < 5: hp_hi = 5
+    d_min, d_max = _denom(def_lo, def_hi, agi_lo, agi_hi)
+    return np.int64(hp_lo / d_max), np.int64(hp_hi / d_min)
+
+
+@njit(cache=True)
+def _rtp_bounds(raw_lo, raw_hi, dl, dh):
+    """Admissible bounds on rawToPct over the box (mirror search_engine)."""
+    first = True; lo = np.int64(0); hi = np.int64(0)
+    if raw_hi > 0:
+        rl = raw_lo if raw_lo > 0 else np.int64(0)
+        rh = np.int64(raw_hi)
+        c1 = rl * (100 + dl); c2 = rl * (100 + dh)
+        c3 = rh * (100 + dl); c4 = rh * (100 + dh)
+        p_lo = min(min(c1, c2), min(c3, c4)) // 100
+        p_hi = max(max(c1, c2), max(c3, c4)) // 100
+        lo = p_lo; hi = p_hi; first = False
+    if raw_lo < 0:
+        rl = np.int64(raw_lo); rh = raw_hi if raw_hi < 0 else np.int64(0)
+        c1 = rl * (100 - dl); c2 = rl * (100 - dh)
+        c3 = rh * (100 - dl); c4 = rh * (100 - dh)
+        g_lo = min(min(c1, c2), min(c3, c4)) // 100
+        g_hi = max(max(c1, c2), max(c3, c4)) // 100
+        if g_lo > 0: g_lo = np.int64(0)
+        if g_hi > 0: g_hi = np.int64(0)
+        if first:
+            lo = g_lo; hi = g_hi
+        else:
+            if g_lo < lo: lo = g_lo
+            if g_hi > hi: hi = g_hi
+    return lo, hi
+
+
+@njit(cache=True)
+def _ehpr_bounds(raw_lo, raw_hi, pct_lo, pct_hi, def_lo, def_hi, agi_lo, agi_hi):
+    hpr_lo, hpr_hi = _rtp_bounds(raw_lo, raw_hi, pct_lo, pct_hi)
+    d_min, d_max = _denom(def_lo, def_hi, agi_lo, agi_hi)
+    c1 = hpr_lo / d_min; c2 = hpr_lo / d_max
+    c3 = hpr_hi / d_min; c4 = hpr_hi / d_max
+    return np.int64(min(min(c1, c2), min(c3, c4))), np.int64(max(max(c1, c2), max(c3, c4)))
+
+
+# --- vectorised helpers for the per-row composite upper bound (over many rows) ---
 def _rtp_np(r, d):
-    """Vectorised rawToPct over int arrays."""
+    """Vectorised rawToPct over int arrays (matches _rtp)."""
     r = r.astype(np.int64); d = d.astype(np.int64)
     out = np.zeros(r.shape, np.int64)
     pos = r > 0
@@ -148,49 +225,100 @@ def _rtp_np(r, d):
     return out
 
 
-def _rtp_max_np(rlo, rhi, plo, phi):
-    """Max of rawToPct over the box [rlo,rhi]x[plo,phi] (4 corners)."""
-    return np.maximum.reduce([_rtp_np(rlo, plo), _rtp_np(rlo, phi),
-                              _rtp_np(rhi, plo), _rtp_np(rhi, phi)])
+def _denom_min_np(def_hi, agi_lo):
+    """Smallest D over the box (max def, min agi) -> largest EHP/EHPR (for num>0)."""
+    d = np.clip(def_hi, 0, _SKP_MAX).astype(np.int64)
+    a = np.clip(agi_lo, 0, _SKP_MAX).astype(np.int64)
+    return 1.0 - (1.0 - _SKP_AGI_ROW[a]) * _SKP_DEF_ROW[d]
+
+
+def _denom_max_np(def_lo, agi_hi):
+    """Largest D over the box (min def, max agi) -> for the num<0 EHPR corner."""
+    d = np.clip(def_lo, 0, _SKP_MAX).astype(np.int64)
+    a = np.clip(agi_hi, 0, _SKP_MAX).astype(np.int64)
+    return 1.0 - (1.0 - _SKP_AGI_ROW[a]) * _SKP_DEF_ROW[d]
 
 
 @njit(cache=True)
-def _solve_row_hpr(void_eidx, base_score, base_cval, base_rmax, base_rmin, base_pmax, base_pmin,
-                   score_sorted, cmarg_sorted, hrmax_s, hrmin_s, hpmax_s, hpmin_s,
-                   best_score_per_eff, thr, sign, w_hpr,
-                   has_cmin, cmin_thr, has_cmax, cmax_thr, row_comp_ub, best_global):
+def _node_ub(comp_type, cdmax, cdmin, sufhi, suflo, j, w_comp):
     """
-    Exact per-row constrained void-fill WITH the HPR composite. Same explicit-stack
-    DFS as _solve_row, but it also accumulates the hprRaw/hprPct roll totals and adds
-    w_hpr*(0.99*cmax + 0.01*cmin) at the leaf (cmax/cmin = rawToPct at the two roll
-    corners). Pruning uses the linear suffix bound plus a CONSTANT composite upper
-    bound for the row (`row_comp_ub`), which is sound because it over-estimates the
-    composite gain regardless of which ranks remain.
+    Composite upper bound for the subtree at node j: each remaining void slot is
+    replaced by its per-eff favourable extreme (max marginal for the numerator/def,
+    min marginal for agi), so the (monotone) composite over-estimates any completion.
+    cdmax/cdmin are cum_dmax[j]/cum_dmin[j]; sufhi/suflo are the favourable suffix sums.
+    """
+    hi0 = cdmax[0] + sufhi[0, j]; hi1 = cdmax[1] + sufhi[1, j]
+    hi2 = cdmax[2] + sufhi[2, j]; hi3 = cdmax[3] + sufhi[3, j]
+    lo2 = cdmin[2] + suflo[2, j]; lo3 = cdmin[3] + suflo[3, j]
+    if comp_type == 0:        # HPR
+        return w_comp * _rtp(np.int64(hi0), np.int64(hi1))
+    if comp_type == 1:        # EHP: max(5,hp) / D(max def, min agi)
+        dmn, _ = _denom(np.int64(hi1), np.int64(hi1), np.int64(lo2), np.int64(lo2))
+        hh = hi0 if hi0 > 5.0 else 5.0
+        return w_comp * (hh / dmn)
+    # EHPR: numerator / D, two-sided in D to cover the numerator's sign
+    num = _rtp(np.int64(hi0), np.int64(hi1))
+    dmn, _ = _denom(np.int64(hi2), np.int64(hi2), np.int64(lo3), np.int64(lo3))
+    _, dmx = _denom(np.int64(lo2), np.int64(lo2), np.int64(hi3), np.int64(hi3))
+    v1 = num / dmn; v2 = num / dmx
+    return w_comp * (v1 if v1 > v2 else v2)
+
+
+@njit(cache=True)
+def _solve_row_comp(void_eidx, base_score, base_cval, base_dmin, base_dmax,
+                    score_sorted, cmarg_sorted, dmin_s, dmax_s, dmax_emax, dmin_emin,
+                    n_deps, comp_type, best_score_per_eff, thr, sign, w_comp,
+                    has_cmin, cmin_thr, has_cmax, cmax_thr, best_global):
+    """
+    Exact per-row constrained void-fill WITH a monotone composite (HPR/EHP/EHPR).
+    Accumulates the composite's dep roll totals and adds w*(0.99*cmax + 0.01*cmin) at
+    the leaf; prunes on the linear suffix bound plus a NODE-LOCAL composite upper
+    bound (_node_ub) that tightens as deps are fixed down the void-slot DFS — without
+    it, when the composite dominates a tiny linear part the per-row solve degenerates
+    to brute force. dmax_emax/dmin_emin are per-eff favourable extremes (4,E). Dep
+    order per type matches the engine leaf:
+      HPR [hprRaw, hprPct];  EHP [hpBonus, def, agi];  EHPR [hprRaw, hprPct, def, agi].
     """
     k = void_eidx.shape[0]; C = thr.shape[0]; N = score_sorted.shape[1]
     suf = np.zeros(k + 1)
+    sufhi = np.zeros((4, k + 1)); suflo = np.zeros((4, k + 1))
     for j in range(k - 1, -1, -1):
-        suf[j] = suf[j + 1] + best_score_per_eff[void_eidx[j]]
+        ei = void_eidx[j]
+        suf[j] = suf[j + 1] + best_score_per_eff[ei]
+        for d in range(4):
+            sufhi[d, j] = sufhi[d, j + 1] + dmax_emax[d, ei]
+            suflo[d, j] = suflo[d, j + 1] + dmin_emin[d, ei]
     best_loc = best_global
     choice = np.full(k, -1, np.int64)
     cur_choice = np.full(k, -1, np.int64)
     stack_r = np.zeros(k, np.int64)
     cum_score = np.zeros(k + 1)
     cum_cval = np.zeros((k + 1, C))
-    cum_rmax = np.zeros(k + 1); cum_rmin = np.zeros(k + 1)
-    cum_pmax = np.zeros(k + 1); cum_pmin = np.zeros(k + 1)
+    cum_dmin = np.zeros((k + 1, 4)); cum_dmax = np.zeros((k + 1, 4))
+    comp_ub_node = np.zeros(k + 1)
     cum_cval[0] = base_cval; cum_score[0] = base_score
-    cum_rmax[0] = base_rmax; cum_rmin[0] = base_rmin
-    cum_pmax[0] = base_pmax; cum_pmin[0] = base_pmin
+    for dd in range(4):
+        cum_dmin[0, dd] = base_dmin[dd]; cum_dmax[0, dd] = base_dmax[dd]
     j = 0
     if k > 0:
         stack_r[0] = 0
+        comp_ub_node[0] = _node_ub(comp_type, cum_dmax[0], cum_dmin[0], sufhi, suflo, 0, w_comp)
     while j >= 0:
         if j == k:
-            ca = _rtp(np.int64(cum_rmin[k]), np.int64(cum_pmin[k]))
-            cb = _rtp(np.int64(cum_rmax[k]), np.int64(cum_pmax[k]))
-            cmn = ca if ca < cb else cb        # match oracle: sort the corner pair
-            cmx = cb if ca < cb else ca
+            if comp_type == 0:        # HPR
+                ca = _rtp(np.int64(cum_dmin[k, 0]), np.int64(cum_dmin[k, 1]))
+                cb = _rtp(np.int64(cum_dmax[k, 0]), np.int64(cum_dmax[k, 1]))
+                cmn = ca if ca < cb else cb
+                cmx = cb if ca < cb else ca
+            elif comp_type == 1:      # EHP
+                cmn, cmx = _ehp_bounds(np.int64(cum_dmin[k, 0]), np.int64(cum_dmax[k, 0]),
+                                       np.int64(cum_dmin[k, 1]), np.int64(cum_dmax[k, 1]),
+                                       np.int64(cum_dmin[k, 2]), np.int64(cum_dmax[k, 2]))
+            else:                     # EHPR
+                cmn, cmx = _ehpr_bounds(np.int64(cum_dmin[k, 0]), np.int64(cum_dmax[k, 0]),
+                                        np.int64(cum_dmin[k, 1]), np.int64(cum_dmax[k, 1]),
+                                        np.int64(cum_dmin[k, 2]), np.int64(cum_dmax[k, 2]),
+                                        np.int64(cum_dmin[k, 3]), np.int64(cum_dmax[k, 3]))
             ok = True
             if has_cmin and cmx < cmin_thr:
                 ok = False
@@ -205,7 +333,7 @@ def _solve_row_hpr(void_eidx, base_score, base_cval, base_rmax, base_rmin, base_
                         if cum_cval[k, c] > thr[c]:
                             ok = False; break
             if ok:
-                total = cum_score[k] + w_hpr * (0.99 * cmx + 0.01 * cmn)
+                total = cum_score[k] + w_comp * (0.99 * cmx + 0.01 * cmn)
                 if total > best_loc:
                     best_loc = total
                     for jj in range(k):
@@ -215,7 +343,7 @@ def _solve_row_hpr(void_eidx, base_score, base_cval, base_rmax, base_rmin, base_
                 stack_r[j] += 1
             continue
         ei = void_eidx[j]; r = stack_r[j]
-        if r >= N or cum_score[j] + score_sorted[ei, r] + suf[j + 1] + row_comp_ub <= best_loc:
+        if r >= N or cum_score[j] + score_sorted[ei, r] + suf[j + 1] + comp_ub_node[j] <= best_loc:
             j -= 1
             if j >= 0:
                 stack_r[j] += 1
@@ -224,13 +352,16 @@ def _solve_row_hpr(void_eidx, base_score, base_cval, base_rmax, base_rmin, base_
         cum_score[j + 1] = cum_score[j] + score_sorted[ei, r]
         for c in range(C):
             cum_cval[j + 1, c] = cum_cval[j, c] + cmarg_sorted[c, ei, r]
-        cum_rmax[j + 1] = cum_rmax[j] + hrmax_s[ei, r]
-        cum_rmin[j + 1] = cum_rmin[j] + hrmin_s[ei, r]
-        cum_pmax[j + 1] = cum_pmax[j] + hpmax_s[ei, r]
-        cum_pmin[j + 1] = cum_pmin[j] + hpmin_s[ei, r]
+        for dd in range(4):
+            cum_dmin[j + 1, dd] = cum_dmin[j, dd]
+            cum_dmax[j + 1, dd] = cum_dmax[j, dd]
+        for dd in range(n_deps):
+            cum_dmin[j + 1, dd] += dmin_s[dd, ei, r]
+            cum_dmax[j + 1, dd] += dmax_s[dd, ei, r]
         j += 1
         if j < k:
             stack_r[j] = 0
+            comp_ub_node[j] = _node_ub(comp_type, cum_dmax[j], cum_dmin[j], sufhi, suflo, j, w_comp)
     return best_loc, choice
 
 
@@ -250,23 +381,29 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
 
     Raises UnsupportedQueryError for composite queries.
     """
-    from data.stats import FORMULA_RAW_TO_PCT
+    from data.stats import FORMULA_RAW_TO_PCT, FORMULA_EHP, FORMULA_EHPR
     q = build_query(user_json=user_query, search_for_inversion=search_for_inversion,
                     item_type=item_type, skill=skill, consumable=consumable)
-    # Composite support: a single HPR (rawToPct) composite is handled exactly via the
-    # meta-row B&B + composite-aware per-row solve. Anything else falls back to the DFS.
-    hpr = None
+    # Composite support: a single monotone composite (HPR / EHP / EHPR) is handled
+    # exactly via the meta-row B&B + composite-aware per-row solve. Dep order mirrors
+    # the engine leaf. Anything else (spell, multiple composites) falls back to the DFS.
+    _CTYPE = {FORMULA_RAW_TO_PCT: (_C_HPR, 2), FORMULA_EHP: (_C_EHP, 3),
+              FORMULA_EHPR: (_C_EHPR, 4)}
+    comp = None
     if q.comp_count > 0:
-        if q.comp_count == 1 and int(q.comp_formula[0]) == FORMULA_RAW_TO_PCT:
+        f0 = int(q.comp_formula[0])
+        if q.comp_count == 1 and f0 in _CTYPE:
+            ctype, ndeps = _CTYPE[f0]
             off = int(q.comp_dep_offset[0])
-            hpr = {"raw": int(q.comp_dep_indices[off]), "pct": int(q.comp_dep_indices[off + 1]),
-                   "w": float(q.comp_weight[0]),
-                   "has_min": bool(q.comp_has_min[0]), "min": float(q.comp_min[0]),
-                   "has_max": bool(q.comp_has_max[0]), "max": float(q.comp_max[0])}
+            comp = {"type": ctype, "n": ndeps,
+                    "deps": [int(q.comp_dep_indices[off + i]) for i in range(ndeps)],
+                    "w": float(q.comp_weight[0]),
+                    "has_min": bool(q.comp_has_min[0]), "min": float(q.comp_min[0]),
+                    "has_max": bool(q.comp_has_max[0]), "max": float(q.comp_max[0])}
         else:
             raise UnsupportedQueryError(
-                f"Only a single HPR (rawToPct) composite is supported so far "
-                f"(query defines {q.comp_count}). Use the DFS (main.py).")
+                f"Only a single HPR/EHP/EHPR composite is supported so far "
+                f"(query defines {q.comp_count}, formula {f0}). Use the DFS (main.py).")
 
     if ingredients_raw is None:
         ingredients_raw = load_ingredients("data/ingreds_compress.json")
@@ -305,11 +442,10 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
 
     score_eff = np.zeros((E, N))
     cmarg = np.zeros((C, E, N))
-    # HPR composite: per-eff roll contributions of the two deps (hprRaw, hprPct).
-    hrmax = hrmin = hpmax = hpmin = None
-    if hpr is not None:
-        hrmax = np.zeros((E, N)); hrmin = np.zeros((E, N))
-        hpmax = np.zeros((E, N)); hpmin = np.zeros((E, N))
+    # Composite: per-eff roll contributions (max/min) of each dep, in dep order.
+    nd = comp["n"] if comp is not None else 0
+    dmax_e = np.zeros((nd, E, N)) if comp is not None else None
+    dmin_e = np.zeros((nd, E, N)) if comp is not None else None
     for ei, eff in enumerate(all_effs):
         eff = int(eff)
         if eff >= 0:
@@ -321,9 +457,10 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
         score_eff[ei] = (cmax * 0.99 + cmin * 0.01) @ w
         for ci, (s, sg, _) in enumerate(cons):
             cmarg[ci, ei] = cmax[:, s] if sg > 0 else cmin[:, s]
-        if hpr is not None:
-            hrmax[ei] = cmax[:, hpr["raw"]]; hrmin[ei] = cmin[:, hpr["raw"]]
-            hpmax[ei] = cmax[:, hpr["pct"]]; hpmin[ei] = cmin[:, hpr["pct"]]
+        if comp is not None:
+            for d in range(nd):
+                sidx = comp["deps"][d]
+                dmax_e[d, ei] = cmax[:, sidx]; dmin_e[d, ei] = cmin[:, sidx]
 
     order = np.argsort(-score_eff, axis=1)
     score_sorted = np.ascontiguousarray(np.take_along_axis(score_eff, order, axis=1))
@@ -333,16 +470,20 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
     cmarg_sorted = np.ascontiguousarray(cmarg_sorted)
     best_score_per_eff = np.ascontiguousarray(score_sorted[:, 0].copy())
 
-    if hpr is not None:
-        hrmax_s = np.ascontiguousarray(np.take_along_axis(hrmax, order, axis=1))
-        hrmin_s = np.ascontiguousarray(np.take_along_axis(hrmin, order, axis=1))
-        hpmax_s = np.ascontiguousarray(np.take_along_axis(hpmax, order, axis=1))
-        hpmin_s = np.ascontiguousarray(np.take_along_axis(hpmin, order, axis=1))
-        # per-eff min/max of each dep marginal (for the per-row composite upper bound)
-        hr_x = (hrmax.max(1).astype(np.int64), hrmax.min(1).astype(np.int64))   # (max,min) of hprRaw-max
-        hr_n = (hrmin.max(1).astype(np.int64), hrmin.min(1).astype(np.int64))   # hprRaw-min
-        hp_x = (hpmax.max(1).astype(np.int64), hpmax.min(1).astype(np.int64))   # hprPct-max
-        hp_n = (hpmin.max(1).astype(np.int64), hpmin.min(1).astype(np.int64))   # hprPct-min
+    dmax_s = dmin_s = None
+    dmax_emax = dmin_emin = None
+    if comp is not None:
+        # length-4 (kernel signature is fixed-width); deps 0..nd-1 used.
+        dmax_s = np.zeros((4, E, N)); dmin_s = np.zeros((4, E, N))
+        for d in range(nd):
+            dmax_s[d] = np.take_along_axis(dmax_e[d], order, axis=1)
+            dmin_s[d] = np.take_along_axis(dmin_e[d], order, axis=1)
+        dmax_s = np.ascontiguousarray(dmax_s); dmin_s = np.ascontiguousarray(dmin_s)
+        # per-eff favourable extremes (max of each dep's max-roll marginal, min of each
+        # dep's min-roll marginal) — drive both the per-row bound and the node-local UB.
+        dmax_emax = np.zeros((4, E)); dmin_emin = np.zeros((4, E))
+        dmax_emax[:nd] = dmax_e.max(2); dmin_emin[:nd] = dmin_e.min(2)
+        dmax_emax = np.ascontiguousarray(dmax_emax); dmin_emin = np.ascontiguousarray(dmin_emin)
 
     cstat_idx = np.array([c[0] for c in cons], np.int64)
     cstat_max = sign > 0    # True -> use base_max column, else base_min
@@ -366,22 +507,30 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
             veidx[:, j] = ix
             bound += best_score_per_eff[ix]
         comp_ub = None
-        if hpr is not None:
-            # Per-row composite upper bound: max rawToPct over the reachable dep-total
-            # box (base + Σ_void [min..max] dep marginal), for both roll corners. Valid
-            # (monotone, independent maxima overestimate) — sound for B&B pruning.
-            Rxlo = imax[:, hpr["raw"]].astype(np.int64).copy(); Rxhi = Rxlo.copy()
-            Rnlo = imin[:, hpr["raw"]].astype(np.int64).copy(); Rnhi = Rnlo.copy()
-            Pxlo = imax[:, hpr["pct"]].astype(np.int64).copy(); Pxhi = Pxlo.copy()
-            Pnlo = imin[:, hpr["pct"]].astype(np.int64).copy(); Pnhi = Pnlo.copy()
+        if comp is not None:
+            # Per-row composite upper bound. d_hi[d] = max reachable max-roll total of
+            # dep d (base_max + Σ_void per-eff max marginal); d_lo[d] = min reachable
+            # min-roll total. Plug the EHP/HPR-favourable extremes into the (monotone)
+            # leaf formula -> a valid over-estimate, sound for B&B pruning.
+            d_hi = np.zeros((nd, M)); d_lo = np.zeros((nd, M))
+            for d in range(nd):
+                sidx = comp["deps"][d]
+                d_hi[d] = imax[:, sidx].astype(np.float64)
+                d_lo[d] = imin[:, sidx].astype(np.float64)
             for j in range(b.void_count):
                 ix = veidx[:, j]
-                Rxhi += hr_x[0][ix]; Rxlo += hr_x[1][ix]
-                Rnhi += hr_n[0][ix]; Rnlo += hr_n[1][ix]
-                Pxhi += hp_x[0][ix]; Pxlo += hp_x[1][ix]
-                Pnhi += hp_n[0][ix]; Pnlo += hp_n[1][ix]
-            comp_ub = hpr["w"] * np.maximum(_rtp_max_np(Rxlo, Rxhi, Pxlo, Pxhi),
-                                            _rtp_max_np(Rnlo, Rnhi, Pnlo, Pnhi))
+                for d in range(nd):
+                    d_hi[d] += dmax_emax[d][ix]
+                    d_lo[d] += dmin_emin[d][ix]
+            if comp["type"] == _C_HPR:
+                cub = _rtp_np(d_hi[0], d_hi[1]).astype(np.float64)
+            elif comp["type"] == _C_EHP:
+                cub = np.maximum(5.0, d_hi[0]) / _denom_min_np(d_hi[1], d_lo[2])
+            else:  # EHPR
+                num_hi = _rtp_np(d_hi[0], d_hi[1]).astype(np.float64)
+                cub = np.maximum(num_hi / _denom_min_np(d_hi[2], d_lo[3]),
+                                 num_hi / _denom_max_np(d_lo[2], d_hi[3]))
+            comp_ub = comp["w"] * cub
             bound = bound + comp_ub
         pre.append((M, base_score, imax, imin, veidx, comp_ub))
         all_bounds.append(bound)
@@ -402,19 +551,20 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
         # constrained-stat base for THIS row only (min-constraint uses max-roll base,
         # max-constraint uses min-roll base).
         base_cval = np.where(cstat_max, imax[m, cstat_idx], imin[m, cstat_idx]).astype(np.float64)
-        if hpr is None:
+        if comp is None:
             sc, choice = _solve_row(veidx[m], float(base_score[m]), base_cval,
                                     score_sorted, cmarg_sorted, best_score_per_eff,
                                     thr, sign, best)
         else:
-            sc, choice = _solve_row_hpr(
-                veidx[m], float(base_score[m]), base_cval,
-                float(imax[m, hpr["raw"]]), float(imin[m, hpr["raw"]]),
-                float(imax[m, hpr["pct"]]), float(imin[m, hpr["pct"]]),
-                score_sorted, cmarg_sorted, hrmax_s, hrmin_s, hpmax_s, hpmin_s,
-                best_score_per_eff, thr, sign, hpr["w"],
-                hpr["has_min"], hpr["min"], hpr["has_max"], hpr["max"],
-                float(comp_ub[m]), best)
+            base_dmax = np.zeros(4); base_dmin = np.zeros(4)
+            for d in range(comp["n"]):
+                sidx = comp["deps"][d]
+                base_dmax[d] = float(imax[m, sidx]); base_dmin[d] = float(imin[m, sidx])
+            sc, choice = _solve_row_comp(
+                veidx[m], float(base_score[m]), base_cval, base_dmin, base_dmax,
+                score_sorted, cmarg_sorted, dmin_s, dmax_s, dmax_emax, dmin_emin,
+                comp["n"], comp["type"], best_score_per_eff, thr, sign, comp["w"],
+                comp["has_min"], comp["min"], comp["has_max"], comp["max"], best)
         solved += 1
         if sc > best:
             best = sc; best_rc = choice.copy(); best_n = n; best_m = m
