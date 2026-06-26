@@ -202,17 +202,21 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
     cmarg_sorted = np.ascontiguousarray(cmarg_sorted)
     best_score_per_eff = np.ascontiguousarray(score_sorted[:, 0].copy())
 
+    cstat_idx = np.array([c[0] for c in cons], np.int64)
+    cstat_max = sign > 0    # True -> use base_max column, else base_min
     pre = []
     all_bounds = []; all_n = []; all_m = []
     for n, b in enumerate(batches):
         M = b.ings_matrix.shape[0]
         if M == 0:
             pre.append(None); continue
-        bmax = b.base_max_matrix.astype(np.float64); bmin = b.base_min_matrix.astype(np.float64)
-        base_score = (bmax * 0.99 + bmin * 0.01) @ w
-        base_cval = np.zeros((M, C))
-        for ci, (s, sg, _) in enumerate(cons):
-            base_cval[:, ci] = (bmax[:, s] if sg > 0 else bmin[:, s])
+        imax = b.base_max_matrix; imin = b.base_min_matrix          # int32, no float copy
+        # matmul-then-blend: reduce (M,K) to (M,) BEFORE the float blend (avoids the
+        # (M,K) float64 intermediate that dominated prep).
+        base_score = (imax @ w) * 0.99 + (imin @ w) * 0.01
+        # constrained-stat base: gather only the C needed columns (min-constraint uses
+        # max-roll base, max-constraint uses min-roll base).
+        base_cval = np.where(cstat_max[None, :], imax[:, cstat_idx], imin[:, cstat_idx]).astype(np.float64)
         veidx = np.zeros((M, b.void_count), np.int64)
         bound = base_score.copy()
         for j in range(b.void_count):
