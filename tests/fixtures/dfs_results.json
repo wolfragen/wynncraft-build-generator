@@ -1,0 +1,158 @@
+{
+  "arm_sustain": {
+    "build": [
+      528,
+      528,
+      792,
+      863,
+      582,
+      569
+    ],
+    "time": 1.8595643043518066,
+    "skill": "ARMOURING",
+    "item_type": "CHESTPLATE"
+  },
+  "arm_full": {
+    "build": [
+      894,
+      485,
+      420,
+      894,
+      769,
+      622
+    ],
+    "time": 223.9509632587433,
+    "skill": "ARMOURING",
+    "item_type": "CHESTPLATE"
+  },
+  "arm_tightreq": {
+    "build": [
+      603,
+      420,
+      792,
+      765,
+      582,
+      569
+    ],
+    "time": 198.17889785766602,
+    "skill": "ARMOURING",
+    "item_type": "CHESTPLATE"
+  },
+  "tai_legs": {
+    "build": [
+      790,
+      798,
+      790,
+      798,
+      631,
+      591
+    ],
+    "time": 0.8841233253479004,
+    "skill": "TAILORING",
+    "item_type": "LEGGINGS"
+  },
+  "wea_dagger": {
+    "build": [
+      563,
+      563,
+      569,
+      441,
+      757,
+      757
+    ],
+    "time": 0.21873211860656738,
+    "skill": "WEAPONSMITHING",
+    "item_type": "DAGGER"
+  },
+  "jew_ring": {
+    "build": [
+      614,
+      614,
+      909,
+      909,
+      909,
+      909
+    ],
+    "time": 0.04092550277709961,
+    "skill": "JEWELING",
+    "item_type": "RING"
+  },
+  "arm_tank": {
+    "build": [
+      528,
+      528,
+      792,
+      863,
+      582,
+      569
+    ],
+    "time": 1.7478163242340088,
+    "skill": "ARMOURING",
+    "item_type": "CHESTPLATE"
+  },
+  "wea_spell": {
+    "build": [
+      563,
+      569,
+      752,
+      612,
+      612,
+      752
+    ],
+    "time": 0.14892029762268066,
+    "skill": "WEAPONSMITHING",
+    "item_type": "DAGGER"
+  },
+  "jew_minimise": {
+    "build": [
+      588,
+      569,
+      760,
+      593,
+      760,
+      614
+    ],
+    "time": 0.02160501480102539,
+    "skill": "JEWELING",
+    "item_type": "RING"
+  },
+  "arm_maxcon": {
+    "build": [
+      674,
+      570,
+      570,
+      570,
+      570,
+      570
+    ],
+    "time": 1.8146378993988037,
+    "skill": "ARMOURING",
+    "item_type": "CHESTPLATE"
+  },
+  "tai_damage": {
+    "build": [
+      662,
+      887,
+      792,
+      887,
+      582,
+      591
+    ],
+    "time": 0.7758307456970215,
+    "skill": "TAILORING",
+    "item_type": "LEGGINGS"
+  },
+  "jew_full": {
+    "build": [
+      614,
+      614,
+      909,
+      909,
+      909,
+      909
+    ],
+    "time": 0.03144240379333496,
+    "skill": "JEWELING",
+    "item_type": "RING"
+  }
+}
