@@ -172,6 +172,14 @@ CASES = [
       "durability": {"min": 50, "weight": 1}}),
     ("jew_ehp", "JEWELING", "RING", 117, 119,
      {"ehp": {"weight": 1000}, "mr": {"weight": 200}, "durability": {"min": 30, "weight": 1}}),
+    # ---- composite: EHPR = rawToPct(hprRaw,hprPct) / (1-(1-agi%)*def%) ----
+    ("arm_ehpr", "ARMOURING", "CHESTPLATE", 117, 119,
+     {"ehpr": {"weight": 1000}, "mr": {"weight": 200}, "durability": {"min": 75, "weight": 1}}),
+    ("tai_ehpr", "TAILORING", "LEGGINGS", 117, 119,
+     {"ehpr": {"weight": 1000}, "mr": {"weight": 200}, "durability": {"min": 50, "weight": 1}}),
+    ("jew_ehpr", "JEWELING", "RING", 117, 119,
+     {"ehpr": {"weight": 1000}, "mr": {"weight": 200}, "hprRaw": {"weight": 20},
+      "durability": {"min": 30, "weight": 1}}),
 ]
 
 
