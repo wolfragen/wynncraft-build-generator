@@ -10,6 +10,7 @@ from data.meta_set_loader import load_meta_sets
 
 from core.search_engine import search, search_pipelined
 from core.warmup import warm_numba
+from separable_search import solve_separable
 
 from time import time
 import cProfile
@@ -72,76 +73,6 @@ print(aWeight)
 
 def main():
 
-    # ---------- Pre-compile numba kernels ----------
-    t_warm = time()
-    warm_numba()
-    print(f"Numba warm-up: {time() - t_warm:.1f}s")
-
-    # ---------- Load all ingredients ----------
-    ingredients_raw = load_ingredients("data/ingreds_compress.json")
-
-    # ---------- Build User Query ----------
-
-    dps = 497
-pctW = 1000
-def raw(pct, dps=dps) : return 10*pct/dps 
-def is_null(val, epsilon=0.6) : return abs(val) < epsilon
-
-nScale = 396
-eScale = 80
-tScale = 0
-wScale = 0
-fScale = 0
-aScale = 28
-
-nDmgWeaponMin = 0
-nDmgWeaponMax = 0
-eDmgWeaponMin = 0
-eDmgWeaponMax = 0
-tDmgWeaponMin = 0
-tDmgWeaponMax = 0
-wDmgWeaponMin = 0
-wDmgWeaponMax = 0
-fDmgWeaponMin = 0
-fDmgWeaponMax = 0
-aDmgWeaponMin = 209
-aDmgWeaponMax = 275
-
-nWeaponAvg = nDmgWeaponMin + ((nDmgWeaponMax - nDmgWeaponMin) / 2)
-eWeaponAvg = eDmgWeaponMin + ((eDmgWeaponMax - eDmgWeaponMin) / 2)
-tWeaponAvg = tDmgWeaponMin + ((tDmgWeaponMax - tDmgWeaponMin) / 2)
-wWeaponAvg = wDmgWeaponMin + ((wDmgWeaponMax - wDmgWeaponMin) / 2)
-fWeaponAvg = fDmgWeaponMin + ((fDmgWeaponMax - fDmgWeaponMin) / 2)
-aWeaponAvg = aDmgWeaponMin + ((aDmgWeaponMax - aDmgWeaponMin) / 2)
-
-nDmg = nWeaponAvg * nScale
-eDmg = eWeaponAvg * nScale + nWeaponAvg * eScale + eWeaponAvg * eScale + tWeaponAvg * eScale + wWeaponAvg * eScale + fWeaponAvg * eScale + aWeaponAvg * eScale
-tDmg = tWeaponAvg * nScale + nWeaponAvg * tScale + eWeaponAvg * tScale + tWeaponAvg * tScale + wWeaponAvg * tScale + fWeaponAvg * tScale + aWeaponAvg * tScale
-wDmg = wWeaponAvg * nScale + nWeaponAvg * wScale + eWeaponAvg * wScale + tWeaponAvg * wScale + wWeaponAvg * wScale + fWeaponAvg * wScale + aWeaponAvg * wScale
-fDmg = fWeaponAvg * nScale + nWeaponAvg * fScale + eWeaponAvg * fScale + tWeaponAvg * fScale + wWeaponAvg * fScale + fWeaponAvg * fScale + aWeaponAvg * fScale
-aDmg = aWeaponAvg * nScale + nWeaponAvg * aScale + eWeaponAvg * aScale + tWeaponAvg * aScale + wWeaponAvg * aScale + fWeaponAvg * aScale + aWeaponAvg * aScale
-
-totalDmg = nDmg + eDmg + tDmg + wDmg + fDmg + aDmg
-if (totalDmg == 0):
-    totalScale = 1
-nWeight = pctW * nDmg / totalDmg
-eWeight = pctW * eDmg / totalDmg
-tWeight = pctW * tDmg / totalDmg
-wWeight = pctW * wDmg / totalDmg
-fWeight = pctW * fDmg / totalDmg
-aWeight = pctW * aDmg / totalDmg
-
-print(aWeight)
-
-
-
-def main():
-
-    # ---------- Pre-compile numba kernels ----------
-    t_warm = time()
-    warm_numba()
-    print(f"Numba warm-up: {time() - t_warm:.1f}s")
-
     # ---------- Load all ingredients ----------
     ingredients_raw = load_ingredients("data/ingreds_compress.json")
 
@@ -197,9 +128,9 @@ def main():
 
         # ===== Skill points =====
         "str": {"min": 0, "weight":1.5*pctW, "ingredient_filter":True},
-        "dex": {"min": 0, "weight":1.5*pctW, "ingredient_filter":False},
-        "int": {"min": 0, "weight":pctW, "ingredient_filter":False},
-        "def": {"min": 0, "weight":pctW, "ingredient_filter":False},
+        "dex": {"min": 0, "weight":1.5*pctW, "ingredient_filter":True},
+        "int": {"min": 0, "weight":pctW, "ingredient_filter":True},
+        "def": {"min": 0, "weight":pctW, "ingredient_filter":True},
         "agi": {"min": 0, "weight":0, "ingredient_filter":False},
 
         # ===== Sustain =====
@@ -224,7 +155,7 @@ def main():
         # "charges":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
     }
 
-    
+
 
     
 
@@ -256,37 +187,49 @@ def main():
         lvl_max=119,
     )
 
-    recipe = build_recipe(recipe_raw, query, tier=3) # builds final recipe using material tier
+    # ---------- Choose solver ----------
+    # The separable solver is exact and ~30x faster, but only for LINEAR queries.
+    # Composite stats (spell damage / EHP / EHPR / HPR) break per-slot separability,
+    # so any query that defines one falls back to the branch-and-bound DFS.
+    if query.comp_count == 0:
+        res = solve_separable(
+            user_query, skill, item_type, tier=3, lvl_min=117, lvl_max=119,
+            search_for_inversion=True, consumable=consumable,
+            ingredients_raw=ingredients_raw, recipes=recipes,
+        )
+        best_solution = res["build"]
+        tm = res["timings"]
+        sc = res["score"]
+        print(f"Solver: SEPARABLE (exact)  status={res['status']}"
+              + (f"  score={sc:.1f}" if sc is not None else ""))
+        print(f"  timing: load {tm['load']:.1f}s + prep {tm['prep']:.2f}s "
+              f"+ search {tm['search']:.2f}s")
+    else:
+        print(f"Solver: DFS  (composite stats present: comp_count={query.comp_count})")
+        t_warm = time()
+        warm_numba()
+        print(f"Numba warm-up: {time() - t_warm:.1f}s")
 
-    # ---------- Filter raw ingredients (no cull; the dual-DB split culls per sign) ----------
-    filtered_raw = filter_raw_ingredients(
-        ingredients_raw,
-        query,
-        recipe,
-        cull=False,
-    )
+        recipe = build_recipe(recipe_raw, query, tier=3) # builds final recipe using material tier
 
-    # ---------- Build the dual (per-effectiveness-sign) DB ----------
-    pos_list, neg_list = split_and_cull_by_sign(filtered_raw, query, recipe)
-    db = build_dual_db(pos_list, neg_list, query)
+        # Filter raw ingredients (no cull; the dual-DB split culls per sign).
+        filtered_raw = filter_raw_ingredients(ingredients_raw, query, recipe, cull=False)
+        pos_list, neg_list = split_and_cull_by_sign(filtered_raw, query, recipe)
+        db = build_dual_db(pos_list, neg_list, query)
 
-    print("Raw ingredients:", len(ingredients_raw))
-    print("Filtered ingredients:", len(filtered_raw))
-    print(f"Search DB: {db.count} (pos {db.pos_count} | neg {db.count - db.pos_count})")
-    
-    # for ing in filtered_raw:
-    #     print(ing.name)
-    
-    # ---------- Load + Search (pipelined, overlapped) ----------
-    # search_pipelined prints its own Load/Search/Wall breakdown.
-    best_solution = search_pipelined(
-        skill, query, recipe, db, max_cull=query.suggested_max_cull,
-    )
-    
+        print("Raw ingredients:", len(ingredients_raw))
+        print("Filtered ingredients:", len(filtered_raw))
+        print(f"Search DB: {db.count} (pos {db.pos_count} | neg {db.count - db.pos_count})")
+
+        # search_pipelined prints its own Load/Search/Wall breakdown.
+        best_solution = search_pipelined(
+            skill, query, recipe, db, max_cull=query.suggested_max_cull,
+        )
+
     print("Best solution:", best_solution)
-    
+
     if best_solution is not None:
-        
+
         id_to_name = {int(ing.ing_id): ing.name for ing in ingredients_raw}
         names = [id_to_name[i] for i in best_solution]
         print(names)

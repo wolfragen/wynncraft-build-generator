@@ -10,7 +10,24 @@
     ],
     "time": 1.8595643043518066,
     "skill": "ARMOURING",
-    "item_type": "CHESTPLATE"
+    "item_type": "CHESTPLATE",
+    "dfs_score": 617324.4,
+    "solvers": {
+      "separable": {
+        "build": [
+          528,
+          528,
+          792,
+          863,
+          582,
+          569
+        ],
+        "score": 617324.4,
+        "time": 2.523,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
   },
   "arm_full": {
     "build": [
@@ -23,7 +40,24 @@
     ],
     "time": 223.9509632587433,
     "skill": "ARMOURING",
-    "item_type": "CHESTPLATE"
+    "item_type": "CHESTPLATE",
+    "dfs_score": 98611.6,
+    "solvers": {
+      "separable": {
+        "build": [
+          894,
+          485,
+          420,
+          894,
+          769,
+          622
+        ],
+        "score": 98611.6,
+        "time": 6.417,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
   },
   "arm_tightreq": {
     "build": [
@@ -36,7 +70,24 @@
     ],
     "time": 198.17889785766602,
     "skill": "ARMOURING",
-    "item_type": "CHESTPLATE"
+    "item_type": "CHESTPLATE",
+    "dfs_score": 91542.3,
+    "solvers": {
+      "separable": {
+        "build": [
+          603,
+          420,
+          792,
+          765,
+          582,
+          569
+        ],
+        "score": 91542.3,
+        "time": 6.63,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
   },
   "tai_legs": {
     "build": [
@@ -49,7 +100,24 @@
     ],
     "time": 0.8841233253479004,
     "skill": "TAILORING",
-    "item_type": "LEGGINGS"
+    "item_type": "LEGGINGS",
+    "dfs_score": 594020.9,
+    "solvers": {
+      "separable": {
+        "build": [
+          790,
+          798,
+          790,
+          798,
+          631,
+          591
+        ],
+        "score": 594020.9,
+        "time": 0.688,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
   },
   "wea_dagger": {
     "build": [
@@ -62,7 +130,24 @@
     ],
     "time": 0.21873211860656738,
     "skill": "WEAPONSMITHING",
-    "item_type": "DAGGER"
+    "item_type": "DAGGER",
+    "dfs_score": 143930.9,
+    "solvers": {
+      "separable": {
+        "build": [
+          563,
+          563,
+          569,
+          441,
+          757,
+          757
+        ],
+        "score": 143930.9,
+        "time": 0.22,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
   },
   "jew_ring": {
     "build": [
@@ -75,7 +160,24 @@
     ],
     "time": 0.04092550277709961,
     "skill": "JEWELING",
-    "item_type": "RING"
+    "item_type": "RING",
+    "dfs_score": 78776.9,
+    "solvers": {
+      "separable": {
+        "build": [
+          614,
+          614,
+          909,
+          909,
+          909,
+          909
+        ],
+        "score": 78776.9,
+        "time": 0.025,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
   },
   "arm_tank": {
     "build": [
@@ -88,7 +190,24 @@
     ],
     "time": 1.7478163242340088,
     "skill": "ARMOURING",
-    "item_type": "CHESTPLATE"
+    "item_type": "CHESTPLATE",
+    "dfs_score": 1234573.9,
+    "solvers": {
+      "separable": {
+        "build": [
+          528,
+          528,
+          792,
+          863,
+          582,
+          569
+        ],
+        "score": 1234573.9,
+        "time": 2.417,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
   },
   "wea_spell": {
     "build": [
@@ -101,7 +220,24 @@
     ],
     "time": 0.14892029762268066,
     "skill": "WEAPONSMITHING",
-    "item_type": "DAGGER"
+    "item_type": "DAGGER",
+    "dfs_score": 153945.9,
+    "solvers": {
+      "separable": {
+        "build": [
+          563,
+          569,
+          752,
+          612,
+          612,
+          752
+        ],
+        "score": 153945.9,
+        "time": 0.204,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
   },
   "jew_minimise": {
     "build": [
@@ -114,7 +250,24 @@
     ],
     "time": 0.02160501480102539,
     "skill": "JEWELING",
-    "item_type": "RING"
+    "item_type": "RING",
+    "dfs_score": 21063.9,
+    "solvers": {
+      "separable": {
+        "build": [
+          588,
+          569,
+          760,
+          593,
+          760,
+          614
+        ],
+        "score": 21063.9,
+        "time": 0.016,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
   },
   "arm_maxcon": {
     "build": [
@@ -127,7 +280,24 @@
     ],
     "time": 1.8146378993988037,
     "skill": "ARMOURING",
-    "item_type": "CHESTPLATE"
+    "item_type": "CHESTPLATE",
+    "dfs_score": 84117.9,
+    "solvers": {
+      "separable": {
+        "build": [
+          674,
+          570,
+          570,
+          570,
+          570,
+          570
+        ],
+        "score": 84117.9,
+        "time": 2.547,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
   },
   "tai_damage": {
     "build": [
@@ -140,7 +310,24 @@
     ],
     "time": 0.7758307456970215,
     "skill": "TAILORING",
-    "item_type": "LEGGINGS"
+    "item_type": "LEGGINGS",
+    "dfs_score": 119786.9,
+    "solvers": {
+      "separable": {
+        "build": [
+          662,
+          887,
+          792,
+          887,
+          582,
+          591
+        ],
+        "score": 119786.9,
+        "time": 0.841,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
   },
   "jew_full": {
     "build": [
@@ -153,6 +340,23 @@
     ],
     "time": 0.03144240379333496,
     "skill": "JEWELING",
-    "item_type": "RING"
+    "item_type": "RING",
+    "dfs_score": 78776.9,
+    "solvers": {
+      "separable": {
+        "build": [
+          614,
+          614,
+          909,
+          909,
+          909,
+          909
+        ],
+        "score": 78776.9,
+        "time": 0.016,
+        "valid": true,
+        "matches_dfs": true
+      }
+    }
   }
 }

@@ -13,3 +13,6 @@ __pycache__/
 data/precalc/
 data/precalc.zip
 *.cache.npz
+
+# Claude context (personal memory/plans/config — local only)
+.claude/
