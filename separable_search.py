@@ -278,6 +278,32 @@ def _node_ub(comp_type, cdmax, cdmin, sufhi, suflo, j):
 
 
 @njit(cache=True)
+def _node_lb(comp_type, cdmax, cdmin, sufhi, suflo, j):
+    """
+    RAW composite LOWER bound for the subtree at node j: each remaining void slot at its
+    UNfavourable extreme (min numerator/def, max agi), so it under-estimates the min-roll
+    composite of any completion. Used for the composite-MAX feasibility prune: if even the
+    smallest reachable composite already exceeds the required max, every completion
+    violates it -> prune. Valid since min_num / max_D <= any build's value.
+    """
+    lo0 = cdmin[0] + suflo[0, j]; lo1 = cdmin[1] + suflo[1, j]
+    lo2 = cdmin[2] + suflo[2, j]; lo3 = cdmin[3] + suflo[3, j]
+    hi2 = cdmax[2] + sufhi[2, j]; hi3 = cdmax[3] + sufhi[3, j]
+    if comp_type == 0:        # HPR: min rtp at (min raw, min pct)
+        return float(_rtp(np.int64(lo0), np.int64(lo1)))
+    if comp_type == 1:        # EHP: max(5, hp_min) / D_max(min def, max agi)
+        _, dmx = _denom(np.int64(lo1), np.int64(lo1), np.int64(hi2), np.int64(hi2))
+        hh = lo0 if lo0 > 5.0 else 5.0
+        return hh / dmx
+    # EHPR: min numerator / D, two-sided in D to cover the numerator's sign
+    num = _rtp(np.int64(lo0), np.int64(lo1))
+    _, dmx = _denom(np.int64(lo2), np.int64(lo2), np.int64(hi3), np.int64(hi3))
+    dmn, _ = _denom(np.int64(hi2), np.int64(hi2), np.int64(lo3), np.int64(lo3))
+    v1 = num / dmx; v2 = num / dmn
+    return v1 if v1 < v2 else v2
+
+
+@njit(cache=True)
 def _solve_row_comp(void_eidx, base_score, base_cval, base_dmin, base_dmax,
                     score_sorted, cmarg_sorted, dmin_s, dmax_s, dmax_emax, dmin_emin,
                     n_deps, comp_type, best_score_per_eff, thr, sign, w_comp,
@@ -309,6 +335,7 @@ def _solve_row_comp(void_eidx, base_score, base_cval, base_dmin, base_dmax,
     cum_cval = np.zeros((k + 1, C))
     cum_dmin = np.zeros((k + 1, 4)); cum_dmax = np.zeros((k + 1, 4))
     comp_raw_node = np.zeros(k + 1)   # RAW (unweighted) composite UB per node
+    comp_lb_node = np.zeros(k + 1)     # RAW composite LB per node (only if has_cmax)
     cum_cval[0] = base_cval; cum_score[0] = base_score
     for dd in range(4):
         cum_dmin[0, dd] = base_dmin[dd]; cum_dmax[0, dd] = base_dmax[dd]
@@ -316,6 +343,8 @@ def _solve_row_comp(void_eidx, base_score, base_cval, base_dmin, base_dmax,
     if k > 0:
         stack_r[0] = 0
         comp_raw_node[0] = _node_ub(comp_type, cum_dmax[0], cum_dmin[0], sufhi, suflo, 0)
+        if has_cmax:
+            comp_lb_node[0] = _node_lb(comp_type, cum_dmax[0], cum_dmin[0], sufhi, suflo, 0)
     while j >= 0:
         if j == k:
             if comp_type == 0:        # HPR
@@ -362,7 +391,8 @@ def _solve_row_comp(void_eidx, base_score, base_cval, base_dmin, base_dmax,
         # no incumbent -> infeasible queries collapse fast instead of brute-forcing).
         if (r >= N
                 or cum_score[j] + score_sorted[ei, r] + suf[j + 1] + w_comp * comp_raw_node[j] <= best_loc
-                or (has_cmin and comp_raw_node[j] < cmin_thr)):
+                or (has_cmin and comp_raw_node[j] < cmin_thr)
+                or (has_cmax and comp_lb_node[j] > cmax_thr)):
             j -= 1
             if j >= 0:
                 stack_r[j] += 1
@@ -381,6 +411,8 @@ def _solve_row_comp(void_eidx, base_score, base_cval, base_dmin, base_dmax,
         if j < k:
             stack_r[j] = 0
             comp_raw_node[j] = _node_ub(comp_type, cum_dmax[j], cum_dmin[j], sufhi, suflo, j)
+            if has_cmax:
+                comp_lb_node[j] = _node_lb(comp_type, cum_dmax[j], cum_dmin[j], sufhi, suflo, j)
     return best_loc, choice
 
 
@@ -737,10 +769,25 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
                                         comp["spell_id"], comp["use_spell"], spell_ctx)
             comp_ub = comp["w"] * cub
             bound = bound + comp_ub
-            # Composite feasibility: cub is the optimistic max composite for the row;
-            # if it can't reach a required composite min, no build in the row qualifies.
+            # Composite feasibility: cub is the optimistic MAX composite for the row; if
+            # it can't reach a required min, no build in the row qualifies. For a max
+            # constraint, clb is the optimistic MIN composite (unfavourable extreme); if
+            # even that exceeds the max, every build in the row violates -> skip.
             if comp["has_min"]:
                 infeas_row |= cub < comp["min"]
+            if comp["has_max"]:
+                if comp["type"] == _C_HPR:
+                    clb = _rtp_np(d_lo[0], d_lo[1]).astype(np.float64)
+                elif comp["type"] == _C_EHP:
+                    clb = np.maximum(5.0, d_lo[0]) / _denom_max_np(d_lo[1], d_hi[2])
+                elif comp["type"] == _C_EHPR:
+                    num_lo = _rtp_np(d_lo[0], d_lo[1]).astype(np.float64)
+                    clb = np.minimum(num_lo / _denom_max_np(d_lo[2], d_hi[3]),
+                                     num_lo / _denom_min_np(d_hi[2], d_lo[3]))
+                else:  # SPELL — monotone, so the min corner is at the unfavourable box
+                    clb = _spell_bounds_all(np.ascontiguousarray(d_lo.T),
+                                            comp["spell_id"], comp["use_spell"], spell_ctx)
+                infeas_row |= clb > comp["max"]
         pre.append((M, base_score, imax, imin, veidx, comp_ub))
         all_bounds.append(bound)
         all_infeas.append(infeas_row)
