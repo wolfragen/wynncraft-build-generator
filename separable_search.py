@@ -250,28 +250,31 @@ def _denom_max_np(def_lo, agi_hi):
 
 
 @njit(cache=True)
-def _node_ub(comp_type, cdmax, cdmin, sufhi, suflo, j, w_comp):
+def _node_ub(comp_type, cdmax, cdmin, sufhi, suflo, j):
     """
-    Composite upper bound for the subtree at node j: each remaining void slot is
+    RAW composite upper bound for the subtree at node j: each remaining void slot is
     replaced by its per-eff favourable extreme (max marginal for the numerator/def,
     min marginal for agi), so the (monotone) composite over-estimates any completion.
+    Returns the unweighted composite value (callers apply the weight for the objective
+    bound, and compare it directly against a composite min for the FEASIBILITY prune —
+    which must be weight-independent, since a `min` constraint can carry weight 0).
     cdmax/cdmin are cum_dmax[j]/cum_dmin[j]; sufhi/suflo are the favourable suffix sums.
     """
     hi0 = cdmax[0] + sufhi[0, j]; hi1 = cdmax[1] + sufhi[1, j]
     hi2 = cdmax[2] + sufhi[2, j]; hi3 = cdmax[3] + sufhi[3, j]
     lo2 = cdmin[2] + suflo[2, j]; lo3 = cdmin[3] + suflo[3, j]
     if comp_type == 0:        # HPR
-        return w_comp * _rtp(np.int64(hi0), np.int64(hi1))
+        return float(_rtp(np.int64(hi0), np.int64(hi1)))
     if comp_type == 1:        # EHP: max(5,hp) / D(max def, min agi)
         dmn, _ = _denom(np.int64(hi1), np.int64(hi1), np.int64(lo2), np.int64(lo2))
         hh = hi0 if hi0 > 5.0 else 5.0
-        return w_comp * (hh / dmn)
+        return hh / dmn
     # EHPR: numerator / D, two-sided in D to cover the numerator's sign
     num = _rtp(np.int64(hi0), np.int64(hi1))
     dmn, _ = _denom(np.int64(hi2), np.int64(hi2), np.int64(lo3), np.int64(lo3))
     _, dmx = _denom(np.int64(lo2), np.int64(lo2), np.int64(hi3), np.int64(hi3))
     v1 = num / dmn; v2 = num / dmx
-    return w_comp * (v1 if v1 > v2 else v2)
+    return v1 if v1 > v2 else v2
 
 
 @njit(cache=True)
@@ -305,14 +308,14 @@ def _solve_row_comp(void_eidx, base_score, base_cval, base_dmin, base_dmax,
     cum_score = np.zeros(k + 1)
     cum_cval = np.zeros((k + 1, C))
     cum_dmin = np.zeros((k + 1, 4)); cum_dmax = np.zeros((k + 1, 4))
-    comp_ub_node = np.zeros(k + 1)
+    comp_raw_node = np.zeros(k + 1)   # RAW (unweighted) composite UB per node
     cum_cval[0] = base_cval; cum_score[0] = base_score
     for dd in range(4):
         cum_dmin[0, dd] = base_dmin[dd]; cum_dmax[0, dd] = base_dmax[dd]
     j = 0
     if k > 0:
         stack_r[0] = 0
-        comp_ub_node[0] = _node_ub(comp_type, cum_dmax[0], cum_dmin[0], sufhi, suflo, 0, w_comp)
+        comp_raw_node[0] = _node_ub(comp_type, cum_dmax[0], cum_dmin[0], sufhi, suflo, 0)
     while j >= 0:
         if j == k:
             if comp_type == 0:        # HPR
@@ -353,7 +356,13 @@ def _solve_row_comp(void_eidx, base_score, base_cval, base_dmin, base_dmax,
                 stack_r[j] += 1
             continue
         ei = void_eidx[j]; r = stack_r[j]
-        if r >= N or cum_score[j] + score_sorted[ei, r] + suf[j + 1] + comp_ub_node[j] <= best_loc:
+        # Prune the subtree if: (a) it is exhausted, (b) its objective bound can't beat
+        # the incumbent, or (c) FEASIBILITY: even the max composite over the subtree
+        # falls short of a required composite min (weight-independent, so it works with
+        # no incumbent -> infeasible queries collapse fast instead of brute-forcing).
+        if (r >= N
+                or cum_score[j] + score_sorted[ei, r] + suf[j + 1] + w_comp * comp_raw_node[j] <= best_loc
+                or (has_cmin and comp_raw_node[j] < cmin_thr)):
             j -= 1
             if j >= 0:
                 stack_r[j] += 1
@@ -371,7 +380,7 @@ def _solve_row_comp(void_eidx, base_score, base_cval, base_dmin, base_dmax,
         j += 1
         if j < k:
             stack_r[j] = 0
-            comp_ub_node[j] = _node_ub(comp_type, cum_dmax[j], cum_dmin[j], sufhi, suflo, j, w_comp)
+            comp_raw_node[j] = _node_ub(comp_type, cum_dmax[j], cum_dmin[j], sufhi, suflo, j)
     return best_loc, choice
 
 
@@ -422,8 +431,10 @@ def _solve_row_spell(void_eidx, base_score, base_cval, base_dmin, base_dmax,
     Same explicit-stack void-slot DFS as _solve_row_comp, but the dep totals are
     width ND (32/36) instead of 4, evaluated through the engine corner fns:
       leaf  cmx = corner(cum_dmax[k]),  cmn = corner(cum_dmin[k])  -> w*(0.99cmx+0.01cmn)
-      node  comp_ub_node[j] = w * corner(cum_dmax[j] + sufhi[:, j])   (max side only)
-    sufhi (ND, k+1) are favourable-max suffix sums; no suflo (monotone increasing).
+      node  comp_raw_node[j] = corner(cum_dmax[j] + sufhi[:, j])     (RAW, max side only)
+    The raw node bound drives both the objective prune (x w) and the composite-min
+    FEASIBILITY prune (raw vs cmin_thr), so an infeasible min collapses with no
+    incumbent. sufhi (ND, k+1) are favourable-max suffix sums; no suflo (monotone).
     Dep order is canonical get_spell_deps(spell_id) (== comp["deps"]).
     """
     k = void_eidx.shape[0]; C = thr.shape[0]; N = score_sorted.shape[1]
@@ -441,7 +452,7 @@ def _solve_row_spell(void_eidx, base_score, base_cval, base_dmin, base_dmax,
     cum_score = np.zeros(k + 1)
     cum_cval = np.zeros((k + 1, C))
     cum_dmin = np.zeros((k + 1, ND)); cum_dmax = np.zeros((k + 1, ND))
-    comp_ub_node = np.zeros(k + 1)
+    comp_raw_node = np.zeros(k + 1)   # RAW (unweighted) spell-damage UB per node
     deps_hi = np.empty(ND); deps_lo = np.empty(ND); deps_nd = np.empty(ND)
     cum_cval[0] = base_cval; cum_score[0] = base_score
     for dd in range(ND):
@@ -451,7 +462,7 @@ def _solve_row_spell(void_eidx, base_score, base_cval, base_dmin, base_dmax,
         stack_r[0] = 0
         for dd in range(ND):
             deps_nd[dd] = cum_dmax[0, dd] + sufhi[dd, 0]
-        comp_ub_node[0] = w_comp * _spell_corner(deps_nd, use_spell, spell_id, ctx)
+        comp_raw_node[0] = _spell_corner(deps_nd, use_spell, spell_id, ctx)
     while j >= 0:
         if j == k:
             for dd in range(ND):
@@ -482,7 +493,12 @@ def _solve_row_spell(void_eidx, base_score, base_cval, base_dmin, base_dmax,
                 stack_r[j] += 1
             continue
         ei = void_eidx[j]; r = stack_r[j]
-        if r >= N or cum_score[j] + score_sorted[ei, r] + suf[j + 1] + comp_ub_node[j] <= best_loc:
+        # (a) exhausted, (b) objective bound can't beat incumbent, or (c) FEASIBILITY:
+        # max spell damage over the subtree can't reach a required min (weight-free, so
+        # it prunes infeasible queries with no incumbent instead of brute-forcing).
+        if (r >= N
+                or cum_score[j] + score_sorted[ei, r] + suf[j + 1] + w_comp * comp_raw_node[j] <= best_loc
+                or (has_cmin and comp_raw_node[j] < cmin_thr)):
             j -= 1
             if j >= 0:
                 stack_r[j] += 1
@@ -499,7 +515,7 @@ def _solve_row_spell(void_eidx, base_score, base_cval, base_dmin, base_dmax,
             stack_r[j] = 0
             for dd in range(ND):
                 deps_nd[dd] = cum_dmax[j, dd] + sufhi[dd, j]
-            comp_ub_node[j] = w_comp * _spell_corner(deps_nd, use_spell, spell_id, ctx)
+            comp_raw_node[j] = _spell_corner(deps_nd, use_spell, spell_id, ctx)
     return best_loc, choice
 
 
@@ -590,8 +606,10 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
     thr = np.array([c[2] for c in cons], np.float64)
 
     t_load = time()
+    if verbose:
+        print(f"[separable] loading + culling meta sets ({skill}, max_cull={int(q.suggested_max_cull)}):")
     batches = load_meta_sets(skill, q, rec, culling=True, max_cull=int(q.suggested_max_cull),
-                             base_path=base_path)
+                             should_print=verbose, base_path=base_path)
     load_s = time() - t_load
 
     t = time()
@@ -629,6 +647,14 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
     cmarg_sorted = np.ascontiguousarray(cmarg_sorted)
     best_score_per_eff = np.ascontiguousarray(score_sorted[:, 0].copy())
 
+    # Per-eff feasibility marginal: BEST achievable constrained-stat roll at each eff
+    # (max for a min constraint, min for a max constraint). Summed over a row's void
+    # slots -> the optimistic reachable value, used to skip rows that provably can't
+    # satisfy a hard constraint (fast infeasibility detection, no brute force).
+    feas_per_eff = np.zeros((C, E))
+    for ci, (s, sg, _) in enumerate(cons):
+        feas_per_eff[ci] = cmarg[ci].max(1) if sg > 0 else cmarg[ci].min(1)
+
     dmax_s = dmin_s = None
     dmax_emax = dmin_emin = None
     if comp is not None:
@@ -652,11 +678,12 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
     cstat_idx = np.array([c[0] for c in cons], np.int64)
     cstat_max = sign > 0    # True -> use base_max column, else base_min
     pre = []
-    all_bounds = []; all_n = []; all_m = []
+    all_bounds = []; all_n = []; all_m = []; all_infeas = []
     for n, b in enumerate(batches):
         M = b.ings_matrix.shape[0]
         if M == 0:
             pre.append(None); continue
+        infeas_row = np.zeros(M, dtype=np.bool_)
         imax = b.base_max_matrix; imin = b.base_min_matrix          # int32, no float copy
         # matmul-then-blend: reduce (M,K) to (M,) BEFORE the float blend (avoids the
         # (M,K) float64 intermediate that dominated prep).
@@ -670,6 +697,17 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
             ix = np.searchsorted(all_effs, b.void_eff_matrix[:, j])
             veidx[:, j] = ix
             bound += best_score_per_eff[ix]
+        # Per-row LINEAR feasibility: a row is infeasible if even the optimistic
+        # reachable value (best per-slot choices) cannot meet a hard min/max. Sound
+        # (a necessary condition) and cheap vs the per-row solve. Only constraints with
+        # a non-trivial threshold are checked (min<=0 / no upper are always satisfiable
+        # given the search already excludes negative-only rows).
+        for ci, (s, sg, thr_c) in enumerate(cons):
+            opt = (imax[:, s] if sg > 0 else imin[:, s]).astype(np.float64)
+            fpe = feas_per_eff[ci]
+            for j in range(b.void_count):
+                opt += fpe[veidx[:, j]]
+            infeas_row |= (opt < thr_c) if sg > 0 else (opt > thr_c)
         comp_ub = None
         if comp is not None:
             # Per-row composite upper bound. d_hi[d] = max reachable max-roll total of
@@ -699,19 +737,47 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
                                         comp["spell_id"], comp["use_spell"], spell_ctx)
             comp_ub = comp["w"] * cub
             bound = bound + comp_ub
+            # Composite feasibility: cub is the optimistic max composite for the row;
+            # if it can't reach a required composite min, no build in the row qualifies.
+            if comp["has_min"]:
+                infeas_row |= cub < comp["min"]
         pre.append((M, base_score, imax, imin, veidx, comp_ub))
         all_bounds.append(bound)
+        all_infeas.append(infeas_row)
         all_n.append(np.full(M, n, np.int64))
         all_m.append(np.arange(M, dtype=np.int64))
     bounds_all = np.concatenate(all_bounds)
+    infeas_all = np.concatenate(all_infeas)
     n_all = np.concatenate(all_n); m_all = np.concatenate(all_m)
+    # Drop provably-infeasible rows BEFORE the search so an infeasible query collapses
+    # fast (no per-row solve, no full scan); feasible rows keep their descending-bound
+    # order. Empty -> INFEASIBLE immediately.
     order_rows = np.argsort(-bounds_all)
+    order_rows = order_rows[~infeas_all[order_rows]]
     prep_s = time() - t
+
+    total_rows = bounds_all.shape[0]
+    n_feasible = order_rows.shape[0]
+    if verbose:
+        n_skipped = total_rows - n_feasible
+        if n_skipped:
+            print(f"[separable] feasibility: {n_skipped:,} of {total_rows:,} rows can't reach "
+                  f"a hard min/max -> skipped (no per-row solve)")
+        if n_feasible == 0:
+            print("[separable] no row can satisfy the constraints -> INFEASIBLE")
+        else:
+            print(f"[separable] prep: {n_feasible:,} feasible meta-rows, "
+                  f"top separable bound = {bounds_all[order_rows[0]]:,.0f}  (prep {prep_s:.2f}s)")
+            print(f"[separable] search: branch & bound over {n_feasible:,} rows in descending "
+                  f"bound order (stops when bound <= best)...")
 
     t2 = time()
     best = -1e18; best_rc = None; best_n = best_m = -1; solved = 0
+    cutoff = None
+    last_log = t2
     for oi in order_rows:
         if bounds_all[oi] <= best:
+            cutoff = float(bounds_all[oi])
             break
         n = int(n_all[oi]); m = int(m_all[oi])
         _, base_score, imax, imin, veidx, comp_ub = pre[n]
@@ -747,7 +813,23 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
         solved += 1
         if sc > best:
             best = sc; best_rc = choice.copy(); best_n = n; best_m = m
+        if verbose and time() - last_log >= 0.7:
+            # B&B progress: best climbs, the cursor bound descends toward it; the loop
+            # stops when they cross. headroom = how much score the survivors could add.
+            cb = float(bounds_all[oi])
+            if best > -1e17:
+                tail = f"best = {best:,.0f} | cursor bound = {cb:,.0f} (headroom {cb - best:,.0f})"
+            else:
+                tail = f"best = (no feasible build yet) | cursor bound = {cb:,.0f}"
+            print(f"    scanned {solved:,} rows | {tail}")
+            last_log = time()
     search_s = time() - t2
+    if verbose and n_feasible:
+        pruned = (1.0 - solved / n_feasible) * 100.0 if n_feasible else 0.0
+        cb = f"{cutoff:,.0f}" if cutoff is not None else "n/a (all rows scanned)"
+        best_s = f"{best:,.0f}" if best > -1e17 else "INFEASIBLE"
+        print(f"[separable] search: solved {solved:,}/{n_feasible:,} feasible rows, stopped "
+              f"(cutoff bound {cb} <= best {best_s}) -> {pruned:.2f}% pruned  (search {search_s:.2f}s)")
 
     if best_n < 0:
         return {"build": None, "score": None, "status": "INFEASIBLE",
@@ -762,8 +844,8 @@ def solve_separable(user_query, skill, item_type, tier, lvl_min, lvl_max,
         build[slot] = int(db.json_ids[order[ei, best_rc[j]]])
 
     if verbose:
-        print(f"[separable] load={load_s:.1f}s prep={prep_s:.2f}s search={search_s:.2f}s "
-              f"rows_solved={solved}/{bounds_all.shape[0]} score={best:.1f}")
+        print(f"[separable] DONE -> score {best:,.1f}  "
+              f"(load {load_s:.1f}s + prep {prep_s:.2f}s + search {search_s:.2f}s)")
     return {"build": build, "score": best, "status": "OPTIMAL", "meta_n": best_n,
             "rows_solved": solved, "recipe_raw": recipe_raw,
             "timings": {"load": load_s, "prep": prep_s, "search": search_s}}

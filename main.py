@@ -131,7 +131,7 @@ def main():
         "dex": {"min": 0, "weight":1.5*pctW, "ingredient_filter":True},
         "int": {"min": 0, "weight":pctW, "ingredient_filter":True},
         "def": {"min": 0, "weight":pctW, "ingredient_filter":True},
-        "agi": {"min": 0, "weight":0, "ingredient_filter":False},
+        "agi": {"min": 0, "weight":0, "ingredient_filter":True},
 
         # ===== Sustain =====
         "mr": {"min": 0, "weight":1*pctW},
@@ -141,11 +141,13 @@ def main():
         #"hpBonus": {"min": 2000, "ingredient_filter":False},
 
         # ===== Requirements =====
-        "strReq": {"max": 45, "ingredient_filter":False},
-        "dexReq": {"max": 45, "ingredient_filter":False},
-        "intReq": {"max": 45, "ingredient_filter":False},
-        "defReq": {"max": 15, "ingredient_filter":False},
+        "strReq": {"max": 45, "ingredient_filter":True},
+        "dexReq": {"max": 45, "ingredient_filter":True},
+        "intReq": {"max": 45, "ingredient_filter":True},
+        "defReq": {"max": 15, "ingredient_filter":True},
         "agiReq": {"max": 125, "ingredient_filter":True},
+
+        "hpr": {"min": 250, "ingredient_filter":True},
 
         # ===== Usability =====
         #"spd": {"min": 0, "weight": 0.5},
@@ -154,8 +156,6 @@ def main():
         # "duration": {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
         # "charges":  {"min": 0, "max": 0, "ingredient_filter": True, "weight": 0},
     }
-
-
 
     
 
@@ -195,13 +195,14 @@ def main():
         res = solve_separable(
             user_query, skill, item_type, tier=3, lvl_min=117, lvl_max=119,
             search_for_inversion=True, consumable=consumable,
-            ingredients_raw=ingredients_raw, recipes=recipes,
+            ingredients_raw=ingredients_raw, recipes=recipes, verbose=True,
         )
         best_solution = res["build"]
         tm = res["timings"]
         sc = res["score"]
         print(f"Solver: SEPARABLE (exact)  status={res['status']}"
-              + (f"  score={sc:.1f}" if sc is not None else ""))
+              + (f"  score={sc:.1f}" if sc is not None else "")
+              + f"  rows_solved={res['rows_solved']:,}")
         print(f"  timing: load {tm['load']:.1f}s + prep {tm['prep']:.2f}s "
               f"+ search {tm['search']:.2f}s")
     except UnsupportedQueryError as ex:
